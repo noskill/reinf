@@ -1,9 +1,11 @@
 import numpy
+import torch
 import sys
 import gymnasium as gym
 from gymnasium.vector import SyncVectorEnv
 from torch import nn
-from agent import *
+from agent_reinf import *
+from sample import *
 
 
 class NA1(nn.Module):
@@ -28,12 +30,13 @@ def make_env():
     return gym.make('Pendulum-v1')
 
 # Create vectorized environment
-env = SyncVectorEnv([make_env for _ in range(16)])  # 8 environments
+num_envs=16
+env = SyncVectorEnv([make_env for _ in range(num_envs)])  # 8 environments
 num_batch = 10
 n_episodes = 10000
 dist_params = 2
-num_envs=16
-discount = 0.9
+
+discount = 0.95
 na = NA1(3, 1 * dist_params)
 na.to(torch.device('cuda'))
 agent = Reinforce(na, sample_action_beta, num_envs=num_envs, discount=discount)
