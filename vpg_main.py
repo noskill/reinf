@@ -8,6 +8,7 @@ from torch import nn
 from vpg import *
 from sample import *
 from gymnasium.spaces import Discrete, Box
+from log import Logger
 
 
 class NA1(nn.Module):
@@ -45,7 +46,7 @@ test_env = make_env()
 num_envs=8
 env = SyncVectorEnv([make_env for _ in range(num_envs)])  # 8 environments
 num_batch = 10
-n_episodes = 300
+n_episodes = 200
 dist_params = 1
 obs_dim = test_env.observation_space.shape[0]
 action_dim = get_action_dim(test_env.action_space)
@@ -57,22 +58,26 @@ na = NA1(obs_dim, action_dim * dist_params, hidden_dim=256).to(device)
 value = Value(obs_dim).to(device)
 
 sampler = lambda policy, state: sample_action_normal(policy, state, a_min=-2, a_max=2)
+logger = Logger("runs/experiment_name")
 agent = VPG(na, value,
             discrete_sampler,
             num_envs=num_envs, 
             discount=discount, 
             device=device, 
             policy_lr=0.001, 
-            value_lr=0.001)
+            value_lr=0.001,
+            logger=logger)
 agent.policy.apply(init_normal)
 value.apply(init_normal)
+
+
 
 seed = 148234324
 torch.manual_seed(seed)
 random.seed(seed)
 np.random.seed(seed)
 for i in range(n_episodes):
-    obs, info = env.reset()
+    obs, info = env.reset(seed=random.randint(0, 1000))
     done = numpy.zeros(num_envs, dtype=bool)
     agent.episode_start()
     while not done.all():
@@ -83,6 +88,7 @@ for i in range(n_episodes):
         if changed:
             break
         obs = next_obs
+    logger.increment_episode()
     if i % 10 == 0:
         print('iteration ' + str(i))
     sys.stdout.flush()

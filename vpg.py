@@ -24,7 +24,8 @@ class Value(nn.Module):
 
 
 class VPG(Agent):
-    def __init__(self, policy, value, sampler, policy_lr=0.001, value_lr=0.001, num_envs=8, discount=0.99, device=torch.device('cpu')):
+    def __init__(self, policy, value, sampler, policy_lr=0.001, value_lr=0.001, num_envs=8, discount=0.99, device=torch.device('cpu'), logger=None):
+        super().__init__(logger=logger)
         self.policy = policy
         self.value = value
         self.sampler = sampler
@@ -112,18 +113,16 @@ class VPG(Agent):
         mean_length = np.mean(episode_lengths)
         mean_return = np.mean(episode_returns)
         std_return = np.std(episode_returns)
+        self.logger.log_scalar(f"Average episode length",  mean_length)
+        self.logger.log_scalar(f"Average return",  mean_return)
+        self.logger.log_scalar(f"return std",  std_return)
+        self.logger.log_scalar(f"min return",  min(episode_returns))
+        self.logger.log_scalar(f"max return",  max(episode_returns))
 
-        print(f"Episodes completed: {len(completed_episodes)}")
-        print(f"Average episode length: {mean_length:.1f}")
-        print(f"Average return: {mean_return:.2f} ± {std_return:.2f}")
-
-        # Optionally, you could also track min/max returns
-        print(f"Min/Max returns: {min(episode_returns):.2f}/{max(episode_returns):.2f}")
-
-    def train_value(self, returns, states):
+    def train_value(self, returns, states_batch):
         # Value Network Update
-        value_epochs = 5
-        mini_batch_size = 512
+        value_epochs = 2
+        mini_batch_size = 256
         
         for epoch in range(value_epochs):
             indices = np.random.permutation(len(states_batch))
@@ -131,11 +130,13 @@ class VPG(Agent):
                 end = start + mini_batch_size
                 batch_idx = indices[start:end]
                 pred_values = self.value(states_batch[batch_idx].detach()).squeeze(-1)
-                value_loss = F.mse_loss(pred_values, all_returns_cat[batch_idx])
+                value_loss = F.mse_loss(pred_values, returns[batch_idx])
                 self.optimizer_value.zero_grad()
                 value_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.value.parameters(), 10.0)
                 self.optimizer_value.step()
+                
+        self.logger.log_scalar(f"value loss",  value_loss)
 
     def learn_from_episodes(self, completed_episodes):
         # Prepare lists to store all data from all completed episodes
@@ -163,8 +164,8 @@ class VPG(Agent):
                 
             # Convert to tensors
             states = torch.stack(states)
-            log_probs = torch.stack(log_probs)
             rewards = torch.tensor(rewards, dtype=torch.float32)
+            log_probs = torch.stack(log_probs).reshape(rewards.shape)
             actions = torch.stack(actions)
             
             # Compute discounted returns Gt (backward)
@@ -196,14 +197,14 @@ class VPG(Agent):
         with torch.no_grad():
             _, _, transformed_dist = self.sampler(self.policy, states_batch)
         
-        print(f"actions mean {all_actions_cat.to(torch.float32).mean()}, actions std \
-              {all_actions_cat.to(torch.float32).std()}")
+        self.logger.log_scalar(f"actions mean", all_actions_cat.to(torch.float32).mean())
+        self.logger.log_scalar("action std",  all_actions_cat.to(torch.float32).std())
         
         # Normalize returns
         if self.mean_reward == -10000:
             self.mean_reward = all_returns_cat.mean()
         
-        n = 50
+        n = 5
         self.mean_reward = (
             self.mean_reward * (n - 1) / n + (all_returns_cat.mean() / n)
         )
@@ -216,83 +217,31 @@ class VPG(Agent):
 
         all_returns_cat = (all_returns_cat - self.mean_reward) / returns_std
 
-
-
-        self.train_policy(all_log_probs_cat, all_returns_cat)
-        return
-        # Print value gradients
-        # for name, param in self.value.named_parameters():
-        #     if param.grad is not None:
-        #         print(name, param.grad.norm().item())
+        self.train_value(all_returns_cat, states_batch)
         
         # Policy Update
         with torch.no_grad():
             updated_values = self.value(states_batch).squeeze(-1)
         
         advantages = all_returns_cat - updated_values
-        print("Raw advantage mean:", advantages.mean().item(), 
-            "Raw advantage std:", advantages.std().item())
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        
-        # Policy loss
+        self.logger.log_scalar("Raw advantage mean:", advantages.mean().item())
+        self.logger.log_scalar("Raw advantage std:", advantages.std().item())
+        self.train_policy(all_log_probs_cat, advantages)
+        return
+
+    def train_policy(self, log_probs, returns):
+        assert log_probs.shape == returns.shape, "Expected same shape for log_probs and returns!"
         self.optimizer_policy.zero_grad()
         policy_loss = -(log_probs * returns).mean()
-
         policy_loss.backward()
         
         # Gradient clipping
         torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 10.0)
-        print("policy gradients")
+        grads = []
         # Print policy gradients
         for name, param in self.policy.named_parameters():
             if param.grad is not None:
-                print(name, param.grad.norm().item())
+                grads.append(param.grad.norm().item())
+        self.logger.log_scalar(f"policy grad std :", np.std(grads))
         self.optimizer_policy.step()
-        
-        # Print losses
-        print("policy loss:", policy_loss.item())
-        print("value loss:", value_loss.item())
-
-    def learn_from_episodes1(self, completed_episodes):
-        for ep in completed_episodes:
-            self.train(ep)
-            return
-
-    def train(self, episode):
-        """Updates the policy network's weights."""
-        
-        states = []
-        log_probs = []
-        rewards = []
-        actions = []
-        
-        # Unpack transitions: (state, action, log_prob, reward)
-        for (s, a, log_p, r) in episode:
-            states.append(s)
-            log_probs.append(log_p)
-            rewards.append(r)
-            actions.append(a)
-                
-        returns = []
-        G = 0
-        # Calculate returns for each timestep
-        for r in reversed(rewards):
-            G = r + self.discount * G
-            returns.insert(0, G)
-        returns = torch.tensor(returns)
-        print("returns " + str(returns.sum()))
-        self.train_policy(returns, log_probs)
-        
-    def train_policy(self, returns, log_probs):
-        # Normalize returns
-        returns = (returns - returns.mean()) / (returns.std() + 1e-8)
-        
-        loss = 0
-        # Calculate loss
-        for log_prob, G in zip(log_probs, returns):
-            loss += -log_prob * G
-            
-        # Update network weights
-        self.optimizer_policy.zero_grad()
-        loss.backward()
-        self.optimizer_policy.step()
+        self.logger.log_scalar("policy loss:", policy_loss.item())
