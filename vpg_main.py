@@ -38,16 +38,16 @@ def get_action_dim(action_space):
         raise ValueError(f"Unsupported action space type: {type(action_space)}")
 
 def make_env():
-#    return gym.make('Pendulum-v1')
-    return gym.make('CartPole-v1')
+   return gym.make('Pendulum-v1')
+    # return gym.make('CartPole-v1')
 
 test_env = make_env()
 # Create vectorized environment
 num_envs=8
 env = SyncVectorEnv([make_env for _ in range(num_envs)])  # 8 environments
 num_batch = 10
-n_episodes = 200
-dist_params = 1
+n_episodes = 2000
+dist_params = 2
 obs_dim = test_env.observation_space.shape[0]
 action_dim = get_action_dim(test_env.action_space)
 
@@ -60,7 +60,7 @@ value = Value(obs_dim).to(device)
 sampler = lambda policy, state: sample_action_normal(policy, state, a_min=-2, a_max=2)
 logger = Logger("runs/experiment_name")
 agent = VPG(na, value,
-            discrete_sampler,
+            sampler,
             num_envs=num_envs, 
             discount=discount, 
             device=device, 
@@ -82,6 +82,7 @@ for i in range(n_episodes):
     agent.episode_start()
     while not done.all():
         action = agent.get_action(obs, done)
+        action = action.reshape(-1, 1)
         next_obs, reward, terminated, truncated, info = env.step(action.cpu().numpy())
         done = terminated | truncated
         changed = agent.update(obs, action, reward, done, next_obs)

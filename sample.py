@@ -43,7 +43,6 @@ def sample_action_normal(policy, state, a_min=-2.0, a_max=2.0):
         ]
     transformed_dist = TransformedDistribution(base_dist, transforms)
 
-    transformed_dist = base_dist
     # Sample an action (no gradient through sample method; use rsample for reparameterization)
     action = transformed_dist.sample()
 

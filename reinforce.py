@@ -9,28 +9,12 @@ np = numpy
 from agent_reinf import Agent
 
 
-class Value(nn.Module):
-    def __init__ (self, state_dim):
-        super().__init__()
-        self.layer1 = nn.Linear(state_dim, 128)
-        self.layer2 = nn.Linear(128, 128)
-        self.value_head = nn.Linear(128, 1)
-
-    def forward(self, x):
-        x = F.relu(self.layer1(x.to(self.layer1.weight)))
-        x = F.relu(self.layer2(x))
-        value = self.value_head(x)
-        return value
-
-
-class VPG(Agent):
-    def __init__(self, policy, value, sampler, policy_lr=0.001, value_lr=0.001, num_envs=8, discount=0.99, device=torch.device('cpu'), logger=None):
+class Reinforce(Agent):
+    def __init__(self, policy, sampler, policy_lr=0.001, value_lr=0.001, num_envs=8, discount=0.99, device=torch.device('cpu'), logger=None):
         super().__init__(logger=logger)
         self.policy = policy
-        self.value = value
         self.sampler = sampler
         self.optimizer_policy = optim.Adam(self.policy.parameters(), lr=policy_lr)#, weight_decay=0.001)
-        self.optimizer_value = optim.Adam(self.value.parameters(), lr=value_lr, weight_decay=0.001)
         self.num_envs = num_envs
         self.episodes = [[] for _ in range(num_envs)]  # Separate buffer for each env
         self.discount = discount
@@ -189,13 +173,16 @@ class VPG(Agent):
         # Concatenate all episodes
         states_batch = torch.cat(all_states, dim=0).to(self.device)
         all_returns_cat = torch.cat(all_returns, dim=0).to(self.device)
+        
         all_log_probs_cat = torch.cat(all_log_probs, dim=0).to(self.device)
         all_actions_cat = torch.cat(all_actions, dim=0).to(self.device)
 
+        _, _, dist = self.sampler(self.policy, states_batch)
+        log_p1 = dist.log_prob(all_actions_cat)
 
         # Get distribution parameters (only needed for printing stats)
-        with torch.no_grad():
-            _, _, transformed_dist = self.sampler(self.policy, states_batch)
+        # with torch.no_grad():
+        #     _, _, transformed_dist = self.sampler(self.policy, states_batch)
         
         self.logger.log_scalar(f"actions mean", all_actions_cat.to(torch.float32).mean())
         self.logger.log_scalar("action std",  all_actions_cat.to(torch.float32).std())
@@ -212,21 +199,9 @@ class VPG(Agent):
             self.mean_std * (n - 1) / n + all_returns_cat.std() / n
         )
         returns_std = all_returns_cat.std() + 1e-8
-        returns = (all_returns_cat - all_returns_cat.mean()) / (all_returns_cat.std() + 1e-8)
-        
 
         all_returns_cat = (all_returns_cat - self.mean_reward) / returns_std
-
-        self.train_value(all_returns_cat, states_batch)
-        
-        # Policy Update
-        with torch.no_grad():
-            updated_values = self.value(states_batch).squeeze(-1)
-        
-        advantages = all_returns_cat - updated_values
-        self.logger.log_scalar("Raw advantage mean:", advantages.mean().item())
-        self.logger.log_scalar("Raw advantage std:", advantages.std().item())
-        self.train_policy(all_log_probs_cat, advantages)
+        self.train_policy(log_p1, all_returns_cat)
         return
 
     def train_policy(self, log_probs, returns):
