@@ -63,9 +63,9 @@ class ReinforceBase(Agent):
         self.process_dones(dones)
 
         if self.should_learn():
-            episodes = self.get_completed_episodes()
+            episodes = self.get_train_episodes()
             self.learn_from_episodes(episodes)
-            self.print_episode_stats(episodes)
+            self.print_episode_stats(self.get_completed_episodes())
             self.version += 1  # Increment version before clearing
             self.clear_completed()
             return True
@@ -99,7 +99,7 @@ class ReinforceBase(Agent):
         # Value Network Update
         value_epochs = 2
         mini_batch_size = 256
-        
+
         for epoch in range(value_epochs):
             indices = np.random.permutation(len(states_batch))
             for start in range(0, len(states_batch), mini_batch_size):
@@ -111,7 +111,7 @@ class ReinforceBase(Agent):
                 value_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.value.parameters(), 10.0)
                 self.optimizer_value.step()
-                
+
         self.logger.log_scalar(f"value loss",  value_loss)
 
     def learn_from_episodes(self, episodes):
@@ -124,13 +124,13 @@ class ReinforceBase(Agent):
         states_batch, returns_batch, log_probs_batch, actions_batch = self._prepare_batches(
             states_list, log_probs_list, rewards_list, actions_list
         )
-        
+
         # Normalize the returns
         normalized_returns = self._normalize_returns(returns_batch)
-        
+
         # Log statistics
         self._log_training_stats(actions_batch)
-        
+
         # Finally, train the policy (using log probs computed from current policy)
         self.train_policy(log_probs_batch, normalized_returns)
 
@@ -144,7 +144,7 @@ class ReinforceBase(Agent):
         log_probs_list = []
         rewards_list = []
         actions_list = []
-        
+
         for episode in episodes:
             if not episode:
                 continue
@@ -155,13 +155,13 @@ class ReinforceBase(Agent):
                 log_probs.append(log_p)
                 rewards.append(r)
                 actions.append(a)
-            
+
             # Stack (or convert) collected data so that each episode becomes a tensor
             states_list.append(torch.stack(states))
             log_probs_list.append(torch.stack(log_probs))
             rewards_list.append(torch.tensor(rewards, dtype=torch.float32))
             actions_list.append(torch.stack(actions))
-        
+
         return states_list, log_probs_list, rewards_list, actions_list
 
     def _compute_discounted_returns(self, rewards):
@@ -183,20 +183,13 @@ class ReinforceBase(Agent):
         Also, recompute log probabilities from current policy for consistency.
         """
         returns_list = [self._compute_discounted_returns(rewards) for rewards in rewards_list]
-        
+
         # Concatenate all episodes along dimension 0 (the time dimension)
         states_batch = torch.cat(states_list, dim=0).to(self.device)
         returns_batch = torch.cat(returns_list, dim=0).to(self.device)
         actions_batch = torch.cat(actions_list, dim=0).to(self.device)
-        
-        # Recompute log probabilities according to the current policy
-        _, _, dist = self.sampler(self.policy, states_batch)
-        log_probs_batch = dist.log_prob(actions_batch)
-        
-        # Ensure log_probs_batch has shape matching returns_batch
-        if log_probs_batch.shape != returns_batch.shape:
-            log_probs_batch = log_probs_batch.reshape(returns_batch.shape)
-        
+        log_probs_batch = torch.cat(log_probs_list, dim=0).to(self.device).reshape(returns_batch.shape)
+
         return states_batch, returns_batch, log_probs_batch, actions_batch
 
     def _normalize_returns(self, returns_batch):
@@ -206,7 +199,7 @@ class ReinforceBase(Agent):
         # Update running mean if it's the first update
         if self.mean_reward == -10000:
             self.mean_reward = returns_batch.mean()
-        
+
         n = 5.0
         self.mean_reward = (
             self.mean_reward * (n - 1) / n + (returns_batch.mean() / n)
@@ -214,7 +207,7 @@ class ReinforceBase(Agent):
         self.mean_std = (
             self.mean_std * (n - 1) / n + returns_batch.std() / n
         )
-        
+
         returns_std = returns_batch.std() + 1e-8  # prevent division by zero
         return (returns_batch - self.mean_reward) / returns_std
 
@@ -223,11 +216,11 @@ class ReinforceBase(Agent):
         Log various statistics about the actions and returns.
         """
         self.logger.log_scalar(
-            "actions mean", 
+            "actions mean",
             actions_batch.to(torch.float32).mean()
         )
         self.logger.log_scalar(
-            "action std",  
+            "action std",
             actions_batch.to(torch.float32).std()
         )
 
@@ -236,7 +229,7 @@ class ReinforceBase(Agent):
         self.optimizer_policy.zero_grad()
         policy_loss = -(log_probs * returns).mean()
         policy_loss.backward()
-        
+
         # Gradient clipping
         torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 10.0)
         grads = []
@@ -251,7 +244,7 @@ class ReinforceBase(Agent):
 
 
 class Reinforce(ReinforceBase, EpisodesPoolMixin):
-    
+
     def __init__(
         self,
         policy,
@@ -262,91 +255,126 @@ class Reinforce(ReinforceBase, EpisodesPoolMixin):
         device=torch.device("cpu"),
         logger=None,
     ):
-        super().__init__(policy, sampler, policy_lr=policy_lr, 
+        super().__init__(policy, sampler, policy_lr=policy_lr,
                          num_envs=num_envs, discount=discount,
                          device=device, logger=logger)
-        
-        
+
+
 class ReinforceWithOldEpisodes(ReinforceBase, EpisodesOldPoolMixin):
-   def learn_from_episodes(self, completed_episodes):
-        # Prepare lists to store all data from all completed episodes
-        all_states = []
-        all_returns = []
-        all_log_probs = []
-        all_actions = []
-        
-        # Step 1: Compute returns per episode, store them
-        for episode in completed_episodes:
-            if len(episode) == 0:  # Skip empty episodes
-                continue
-                
-            states = []
-            log_probs = []
-            rewards = []
-            actions = []
-            
-            # Unpack transitions: (state, action, log_prob, reward)
-            for (s, a, log_p, r) in episode:
-                states.append(s)
-                log_probs.append(log_p)
-                rewards.append(r)
-                actions.append(a)
-                
-            # Convert to tensors
-            states = torch.stack(states)
-            rewards = torch.tensor(rewards, dtype=torch.float32)
-            log_probs = torch.stack(log_probs).reshape(rewards.shape)
-            actions = torch.stack(actions)
-            
-            # Compute discounted returns Gt (backward)
-            returns = []
-            G = 0
-            for r_t in reversed(rewards):
-                G = r_t + self.discount * G
-                returns.insert(0, G)
-            returns = torch.tensor(returns, dtype=torch.float32)
-            
-            # Append tensors directly to lists
-            all_states.append(states)
-            all_returns.append(returns)
-            all_log_probs.append(log_probs)
-            all_actions.append(actions)
-        
-        # Skip update if no valid episodes
-        if not all_states:
+
+    def learn_from_episodes(self, episodes):
+        # Extract per-episode tensors/lists
+        states_list, log_probs_list, rewards_list, actions_list = self._extract_episode_data(episodes)
+        if not states_list:
             return
-        
-        # Concatenate all episodes
-        states_batch = torch.cat(all_states, dim=0).to(self.device)
-        all_returns_cat = torch.cat(all_returns, dim=0).to(self.device)
-        
-        all_log_probs_cat = torch.cat(all_log_probs, dim=0).to(self.device)
-        all_actions_cat = torch.cat(all_actions, dim=0).to(self.device)
 
+        # Prepare batches: compute discounted returns, and then aggregate states, returns, etc.
+        states_batch, returns_batch, log_probs_batch, actions_batch = self._prepare_batches(
+            states_list, log_probs_list, rewards_list, actions_list
+        )
+
+        # Normalize the returns
+        normalized_returns = self._normalize_returns(returns_batch)
+
+        # Log statistics
+        self._log_training_stats(actions_batch)
         _, _, dist = self.sampler(self.policy, states_batch)
-        log_p1 = dist.log_prob(all_actions_cat).reshape(all_returns_cat.shape)
+        log_p1 = dist.log_prob(actions_batch).reshape(returns_batch.shape)
+        # Finally, train the policy (using log probs computed from current policy)
+        self.train_policy(log_p1, normalized_returns)
 
-        # Get distribution parameters (only needed for printing stats)
-        # with torch.no_grad():
-        #     _, _, transformed_dist = self.sampler(self.policy, states_batch)
-        
-        self.logger.log_scalar(f"actions mean", all_actions_cat.to(torch.float32).mean())
-        self.logger.log_scalar("action std",  all_actions_cat.to(torch.float32).std())
-        
-        # Normalize returns
-        if self.mean_reward == -10000:
-            self.mean_reward = all_returns_cat.mean()
-        
-        n = 5
-        self.mean_reward = (
-            self.mean_reward * (n - 1) / n + (all_returns_cat.mean() / n)
-        )
-        self.mean_std = (
-            self.mean_std * (n - 1) / n + all_returns_cat.std() / n
-        )
-        returns_std = all_returns_cat.std() + 1e-8
 
-        all_returns_cat = (all_returns_cat - self.mean_reward) / returns_std
-        self.train_policy(log_p1, all_returns_cat)
-        return
-        
+class ReinforcePred(Reinforce):
+    def __init__(
+        self,
+        policy,
+        sampler,
+        predictor,
+        predictor_lr=0.001,
+        num_envs=8,
+        discount=0.99,
+        device=torch.device("cpu"),
+        logger=None,
+        policy_lr=0.001
+    ):
+        # Initialize using the parent class which setups episodes pooling etc.
+        super().__init__(
+            policy,
+            sampler,
+            policy_lr=policy_lr,
+            num_envs=num_envs,
+            discount=discount,
+            device=device,
+            logger=logger,
+        )
+        # Store the predictor network and its optimizer
+        self.predictor = predictor.to(self.device)
+        self.optimizer_predictor = optim.Adam(self.predictor.parameters(), lr=predictor_lr)
+        # Running average of prediction error (for bonus computation)
+        self.avg_pred_error = 0.0
+
+    def update(self, obs, actions, rewards, dones, next_obs):
+        """
+        For each environment, use the last transition (state,action) to predict next state,
+        compute the prediction error (MSE), update the predictor network, then add
+        an exploration bonus equal to (prediction error - running average error) to each reward.
+        Finally, call the parent's update() method with modified rewards.
+        """
+        bonus_rewards = np.zeros_like(rewards)
+        available_indices = []
+        pred_input_states = []
+        pred_input_actions = []
+        target_next_states = []
+
+        # For each environment with at least one stored transition:
+        for env_idx in range(self.num_envs):
+            if len(self.episodes[env_idx]) > 0:
+                # The stored transition is a tuple: (state, action, log_prob, reward)
+                # We use the state and action from the last transition.
+                transition = self.episodes[env_idx][-1]
+                state_saved, action_saved, *_ = transition
+                available_indices.append(env_idx)
+                pred_input_states.append(state_saved)
+                pred_input_actions.append(action_saved)
+                # Convert next_obs for the environment to a tensor and send to device.
+                target_next_states.append(torch.FloatTensor(next_obs[env_idx]).to(self.device))
+
+        if available_indices:
+            states_tensor = torch.stack(pred_input_states)  # shape: [batch, state_dim]
+            actions_tensor = torch.stack(pred_input_actions)  # shape: [batch, action_dim]
+            # Concatenate state and action along feature dimension.
+            predictor_input = torch.cat([states_tensor.to(actions_tensor.device), actions_tensor], dim=-1)
+            predicted_next = self.predictor(predictor_input)
+            targets = torch.stack(target_next_states)
+            # Compute per-sample mean squared error (MSE)
+            loss_tensor = F.mse_loss(predicted_next, targets, reduction='none')
+            # Average error per sample (mean over state-dimensions)
+            pred_errors = loss_tensor.mean(dim=1)
+            pred_loss = pred_errors.mean()
+
+            # Update the predictor network
+            self.optimizer_predictor.zero_grad()
+            pred_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.predictor.parameters(), 10.0)
+            self.optimizer_predictor.step()
+
+            # Update the running average (simple exponential moving average)
+            mean_error = pred_errors.mean().item()
+            if self.avg_pred_error == 0:
+                self.avg_pred_error = mean_error
+            else:
+                self.avg_pred_error = 0.99 * self.avg_pred_error + 0.01 * mean_error
+
+            # Compute bonus reward for each sample
+            bonus = pred_errors.detach().cpu().numpy() - self.avg_pred_error
+            for i, env_idx in enumerate(available_indices):
+                bonus_rewards[env_idx] = bonus[i]
+
+        # Log the running average prediction error.
+        self.logger.log_scalar("avg_pred_error", self.avg_pred_error)
+
+        # Combine the environment reward with the exploration bonus.
+        mod_rewards = rewards + bonus_rewards
+
+        # Pass the modified rewards to the parent update() method.
+        return super().update(obs, actions, mod_rewards, dones, next_obs)

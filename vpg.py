@@ -86,3 +86,8 @@ class VPG(VPGBase, EpisodesPoolMixin):
     pass
 
 
+class VPG(VPGBase, EpisodesPoolMixin):
+    pass
+
+
+

@@ -35,6 +35,9 @@ class EpisodesPoolMixin:
     def get_completed_episodes(self):
         return self.completed
 
+    def get_train_episodes(self):
+        return self.get_completed_episodes()
+
     def clear_completed(self):
         self.completed = []
         for env_idx in range(self.num_envs):
@@ -50,7 +53,7 @@ class EpisodesOldPoolMixin(EpisodesPoolMixin):
 
     def process_dones(self, dones):
         completed_episodes = super().process_dones(dones)
-        
+
         # Add completed episodes to the pool
         for episode in completed_episodes:
             if len(self.episode_pool) < self.pool_size:
@@ -59,15 +62,15 @@ class EpisodesOldPoolMixin(EpisodesPoolMixin):
                 # Replace random episode in the pool
                 idx = random.randint(0, self.pool_size - 1)
                 self.episode_pool[idx] = episode
-        
+
         return completed_episodes
 
-    def get_completed_episodes(self):
+    def get_train_episodes(self):
         if len(self.episode_pool) == 0:
             return []
         # Select random subset from pool for learning
         return random.sample(
-            self.episode_pool, 
+            self.episode_pool,
             min(self.num_envs, len(self.episode_pool))
         )
 
