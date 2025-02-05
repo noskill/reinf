@@ -63,7 +63,7 @@ class VPGBase(ReinforceBase):
         # Finally, train the policy (using log probs computed from current policy)
         if len(entropy_batch.shape) == 2 and entropy_batch.shape[1] == 1:
             entropy_batch = entropy_batch.flatten()
-        self.train_policy(log_probs_batch, advantages, entropy_batch)
+        self.train_policy(log_probs_batch, advantages, entropy_batch, states_batch)
 
     def train_value(self, returns, states_batch):
         # Value Network Update

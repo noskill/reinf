@@ -130,13 +130,13 @@ class RLTrainer:
 
 
 def main():
-    
-    name = 'Pendulum-v1'
     name = 'CartPole-v1'
+    name = 'Pendulum-v1'
+
     trainer = RLTrainer(
         env_name=name,
         num_envs=8,
-        n_episodes=2000,
+        n_episodes=5000,
         hidden_dim=256,
         discount=0.99,
         policy_lr=0.0001

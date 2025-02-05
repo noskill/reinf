@@ -34,7 +34,7 @@ class ReinforceBase(Agent):
         self.device = device
         self.version = 0
         self.entropy_coef = 0.05
-        self.entropy_thresh = 0.5
+        self.entropy_thresh = 0.2
         logger.add_hparams(dict(policy_lr=policy_lr, discount=discount, entropy_coef=self.entropy_coef,
                                 entropy_thresh=self.entropy_thresh),
                            dict())
@@ -121,9 +121,10 @@ class ReinforceBase(Agent):
 
         # Log statistics
         self._log_training_stats(actions_batch)
-
+        if len(entropy_batch.shape) == 2 and entropy_batch.shape[1] == 1:
+            entropy_batch = entropy_batch.flatten()
         # Finally, train the policy (using log probs computed from current policy)
-        self.train_policy(log_probs_batch, normalized_returns, entropy_batch)
+        self.train_policy(log_probs_batch, normalized_returns, entropy_batch, states_batch)
 
     def _extract_episode_data(self, episodes):
         """
@@ -217,13 +218,19 @@ class ReinforceBase(Agent):
             actions_batch.to(torch.float32).std()
         )
 
-    def train_policy(self, log_probs, returns, entropy=torch.zeros(1)):
+    def train_policy(self, log_probs, returns, entropy=torch.zeros(1), states_batch=None):
         assert log_probs.shape == returns.shape, "Expected same shape for log_probs and returns!"
         assert log_probs.shape == entropy.shape, "Expected same shape for log_probs and entropy!"
         self.optimizer_policy.zero_grad()
         m = (entropy < self.entropy_thresh)
         e_loss =  -(self.entropy_coef * entropy * m).to(log_probs).mean()
-        policy_loss = -(log_probs * returns).mean() + e_loss
+        mu_loss = 0
+        if states_batch is not None:
+            out = self.policy(states_batch)
+            mu = out[..., :1]
+            mu_loss = 0.01 * torch.mean(mu ** 2 * (mu.abs() > 2)).mean()
+        self.logger.log_scalar("mu loss:", mu_loss.item())
+        policy_loss = -(log_probs * returns).mean() + e_loss + mu_loss
         if policy_loss > 100:
             import pdb;pdb.set_trace()
         policy_loss.backward()
