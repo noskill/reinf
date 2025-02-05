@@ -4,6 +4,8 @@ from torch.distributions import *
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+from torch.distributions import TransformedDistribution
+
 np = numpy
 
 from agent_reinf import Agent
@@ -31,6 +33,11 @@ class ReinforceBase(Agent):
         self.mean_std = 0
         self.device = device
         self.version = 0
+        self.entropy_coef = 0.05
+        self.entropy_thresh = 0.5
+        logger.add_hparams(dict(policy_lr=policy_lr, discount=discount, entropy_coef=self.entropy_coef,
+                                entropy_thresh=self.entropy_thresh),
+                           dict())
         super().__init__(logger=logger)
 
     def episode_start(self):
@@ -44,7 +51,10 @@ class ReinforceBase(Agent):
 
         active_states = torch.FloatTensor(state[active_mask])
         actions, log_probs, dist = self.sampler(self.policy, active_states)
-
+        if isinstance(dist, TransformedDistribution):
+            entropy = dist.base_dist.entropy()
+        else:
+            entropy = dist.entropy()
         full_actions = torch.zeros(
             (active_mask.shape[0], actions.shape[1] if len(actions.shape) > 1 else 1)
         ).to(actions)
@@ -52,7 +62,7 @@ class ReinforceBase(Agent):
 
         active_env_indices = np.where(active_mask)[0]
         for idx, env_idx in enumerate(active_env_indices):
-            self.add_transition(env_idx, active_states[idx], actions[idx], log_probs[idx])
+            self.add_transition(env_idx, active_states[idx], actions[idx], log_probs[idx], entropy[idx])
 
         return full_actions.flatten()
 
@@ -82,7 +92,7 @@ class ReinforceBase(Agent):
         for episode in completed_episodes:
             episode_lengths.append(len(episode))
             # Sum up rewards for the episode
-            episode_return = sum(reward for _, _, _, reward in episode)
+            episode_return = sum(reward for _, _, _,_, reward in episode)
             episode_returns.append(episode_return)
 
         # Calculate statistics
@@ -95,34 +105,15 @@ class ReinforceBase(Agent):
         self.logger.log_scalar(f"min return",  min(episode_returns))
         self.logger.log_scalar(f"max return",  max(episode_returns))
 
-    def train_value(self, returns, states_batch):
-        # Value Network Update
-        value_epochs = 2
-        mini_batch_size = 256
-
-        for epoch in range(value_epochs):
-            indices = np.random.permutation(len(states_batch))
-            for start in range(0, len(states_batch), mini_batch_size):
-                end = start + mini_batch_size
-                batch_idx = indices[start:end]
-                pred_values = self.value(states_batch[batch_idx].detach()).squeeze(-1)
-                value_loss = F.mse_loss(pred_values, returns[batch_idx])
-                self.optimizer_value.zero_grad()
-                value_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.value.parameters(), 10.0)
-                self.optimizer_value.step()
-
-        self.logger.log_scalar(f"value loss",  value_loss)
-
     def learn_from_episodes(self, episodes):
         # Extract per-episode tensors/lists
-        states_list, log_probs_list, rewards_list, actions_list = self._extract_episode_data(episodes)
+        states_list, log_probs_list, rewards_list, actions_list, entropy_list = self._extract_episode_data(episodes)
         if not states_list:
             return
 
         # Prepare batches: compute discounted returns, and then aggregate states, returns, etc.
-        states_batch, returns_batch, log_probs_batch, actions_batch = self._prepare_batches(
-            states_list, log_probs_list, rewards_list, actions_list
+        states_batch, returns_batch, log_probs_batch, actions_batch, entropy_batch = self._prepare_batches(
+            states_list, log_probs_list, rewards_list, actions_list, entropy_list
         )
 
         # Normalize the returns
@@ -132,37 +123,38 @@ class ReinforceBase(Agent):
         self._log_training_stats(actions_batch)
 
         # Finally, train the policy (using log probs computed from current policy)
-        self.train_policy(log_probs_batch, normalized_returns)
+        self.train_policy(log_probs_batch, normalized_returns, entropy_batch)
 
     def _extract_episode_data(self, episodes):
         """
-        From a list of episodes, each consisting of a sequence of (state, action, log_prob, reward),
-        return four lists: states_list, log_probs_list, rewards_list, and actions_list.
+        From a list of episodes, each consisting of a sequence of (state, action, log_prob, entropy, reward),
+        return four lists: states_list, log_probs_list, rewards_list, and actions_list, entropy_list.
         Each element in the returned lists corresponds to one episode.
         """
         states_list = []
         log_probs_list = []
         rewards_list = []
         actions_list = []
-
+        entropy_list = []
         for episode in episodes:
             if not episode:
                 continue
 
-            states, log_probs, rewards, actions = [], [], [], []
-            for (s, a, log_p, r) in episode:
+            states, log_probs, rewards, actions, entropy = [], [], [], [], []
+            for (s, a, log_p, e, r) in episode:
                 states.append(s)
                 log_probs.append(log_p)
                 rewards.append(r)
                 actions.append(a)
+                entropy.append(e)
 
             # Stack (or convert) collected data so that each episode becomes a tensor
             states_list.append(torch.stack(states))
             log_probs_list.append(torch.stack(log_probs))
             rewards_list.append(torch.tensor(rewards, dtype=torch.float32))
             actions_list.append(torch.stack(actions))
-
-        return states_list, log_probs_list, rewards_list, actions_list
+            entropy_list.append(torch.stack(entropy))
+        return states_list, log_probs_list, rewards_list, actions_list, entropy_list
 
     def _compute_discounted_returns(self, rewards):
         """
@@ -176,7 +168,7 @@ class ReinforceBase(Agent):
             returns.insert(0, G)
         return torch.tensor(returns, dtype=torch.float32)
 
-    def _prepare_batches(self, states_list, log_probs_list, rewards_list, actions_list):
+    def _prepare_batches(self, states_list, log_probs_list, rewards_list, actions_list, entropy_list):
         """
         From lists of per-episode data, compute discounted returns for each episode
         then concat all episodes to form large batches.
@@ -189,8 +181,9 @@ class ReinforceBase(Agent):
         returns_batch = torch.cat(returns_list, dim=0).to(self.device)
         actions_batch = torch.cat(actions_list, dim=0).to(self.device)
         log_probs_batch = torch.cat(log_probs_list, dim=0).to(self.device).reshape(returns_batch.shape)
+        entropy_batch = torch.cat(entropy_list, dim=0).to(self.device)
 
-        return states_batch, returns_batch, log_probs_batch, actions_batch
+        return states_batch, returns_batch, log_probs_batch, actions_batch, entropy_batch
 
     def _normalize_returns(self, returns_batch):
         """
@@ -224,20 +217,27 @@ class ReinforceBase(Agent):
             actions_batch.to(torch.float32).std()
         )
 
-    def train_policy(self, log_probs, returns):
+    def train_policy(self, log_probs, returns, entropy=torch.zeros(1)):
         assert log_probs.shape == returns.shape, "Expected same shape for log_probs and returns!"
+        assert log_probs.shape == entropy.shape, "Expected same shape for log_probs and entropy!"
         self.optimizer_policy.zero_grad()
-        policy_loss = -(log_probs * returns).mean()
+        m = (entropy < self.entropy_thresh)
+        e_loss =  -(self.entropy_coef * entropy * m).to(log_probs).mean()
+        policy_loss = -(log_probs * returns).mean() + e_loss
+        if policy_loss > 100:
+            import pdb;pdb.set_trace()
         policy_loss.backward()
 
         # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 10.0)
+        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 0.4)
         grads = []
         # Print policy gradients
         for name, param in self.policy.named_parameters():
             if param.grad is not None:
                 grads.append(param.grad.norm().item())
         self.logger.log_scalar(f"policy grad std :", np.std(grads))
+        self.logger.log_scalar(f"entropy mean :", entropy.mean())
+        self.logger.log_scalar(f"entropy loss :", e_loss)
         self.optimizer_policy.step()
         self.logger.log_scalar("policy loss:", policy_loss.item())
 
@@ -264,12 +264,12 @@ class ReinforceWithOldEpisodes(ReinforceBase, EpisodesOldPoolMixin):
 
     def learn_from_episodes(self, episodes):
         # Extract per-episode tensors/lists
-        states_list, log_probs_list, rewards_list, actions_list = self._extract_episode_data(episodes)
+        states_list, log_probs_list, rewards_list, actions_list, dist = self._extract_episode_data(episodes)
         if not states_list:
             return
 
         # Prepare batches: compute discounted returns, and then aggregate states, returns, etc.
-        states_batch, returns_batch, log_probs_batch, actions_batch = self._prepare_batches(
+        states_batch, returns_batch, log_probs_batch, actions_batch, entropy_batch = self._prepare_batches(
             states_list, log_probs_list, rewards_list, actions_list
         )
 

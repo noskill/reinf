@@ -33,7 +33,7 @@ class RLTrainer:
         policy_lr=0.0001,
         device=torch.device('cuda'),
         seed=148234324,
-        experiment_dir="runs/reinforce"
+        experiment_dir="runs/reinforce-entropy"
     ):
         self.env_name = env_name
         self.num_envs = num_envs

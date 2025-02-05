@@ -28,6 +28,7 @@ def sample_action_normal(policy, state, a_min=-2.0, a_max=2.0):
     out = policy(state)
     mu = out[..., :1]
     log_sigma = out[..., 1:]
+    log_sigma = torch.clamp(log_sigma, -20, 2)
 
     # Convert log_sigma to a positive std; softplus is a common choice
     sigma = F.softplus(log_sigma) + 1e-6
@@ -47,7 +48,7 @@ def sample_action_normal(policy, state, a_min=-2.0, a_max=2.0):
     action = transformed_dist.sample()
 
     # Optionally clamp to ensure numerical stability
-    action = torch.clamp(action, a_min + 1e-6, a_max - 1e-6)
+    action = torch.clamp(action, a_min + 1e-4, a_max - 1e-4)
 
     # Compute log probability. Note .log_prob(action) is shaped [batch_size],
     # so add dimension if you want shape [batch_size, 1].

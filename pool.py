@@ -12,8 +12,8 @@ class EpisodesPoolMixin:
         self.episodes = [[] for _ in range(self.num_envs)]
         self.completed = []
 
-    def add_transition(self, env_idx, state, action, log_prob):
-        self.episodes[env_idx].append((state, action, log_prob))
+    def add_transition(self, env_idx, state, action, log_prob, entropy):
+        self.episodes[env_idx].append((state, action, log_prob, entropy))
 
     def add_reward(self, env_idx, reward):
         if self.episodes[env_idx] and len(self.episodes[env_idx]) > 0:

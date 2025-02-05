@@ -26,6 +26,9 @@ except ImportError as e:
         
         def log_scalar(self, name, value, step=None):
             logging.info("iter " + str(step) + " " + str(name) + " " + str(value))
+    
+        def add_hparams(self, *args, **kwargs):
+            logging.info(f"add_hparams({args}, {kwargs})")
 
 
 class Logger:
@@ -37,6 +40,9 @@ class Logger:
         if step is None:
             step = self.episode_count
         self.writer.add_scalar(name, value, step)
+    
+    def add_hparams(self, *args, **kwargs):
+        self.writer.add_hparams(*args, **kwargs)
 
     def increment_episode(self):
         self.episode_count += 1

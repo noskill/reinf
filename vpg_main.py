@@ -48,7 +48,7 @@ class VPGTrainer(RLTrainer):
             policy_lr=policy_lr,
             device=device,
             seed=seed, 
-            experiment_dir="runs/vpg"
+            experiment_dir=experiment_dir
         )
         
         # Initialize value network
@@ -72,15 +72,16 @@ class VPGTrainer(RLTrainer):
 
 
 def main():
-    name = 'CartPole-v1'  # or 'Pendulum-v1'
+    name = 'Pendulum-v1'  # or 'CartPole-v1'
     trainer = VPGTrainer(
         env_name=name,
         num_envs=8,
-        n_episodes=2000,
+        n_episodes=5000,
         hidden_dim=256,
         discount=0.99,
         policy_lr=0.001,
-        value_lr=0.001
+        value_lr=0.001,
+        experiment_dir='runs/vpg-entropy'
     )
     trainer.train()
 
