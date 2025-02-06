@@ -32,7 +32,10 @@ class VPGBase(ReinforceBase):
         self.sampler = sampler
         weight_decay_value = 0.001
         self.optimizer_value = optim.Adam(self.value.parameters(), lr=value_lr, weight_decay=weight_decay_value)
-        logger.add_hparams(dict(value_lr=value_lr, weight_decay_vl=weight_decay_value), dict())
+        self.hparams.update({
+            'value_lr': value_lr,
+            'weight_decay_vl': weight_decay_value
+        })
 
     def learn_from_episodes(self, episodes):
         # Extract per-episode tensors/lists

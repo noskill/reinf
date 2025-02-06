@@ -35,10 +35,14 @@ class ReinforceBase(Agent):
         self.version = 0
         self.entropy_coef = 0.05
         self.entropy_thresh = 0.2
-        logger.add_hparams(dict(policy_lr=policy_lr, discount=discount, entropy_coef=self.entropy_coef,
-                                entropy_thresh=self.entropy_thresh),
-                           dict())
         super().__init__(logger=logger)
+        self.hparams.update( {
+            'policy_lr': policy_lr,
+            'discount': discount,
+            'entropy_coef': self.entropy_coef,
+            'entropy_thresh': self.entropy_thresh
+        })
+
 
     def episode_start(self):
         self.reset_episodes()
@@ -273,16 +277,38 @@ class Reinforce(ReinforceBase, EpisodesPoolMixin):
 
 
 class ReinforceWithOldEpisodes(ReinforceBase, EpisodesOldPoolMixin):
+    def __init__(
+        self,
+        policy,
+        sampler,
+        policy_lr=0.001,
+        num_envs=8,
+        discount=0.99,
+        device=torch.device("cpu"),
+        logger=None,
+        pool_size=50,
+    ):
+        super().__init__(
+            policy,
+            sampler,
+            policy_lr=policy_lr,
+            num_envs=num_envs,
+            discount=discount,
+            device=device,
+            logger=logger
+        )
+        self.pool_size = pool_size
 
     def learn_from_episodes(self, episodes):
         # Extract per-episode tensors/lists
-        states_list, log_probs_list, rewards_list, actions_list, dist = self._extract_episode_data(episodes)
+        states_list, log_probs_list, rewards_list, actions_list, entropy_list = self._extract_episode_data(episodes)
+
         if not states_list:
             return
 
         # Prepare batches: compute discounted returns, and then aggregate states, returns, etc.
         states_batch, returns_batch, log_probs_batch, actions_batch, entropy_batch = self._prepare_batches(
-            states_list, log_probs_list, rewards_list, actions_list
+            states_list, log_probs_list, rewards_list, actions_list, entropy_list
         )
 
         # Normalize the returns
@@ -290,7 +316,181 @@ class ReinforceWithOldEpisodes(ReinforceBase, EpisodesOldPoolMixin):
 
         # Log statistics
         self._log_training_stats(actions_batch)
-        _, _, dist = self.sampler(self.policy, states_batch)
-        log_p1 = dist.log_prob(actions_batch).reshape(returns_batch.shape)
-        # Finally, train the policy (using log probs computed from current policy)
-        self.train_policy(log_p1, normalized_returns)
+
+        # Recompute log probabilities with current policy
+        _, log_probs, dist = self.sampler(self.policy, states_batch)
+        if isinstance(dist, TransformedDistribution):
+            entropy = dist.base_dist.entropy()
+        else:
+            entropy = dist.entropy()
+
+        # Reshape log probabilities to match returns shape if necessary
+        if log_probs.shape != returns_batch.shape:
+            log_probs = log_probs.reshape(returns_batch.shape)
+
+        # Finally, train the policy using current policy's log probs
+        self.train_policy(log_probs, normalized_returns, entropy, states_batch)
+
+
+class ReinforceWithPrediction(ReinforceBase, EpisodesPoolMixin):
+    def __init__(
+        self,
+        policy,
+        predictor,
+        sampler,
+        policy_lr=0.001,
+        predictor_lr=0.001,
+        num_envs=8,
+        discount=0.99,
+        device=torch.device("cpu"),
+        logger=None,
+        prediction_bonus_scale=0.1
+    ):
+        super().__init__(
+            policy,
+            sampler,
+            policy_lr=policy_lr,
+            num_envs=num_envs,
+            discount=discount,
+            device=device,
+            logger=logger,
+        )
+        self.predictor = predictor
+        self.prediction_bonus_scale = prediction_bonus_scale
+        weight_decay_predictor = 0.001
+        self.optimizer_predictor = optim.Adam(
+            self.predictor.parameters(),
+            lr=predictor_lr,
+            weight_decay=weight_decay_predictor
+        )
+        self.prediction_error_mean = 0
+        self.prediction_error_std = 1
+        self.hparams.update(
+            dict(
+                predictor_lr=predictor_lr,
+                weight_decay_pred=weight_decay_predictor,
+                prediction_bonus_scale=prediction_bonus_scale
+            ))
+
+    def _extract_episode_data_with_next_states(self, episodes):
+        states_list, log_probs_list, rewards_list, actions_list, entropy_list = [], [], [], [], []
+        next_states_list = []
+
+        for episode in episodes:
+            if not episode:
+                continue
+            states, actions, log_probs, entropy, rewards = [], [], [], [], []
+            next_states = []
+
+            for i in range(len(episode)-1):
+                s, a, log_p, e, r = episode[i]
+                next_s, _, _, _, _ = episode[i+1]
+
+                states.append(s)
+                actions.append(a)
+                log_probs.append(log_p)
+                entropy.append(e)
+                rewards.append(r)
+                next_states.append(next_s)
+
+            # Handle last transition
+            if episode:
+                s, a, log_p, e, r = episode[-1]
+                states.append(s)
+                actions.append(a)
+                log_probs.append(log_p)
+                entropy.append(e)
+                rewards.append(r)
+                next_states.append(s)  # Use current state as next state for last transition
+
+            states_list.append(torch.stack(states))
+            actions_list.append(torch.stack(actions))
+            log_probs_list.append(torch.stack(log_probs))
+            entropy_list.append(torch.stack(entropy))
+            rewards_list.append(torch.tensor(rewards, dtype=torch.float32))
+            next_states_list.append(torch.stack(next_states))
+
+        return states_list, log_probs_list, rewards_list, actions_list, entropy_list, next_states_list
+
+    def train_predictor(self, states_batch, actions_batch, next_states_batch):
+        predictor_epochs = 2
+        mini_batch_size = 256
+
+        for epoch in range(predictor_epochs):
+            indices = np.random.permutation(len(states_batch))
+            for start in range(0, len(states_batch), mini_batch_size):
+                self.optimizer_predictor.zero_grad()
+                end = start + mini_batch_size
+                batch_idx = indices[start:end]
+
+                pred_next_states = self.predictor(
+                    states_batch[batch_idx].detach(),
+                    actions_batch[batch_idx].detach()
+                )
+                prediction_loss = F.mse_loss(pred_next_states, next_states_batch[batch_idx])
+
+                prediction_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.predictor.parameters(), 0.4)
+                self.optimizer_predictor.step()
+
+        return prediction_loss.item()
+
+    def compute_prediction_bonus(self, states, actions, next_states):
+        with torch.no_grad():
+            predicted_next_states = self.predictor(states, actions)
+            prediction_errors = F.mse_loss(predicted_next_states, next_states, reduction='none').mean(dim=-1)
+
+            # Update running statistics
+            n = 100.0  # smoothing factor
+            self.prediction_error_mean = (
+                self.prediction_error_mean * (n - 1) / n + prediction_errors.mean().item() / n
+            )
+            self.prediction_error_std = (
+                self.prediction_error_std * (n - 1) / n + prediction_errors.std().item() / n
+            )
+
+            return prediction_errors * self.prediction_bonus_scale
+
+    def learn_from_episodes(self, episodes):
+        # Extract data including next states
+        states_list, log_probs_list, rewards_list, actions_list, entropy_list, next_states_list = (
+            self._extract_episode_data_with_next_states(episodes)
+        )
+
+        if not states_list:
+            return
+
+        # Prepare batches
+        states_batch = torch.cat(states_list, dim=0).to(self.device)
+        actions_batch = torch.cat(actions_list, dim=0).to(self.device)
+        next_states_batch = torch.cat(next_states_list, dim=0).to(self.device)
+        returns_batch = torch.cat([self._compute_discounted_returns(r) for r in rewards_list], dim=0).to(self.device)
+        log_probs_batch = torch.cat(log_probs_list, dim=0).to(self.device)
+        entropy_batch = torch.cat(entropy_list, dim=0).to(self.device)
+
+        # Compute prediction bonus
+        prediction_bonus = self.compute_prediction_bonus(states_batch, actions_batch, next_states_batch)
+        augmented_returns = returns_batch + prediction_bonus
+
+        # Normalize returns
+        normalized_returns = self._normalize_returns(augmented_returns)
+
+        # Train predictor
+        prediction_loss = self.train_predictor(states_batch, actions_batch, next_states_batch)
+        self.logger.log_scalar("prediction_loss", prediction_loss)
+        self.logger.log_scalar("prediction_error_mean", self.prediction_error_mean)
+        self.logger.log_scalar("prediction_error_std", self.prediction_error_std)
+
+        # Log statistics
+        self._log_training_stats(actions_batch)
+
+        # Train policy
+        if len(entropy_batch.shape) > 2 and entropy_batch.shape[1] > 1:
+            entropy_batch = entropy_batch.flatten()
+
+        # Reshape log probabilities to match returns shape if necessary
+        if log_probs_batch.shape != returns_batch.shape:
+            log_probs_batch = log_probs_batch.reshape(returns_batch.shape)
+        if entropy_batch.shape != returns_batch.shape:
+            entropy_batch = entropy_batch.reshape(returns_batch.shape)
+        self.train_policy(log_probs_batch, normalized_returns, entropy_batch, states_batch)

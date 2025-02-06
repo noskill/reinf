@@ -40,6 +40,8 @@ class RLTrainer:
         self.n_episodes = n_episodes
         self.device = device
         self.seed = seed
+        self.discount = discount
+        self.policy_lr = policy_lr
         
         # Initialize environment
         self.test_env = self._make_env()
@@ -139,6 +141,7 @@ def main():
         discount=0.99,
         policy_lr=0.0001
     )
+    trainer.agent.log_hparams()
     trainer.train()
 
 

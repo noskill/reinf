@@ -83,6 +83,7 @@ def main():
         value_lr=0.001,
         experiment_dir='runs/vpg-entropy'
     )
+    trainer.agent.log_hparams()
     trainer.train()
 
 
