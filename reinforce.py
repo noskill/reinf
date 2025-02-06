@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.distributions import TransformedDistribution
-
+from sample import *
 np = numpy
 
 from agent_reinf import Agent
@@ -222,14 +222,19 @@ class ReinforceBase(Agent):
         assert log_probs.shape == returns.shape, "Expected same shape for log_probs and returns!"
         assert log_probs.shape == entropy.shape, "Expected same shape for log_probs and entropy!"
         self.optimizer_policy.zero_grad()
+        # Entropy loss
+
         m = (entropy < self.entropy_thresh)
-        e_loss =  -(self.entropy_coef * entropy * m).to(log_probs).mean()
-        mu_loss = 0
-        if states_batch is not None:
+        e_loss = -(self.entropy_coef * entropy * m).to(log_probs).mean()
+
+        # mu loss for normal distribution (continuous action space)
+        mu_loss = torch.tensor(0.0, device=self.device)
+        if states_batch is not None and isinstance(self.sampler, NormalActionSampler):
             out = self.policy(states_batch)
             mu = out[..., :1]
-            mu_loss = 0.01 * torch.mean(mu ** 2 * (mu.abs() > 2)).mean()
-        self.logger.log_scalar("mu loss:", mu_loss.item())
+            mu_loss = 0.01 * torch.mean(mu**2 * (mu.abs() > 2))
+            self.logger.log_scalar("mu loss:", mu_loss.item())
+
         policy_loss = -(log_probs * returns).mean() + e_loss + mu_loss
         if policy_loss > 100:
             import pdb;pdb.set_trace()
@@ -238,7 +243,7 @@ class ReinforceBase(Agent):
         # Gradient clipping
         torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 0.4)
         grads = []
-        # Print policy gradients
+        # Log gradients
         for name, param in self.policy.named_parameters():
             if param.grad is not None:
                 grads.append(param.grad.norm().item())
@@ -289,99 +294,3 @@ class ReinforceWithOldEpisodes(ReinforceBase, EpisodesOldPoolMixin):
         log_p1 = dist.log_prob(actions_batch).reshape(returns_batch.shape)
         # Finally, train the policy (using log probs computed from current policy)
         self.train_policy(log_p1, normalized_returns)
-
-
-class ReinforcePred(Reinforce):
-    def __init__(
-        self,
-        policy,
-        sampler,
-        predictor,
-        predictor_lr=0.001,
-        num_envs=8,
-        discount=0.99,
-        device=torch.device("cpu"),
-        logger=None,
-        policy_lr=0.001
-    ):
-        # Initialize using the parent class which setups episodes pooling etc.
-        super().__init__(
-            policy,
-            sampler,
-            policy_lr=policy_lr,
-            num_envs=num_envs,
-            discount=discount,
-            device=device,
-            logger=logger,
-        )
-        # Store the predictor network and its optimizer
-        self.predictor = predictor.to(self.device)
-        self.optimizer_predictor = optim.Adam(self.predictor.parameters(), lr=predictor_lr)
-        # Running average of prediction error (for bonus computation)
-        self.avg_pred_error = 0.0
-
-    def update(self, obs, actions, rewards, dones, next_obs):
-        """
-        For each environment, use the last transition (state,action) to predict next state,
-        compute the prediction error (MSE), update the predictor network, then add
-        an exploration bonus equal to (prediction error - running average error) to each reward.
-        Finally, call the parent's update() method with modified rewards.
-        """
-        bonus_rewards = np.zeros_like(rewards)
-        available_indices = []
-        pred_input_states = []
-        pred_input_actions = []
-        target_next_states = []
-
-        # For each environment with at least one stored transition:
-        for env_idx in range(self.num_envs):
-            if len(self.episodes[env_idx]) > 0:
-                # The stored transition is a tuple: (state, action, log_prob, reward)
-                # We use the state and action from the last transition.
-                transition = self.episodes[env_idx][-1]
-                state_saved, action_saved, *_ = transition
-                available_indices.append(env_idx)
-                pred_input_states.append(state_saved)
-                pred_input_actions.append(action_saved)
-                # Convert next_obs for the environment to a tensor and send to device.
-                target_next_states.append(torch.FloatTensor(next_obs[env_idx]).to(self.device))
-
-        if available_indices:
-            states_tensor = torch.stack(pred_input_states)  # shape: [batch, state_dim]
-            actions_tensor = torch.stack(pred_input_actions)  # shape: [batch, action_dim]
-            # Concatenate state and action along feature dimension.
-            predictor_input = torch.cat([states_tensor.to(actions_tensor.device), actions_tensor], dim=-1)
-            predicted_next = self.predictor(predictor_input)
-            targets = torch.stack(target_next_states)
-            # Compute per-sample mean squared error (MSE)
-            loss_tensor = F.mse_loss(predicted_next, targets, reduction='none')
-            # Average error per sample (mean over state-dimensions)
-            pred_errors = loss_tensor.mean(dim=1)
-            pred_loss = pred_errors.mean()
-
-            # Update the predictor network
-            self.optimizer_predictor.zero_grad()
-            pred_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.predictor.parameters(), 10.0)
-            self.optimizer_predictor.step()
-
-            # Update the running average (simple exponential moving average)
-            mean_error = pred_errors.mean().item()
-            if self.avg_pred_error == 0:
-                self.avg_pred_error = mean_error
-            else:
-                self.avg_pred_error = 0.99 * self.avg_pred_error + 0.01 * mean_error
-
-            # Compute bonus reward for each sample
-            bonus = pred_errors.detach().cpu().numpy() - self.avg_pred_error
-            for i, env_idx in enumerate(available_indices):
-                bonus_rewards[env_idx] = bonus[i]
-
-        # Log the running average prediction error.
-        self.logger.log_scalar("avg_pred_error", self.avg_pred_error)
-
-        # Combine the environment reward with the exploration bonus.
-        mod_rewards = rewards + bonus_rewards
-
-        # Pass the modified rewards to the parent update() method.
-        return super().update(obs, actions, mod_rewards, dones, next_obs)

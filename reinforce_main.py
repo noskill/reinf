@@ -49,13 +49,11 @@ class RLTrainer:
         self.obs_dim = self.test_env.observation_space.shape[0]
         self.action_dim = self._get_action_dim(self.test_env.action_space)
         self.dist_params = 1
-        self.sampler = discrete_sampler
+        self.sampler = DiscreteActionSampler()
         
         if env_name == 'Pendulum-v1':
             self.dist_params = 2
-            self.sampler = lambda policy, state: sample_action_normal(
-                policy, state, a_min=-2, a_max=2
-            )
+            self.sampler = NormalActionSampler(a_min=-2, a_max=2)
 
         # Initialize policy network and agent
         self.policy = PolicyNetwork(
