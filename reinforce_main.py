@@ -63,7 +63,7 @@ class RLTrainer:
             self.action_dim * self.dist_params, 
             hidden_dim=hidden_dim
         ).to(device)
-        
+        self.policy.apply(self._init_normal)
         self.logger = Logger(experiment_dir)
         
         self.agent = Reinforce(
@@ -98,9 +98,6 @@ class RLTrainer:
         torch.manual_seed(self.seed)
         random.seed(self.seed)
         np.random.seed(self.seed)
-        
-        # Initialize policy weights
-        self.policy.apply(self._init_normal)
 
         for i in range(self.n_episodes):
             obs, info = self.env.reset(seed=random.randint(0, 1000))
