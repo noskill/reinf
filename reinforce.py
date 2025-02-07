@@ -222,7 +222,7 @@ class ReinforceBase(Agent):
             actions_batch.to(torch.float32).std()
         )
 
-    def train_policy(self, log_probs, returns, entropy=torch.zeros(1), states_batch=None):
+    def train_policy(self, log_probs, returns, entropy=torch.zeros(1), states_batch=None, actions=None):
         assert log_probs.shape == returns.shape, "Expected same shape for log_probs and returns!"
         assert log_probs.shape == entropy.shape, "Expected same shape for log_probs and entropy!"
         self.optimizer_policy.zero_grad()
