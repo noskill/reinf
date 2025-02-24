@@ -31,7 +31,7 @@ class VPGBase(ReinforceBase):
                     device=device, logger=logger, entropy_coef=entropy_coef)
         self.value = value
         self.sampler = sampler
-        weight_decay_value = 0.001
+        weight_decay_value = 0
         self.optimizer_value = optim.Adam(self.value.parameters(), lr=value_lr, weight_decay=weight_decay_value)
         self.hparams.update({
             'value_lr': value_lr,

@@ -13,7 +13,7 @@ import copy
 
 
 class PPO(VPG, EpisodesPoolMixin):
-    def __init__(self, policy, value, sampler, policy_lr=0.0005, value_lr=0.001, num_envs=8, discount=0.99, device=torch.device('cpu'), logger=None, **kwargs):
+    def __init__(self, policy, value, sampler, policy_lr=0.0001, value_lr=0.001, num_envs=8, discount=0.99, device=torch.device('cpu'), logger=None, **kwargs):
         super().__init__(policy, value, sampler, policy_lr=policy_lr, 
                     num_envs=num_envs, discount=discount,
                     device=device, logger=logger)
@@ -39,8 +39,7 @@ class PPO(VPG, EpisodesPoolMixin):
         self._log_training_stats(actions_batch)
         self.train_value(normalized_returns, states_batch)
         
-        self.policy_old.load_state_dict(self.policy.state_dict())
-        self.policy_old = copy.deepcopy(self.policy)
+        self.policy.load_state_dict(self.policy_old.state_dict())
         for i in range(4):
             # Create minibatches
             dataset = torch.utils.data.TensorDataset(states_batch, log_probs_batch, normalized_returns, actions_batch, entropy_batch)
@@ -65,6 +64,7 @@ class PPO(VPG, EpisodesPoolMixin):
                     entropy_minibatch = entropy_minibatch.flatten()
 
                 self.train_policy(log_probs_minibatch, advantages, entropy_minibatch, states_minibatch, actions_minibatch)
+        self.policy_old.load_state_dict(self.policy.state_dict())
 
     def train_policy(self, log_probs, advantages, entropy=torch.zeros(1), states_batch=None, actions_batch=None):
         self.optimizer_policy.zero_grad()
@@ -92,11 +92,12 @@ class PPO(VPG, EpisodesPoolMixin):
 
         # Sample from new and old policy
         _, _, dist = self.sampler(self.policy, states_batch)
-        with torch.no_grad():
-            _, _, dist_old = self.sampler(self.policy_old, states_batch)
+        # with torch.no_grad():
+        #     _, _, dist_old = self.sampler(self.policy_old, states_batch)
 
         log_probs_new = dist.log_prob(actions_batch)
-        log_probs_old = dist_old.log_prob(actions_batch)
+        log_probs_old = log_probs.detach()
+        # log_probs_old = dist_old.log_prob(actions_batch)
 
         # If these are shape [B,1], you might likewise squeeze them:
         if log_probs_new.dim() == 2 and log_probs_new.shape[1] == 1:
@@ -128,7 +129,7 @@ class PPO(VPG, EpisodesPoolMixin):
 
         # Finally, compute ratio
         # Avoid doing .reshape(log_probs.shape); they should be the same shape anyway.
-        ratio = torch.exp(log_probs_new - log_probs_old)
+        ratio = torch.exp(log_probs_new - log_probs_old).clamp(-20, 20)
 
         # Double‐check ratio shape
         assert ratio.shape == log_probs.shape, (
@@ -169,3 +170,27 @@ class PPO(VPG, EpisodesPoolMixin):
 
         self.optimizer_policy.step()
         self.logger.log_scalar("policy loss:", policy_loss.item())
+
+    def get_action(self, state, done):
+        active_mask = ~done
+        if not any(active_mask):
+            return np.zeros((self.num_envs,) + self.policy_old.action_shape)
+
+        active_states = state[active_mask]
+        if not isinstance(active_states, torch.Tensor):
+            active_states = torch.FloatTensor(active_states)
+        actions, log_probs, dist = self.sampler(self.policy_old, active_states)
+        if isinstance(dist, TransformedDistribution):
+            entropy = dist.base_dist.entropy()
+        else:
+            entropy = dist.entropy()
+        full_actions = torch.zeros(
+            (active_mask.shape[0], actions.shape[1] if len(actions.shape) > 1 else 1)
+        ).to(actions)
+        full_actions[active_mask] = actions.reshape(full_actions[active_mask].shape)
+
+        active_env_indices = torch.where(active_mask)[0]
+        for idx, env_idx in enumerate(active_env_indices):
+            self.add_transition(env_idx, active_states[idx], actions[idx], log_probs[idx], entropy[idx])
+
+        return full_actions.flatten()
