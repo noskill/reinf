@@ -12,6 +12,22 @@ from agent_reinf import Agent
 from pool import *
 
 
+class RunningNorm:
+    def __init__(self, epsilon=1e-4):
+        self.mean = None
+        self.std = None
+        self.epsilon = epsilon
+
+    def __call__(self, x):
+        if self.mean is None:
+            self.mean = x.mean(0, keepdim=True)
+            self.std = x.std(0, keepdim=True) + self.epsilon
+        else:
+            self.mean = 0.99 * self.mean + 0.01 * x.mean(0, keepdim=True)
+            self.std = 0.99 * self.std + 0.01 * x.std(0, keepdim=True)
+        return (x - self.mean) / self.std
+
+
 class ReinforceBase(Agent):
     def __init__(
         self,
@@ -23,6 +39,8 @@ class ReinforceBase(Agent):
         discount=0.99,
         device=torch.device("cpu"),
         logger=None,
+        entropy_coef=0.01,
+        **kwargs
     ):
         self.num_envs = num_envs
         self.policy = policy
@@ -33,7 +51,7 @@ class ReinforceBase(Agent):
         self.mean_std = 0
         self.device = device
         self.version = 0
-        self.entropy_coef = 0.05
+        self.entropy_coef = entropy_coef
         self.entropy_thresh = 0.2
         super().__init__(logger=logger)
         self.hparams.update( {
@@ -42,6 +60,7 @@ class ReinforceBase(Agent):
             'entropy_coef': self.entropy_coef,
             'entropy_thresh': self.entropy_thresh
         })
+        self.state_normalizer = None
 
 
     def episode_start(self):
@@ -53,7 +72,9 @@ class ReinforceBase(Agent):
         if not any(active_mask):
             return np.zeros((self.num_envs,) + self.policy.action_shape)
 
-        active_states = torch.FloatTensor(state[active_mask])
+        active_states = state[active_mask]
+        if not isinstance(active_states, torch.Tensor):
+            active_states = torch.FloatTensor(active_states)
         actions, log_probs, dist = self.sampler(self.policy, active_states)
         if isinstance(dist, TransformedDistribution):
             entropy = dist.base_dist.entropy()
@@ -64,7 +85,7 @@ class ReinforceBase(Agent):
         ).to(actions)
         full_actions[active_mask] = actions.reshape(full_actions[active_mask].shape)
 
-        active_env_indices = np.where(active_mask)[0]
+        active_env_indices = torch.where(active_mask)[0]
         for idx, env_idx in enumerate(active_env_indices):
             self.add_transition(env_idx, active_states[idx], actions[idx], log_probs[idx], entropy[idx])
 
@@ -101,8 +122,8 @@ class ReinforceBase(Agent):
 
         # Calculate statistics
         mean_length = np.mean(episode_lengths)
-        mean_return = np.mean(episode_returns)
-        std_return = np.std(episode_returns)
+        mean_return = torch.mean(torch.stack(episode_returns))
+        std_return = torch.mean(torch.stack(episode_returns))
         self.logger.log_scalar(f"Average episode length",  mean_length)
         self.logger.log_scalar(f"Average return",  mean_return)
         self.logger.log_scalar(f"return std",  std_return)
@@ -122,13 +143,14 @@ class ReinforceBase(Agent):
 
         # Normalize the returns
         normalized_returns = self._normalize_returns(returns_batch)
+        self.logger.log_scalar("adv normalized max", normalized_returns.max())
 
         # Log statistics
         self._log_training_stats(actions_batch)
         if len(entropy_batch.shape) == 2 and entropy_batch.shape[1] == 1:
             entropy_batch = entropy_batch.flatten()
         # Finally, train the policy (using log probs computed from current policy)
-        self.train_policy(log_probs_batch, normalized_returns, entropy_batch, states_batch)
+        self.train_policy(log_probs_batch, normalized_returns, entropy_batch, states_batch, actions_batch)
 
     def _extract_episode_data(self, episodes):
         """
@@ -198,7 +220,7 @@ class ReinforceBase(Agent):
         if self.mean_reward == -10000:
             self.mean_reward = returns_batch.mean()
 
-        n = 5.0
+        n = 10.0
         self.mean_reward = (
             self.mean_reward * (n - 1) / n + (returns_batch.mean() / n)
         )
@@ -207,7 +229,7 @@ class ReinforceBase(Agent):
         )
 
         returns_std = returns_batch.std() + 1e-8  # prevent division by zero
-        return (returns_batch - self.mean_reward) / returns_std
+        return (returns_batch - self.mean_reward) / (self.mean_std + 1e-8)
 
     def _log_training_stats(self, actions_batch):
         """
@@ -226,22 +248,23 @@ class ReinforceBase(Agent):
         assert log_probs.shape == returns.shape, "Expected same shape for log_probs and returns!"
         assert log_probs.shape == entropy.shape, "Expected same shape for log_probs and entropy!"
         self.optimizer_policy.zero_grad()
-        # Entropy loss
 
-        m = (entropy < self.entropy_thresh)
-        e_loss = -(self.entropy_coef * entropy * m).to(log_probs).mean()
+        # Entropy loss
+        e_loss = -( entropy).to(log_probs).mean()
 
         # mu loss for normal distribution (continuous action space)
         mu_loss = torch.tensor(0.0, device=self.device)
         if states_batch is not None and isinstance(self.sampler, NormalActionSampler):
             out = self.policy(states_batch)
             mu = out[..., :1]
-            mu_loss = 0.01 * torch.mean(mu**2 * (mu.abs() > 2))
+            mu_loss = torch.mean(mu**2)
             self.logger.log_scalar("mu loss:", mu_loss.item())
 
-        policy_loss = -(log_probs * returns).mean() + e_loss + mu_loss
-        if policy_loss > 100:
+        mu_coef = 0.001
+        policy_loss = -(log_probs * returns).mean() + self.entropy_coef * e_loss + mu_loss * mu_coef
+        if policy_loss.abs() > 100:
             import pdb;pdb.set_trace()
+            return
         policy_loss.backward()
 
         # Gradient clipping
@@ -257,6 +280,31 @@ class ReinforceBase(Agent):
         self.optimizer_policy.step()
         self.logger.log_scalar("policy loss:", policy_loss.item())
 
+    def get_state_dict(self):
+        return {
+            'policy': self.policy.state_dict(),
+            'value': self.value.state_dict() if hasattr(self, 'value') else None,
+            'policy_old': self.policy_old.state_dict() if hasattr(self, 'policy_old') else None,
+            'optimizer_policy': self.optimizer_policy.state_dict(),
+            'optimizer_value': self.optimizer_value.state_dict() if hasattr(self, 'optimizer_value') else None,
+            'mean_reward': self.mean_reward,
+            'mean_std': self.mean_std,
+            'state_normalizer': self.state_normalizer.__dict__ if self.state_normalizer else None
+        }
+
+    def load_state_dict(self, state_dict):
+        self.policy.load_state_dict(state_dict['policy'])
+        if state_dict['value'] and hasattr(self, 'value'):
+            self.value.load_state_dict(state_dict['value'])
+        if state_dict['policy_old'] and hasattr(self, 'policy_old'):
+            self.policy_old.load_state_dict(state_dict['policy_old'])
+        self.optimizer_policy.load_state_dict(state_dict['optimizer_policy'])
+        if state_dict['optimizer_value'] and hasattr(self, 'optimizer_value'):
+            self.optimizer_value.load_state_dict(state_dict['optimizer_value'])
+        self.mean_reward = state_dict['mean_reward']
+        self.mean_std = state_dict['mean_std']
+        if state_dict['state_normalizer'] and self.state_normalizer:
+            self.state_normalizer.__dict__.update(state_dict['state_normalizer'])
 
 
 class Reinforce(ReinforceBase, EpisodesPoolMixin):
@@ -269,7 +317,7 @@ class Reinforce(ReinforceBase, EpisodesPoolMixin):
         num_envs=8,
         discount=0.99,
         device=torch.device("cpu"),
-        logger=None,
+        logger=None, **kwargs
     ):
         super().__init__(policy, sampler, policy_lr=policy_lr,
                          num_envs=num_envs, discount=discount,
@@ -310,6 +358,7 @@ class ReinforceWithOldEpisodes(ReinforceBase, EpisodesOldPoolMixin):
         states_batch, returns_batch, log_probs_batch, actions_batch, entropy_batch = self._prepare_batches(
             states_list, log_probs_list, rewards_list, actions_list, entropy_list
         )
+
 
         # Normalize the returns
         normalized_returns = self._normalize_returns(returns_batch)

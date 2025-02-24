@@ -6,7 +6,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 np = numpy
 from pool import EpisodesPoolMixin
-from reinforce import ReinforceBase
+from reinforce import ReinforceBase, RunningNorm
 
 
 class Value(nn.Module):
@@ -24,10 +24,11 @@ class Value(nn.Module):
 
 
 class VPGBase(ReinforceBase):
-    def __init__(self, policy, value, sampler, policy_lr=0.001, value_lr=0.001, num_envs=8, discount=0.99, device=torch.device('cpu'), logger=None):
+    def __init__(self, policy, value, sampler, policy_lr=0.0001, value_lr=0.001, num_envs=8,
+                 discount=0.99, device=torch.device('cpu'), logger=None, entropy_coef=0.01):
         super().__init__(policy, sampler, policy_lr=policy_lr,
                     num_envs=num_envs, discount=discount,
-                    device=device, logger=logger)
+                    device=device, logger=logger, entropy_coef=entropy_coef)
         self.value = value
         self.sampler = sampler
         weight_decay_value = 0.001
@@ -36,6 +37,7 @@ class VPGBase(ReinforceBase):
             'value_lr': value_lr,
             'weight_decay_vl': weight_decay_value
         })
+        self.state_normalizer = RunningNorm()
 
     def learn_from_episodes(self, episodes):
         # Extract per-episode tensors/lists
@@ -48,12 +50,12 @@ class VPGBase(ReinforceBase):
             states_list, log_probs_list, rewards_list, actions_list, entropy_list
         )
 
+        states_batch = self.state_normalizer(states_batch)
         # Normalize the returns
         normalized_returns = self._normalize_returns(returns_batch)
 
         # Log statistics
         self._log_training_stats(actions_batch)
-
         self.train_value(normalized_returns, states_batch)
 
         # Policy Update
@@ -74,7 +76,7 @@ class VPGBase(ReinforceBase):
     def train_value(self, returns, states_batch):
         # Value Network Update
         value_epochs = 2
-        mini_batch_size = 256
+        mini_batch_size = 128
 
         for epoch in range(value_epochs):
 

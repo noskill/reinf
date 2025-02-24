@@ -1,0 +1,24 @@
+# Reinforce agent configuration.
+#
+# This file is loaded when using the entry point "reinforce_cfg_entry_point".
+#
+# You can adjust the parameters as needed.
+
+experiment_name: "reinforce_experiment"
+run_name: "test_run"
+
+# Number of training episodes.
+n_episodes: 5000
+
+# Neural network hidden dimension.
+hidden_dim: 256
+
+# Discount factor for reward computation.
+discount: 0.99
+
+# Learning rate for the policy network.
+policy_lr: 0.0001
+
+# Optional: any additional parameters that your agent might need.
+additional_params:
+  some_param: 42

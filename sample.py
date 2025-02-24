@@ -30,6 +30,7 @@ class NormalActionSampler(ActionSampler):
         out = policy(state)
         mu = out[..., :1]
         log_sigma = out[..., 1:]
+        assert out.shape[1] == 2
         log_sigma = torch.clamp(log_sigma, -20, 2)
         
         # Convert log_sigma to a positive std
@@ -91,7 +92,6 @@ class BetaActionSampler(ActionSampler):
 class DiscreteActionSampler(ActionSampler):
     def __call__(self, policy, state):
         state = self._prepare_state(state)
-        
         logits = policy(state)
         dist = Categorical(logits=logits)
         action = dist.sample()

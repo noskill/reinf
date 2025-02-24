@@ -8,18 +8,19 @@ import torch.nn.functional as F
 from sample import NormalActionSampler
 np = numpy
 from pool import EpisodesPoolMixin
-
+from reinforce import RunningNorm
 import copy
 
 
 class PPO(VPG, EpisodesPoolMixin):
-    def __init__(self, policy, value, sampler, policy_lr=0.0005, value_lr=0.001, num_envs=8, discount=0.99, device=torch.device('cpu'), logger=None):
+    def __init__(self, policy, value, sampler, policy_lr=0.0005, value_lr=0.001, num_envs=8, discount=0.99, device=torch.device('cpu'), logger=None, **kwargs):
         super().__init__(policy, value, sampler, policy_lr=policy_lr, 
                     num_envs=num_envs, discount=discount,
                     device=device, logger=logger)
         self.policy_old = copy.deepcopy(self.policy)
         self.eps = 0.2
         self.hparams.update({'eps': self.eps})
+        self.state_normalizer = RunningNorm()
 
     def learn_from_episodes(self, episodes, num_minibatches=4):
         # Extract per-episode tensors/lists
@@ -43,15 +44,21 @@ class PPO(VPG, EpisodesPoolMixin):
         for i in range(4):
             # Create minibatches
             dataset = torch.utils.data.TensorDataset(states_batch, log_probs_batch, normalized_returns, actions_batch, entropy_batch)
-            data_loader = torch.utils.data.DataLoader(dataset, batch_size=len(states_batch) // num_minibatches, shuffle=True)
+            batch_size = len(states_batch) // num_minibatches
+            data_loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
             for states_minibatch, log_probs_minibatch, returns_minibatch, actions_minibatch, entropy_minibatch in data_loader:
+                if len(states_minibatch) < batch_size // 2 or len(states_minibatch) < 2:
+                    continue
                 # Policy Update
                 with torch.no_grad():
                     updated_values = self.value(states_minibatch).squeeze(-1)
 
                 advantages = returns_minibatch - updated_values
+                std = advantages.std()
+                if torch.isnan(std).any():
+                    import pdb;pdb.set_trace()
                 self.logger.log_scalar("Raw advantage mean:", advantages.mean().item())
-                self.logger.log_scalar("Raw advantage std:", advantages.std().item())
+                self.logger.log_scalar("Raw advantage std:", std.item())
 
                 # Finally, train the policy (using log probs computed from current policy)
                 if len(entropy_minibatch.shape) == 2 and entropy_minibatch.shape[1] == 1:

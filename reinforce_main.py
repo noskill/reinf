@@ -101,10 +101,11 @@ class RLTrainer:
 
         for i in range(self.n_episodes):
             obs, info = self.env.reset(seed=random.randint(0, 1000))
-            done = np.zeros(len(obs), dtype=bool)
+            done = torch.zeros(len(obs), dtype=bool)
             self.agent.episode_start()
 
             while not done.all():
+                obs = torch.tensor(obs).to(self.device)
                 action = self.agent.get_action(obs, done)
                 if self.env_name == "Pendulum-v1":
                     action = action.reshape(-1, 1)
@@ -113,7 +114,8 @@ class RLTrainer:
                     action.cpu().numpy()
                 )
                 done = terminated | truncated
-                
+                done = torch.tensor(done).to(self.device)
+                reward = torch.tensor(reward).to(self.device)
                 changed = self.agent.update(obs, action, reward, done, next_obs)
                 if changed:
                     break
