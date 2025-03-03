@@ -13,14 +13,15 @@ import copy
 
 
 class PPO(VPG, EpisodesPoolMixin):
-    def __init__(self, policy, value, sampler, policy_lr=0.0001, value_lr=0.001, num_envs=8, discount=0.99, device=torch.device('cpu'), logger=None, **kwargs):
-        super().__init__(policy, value, sampler, policy_lr=policy_lr, 
+    def __init__(self, policy, value, sampler, policy_lr=0.0001, value_lr=0.001, num_envs=8, discount=0.99, device=torch.device('cpu'), logger=None, num_learning_epochs=4, clip_param=None, **kwargs):
+        super().__init__(policy, value, sampler, policy_lr=policy_lr,
                     num_envs=num_envs, discount=discount,
-                    device=device, logger=logger)
+                    device=device, logger=logger, **kwargs)
         self.policy_old = copy.deepcopy(self.policy)
         self.eps = 0.2
         self.hparams.update({'eps': self.eps})
         self.state_normalizer = RunningNorm()
+        self.num_learning_epochs = num_learning_epochs
 
     def learn_from_episodes(self, episodes, num_minibatches=4):
         # Extract per-episode tensors/lists
@@ -32,15 +33,15 @@ class PPO(VPG, EpisodesPoolMixin):
         states_batch, returns_batch, log_probs_batch, actions_batch, entropy_batch = self._prepare_batches(
             states_list, log_probs_list, rewards_list, actions_list, entropy_list
         )
-        
+
         # Normalize the returns
         normalized_returns = self._normalize_returns(returns_batch)
         # Log statistics
         self._log_training_stats(actions_batch)
         self.train_value(normalized_returns, states_batch)
-        
+
         self.policy.load_state_dict(self.policy_old.state_dict())
-        for i in range(4):
+        for i in range(self.num_learning_epochs):
             # Create minibatches
             dataset = torch.utils.data.TensorDataset(states_batch, log_probs_batch, normalized_returns, actions_batch, entropy_batch)
             batch_size = len(states_batch) // num_minibatches
@@ -194,3 +195,72 @@ class PPO(VPG, EpisodesPoolMixin):
             self.add_transition(env_idx, active_states[idx], actions[idx], log_probs[idx], entropy[idx])
 
         return full_actions.flatten()
+
+
+class PPOMI(PPO):
+    def __init__(self, policy, value, T, sampler, policy_lr=0.0001, value_lr=0.001, num_envs=8, discount=0.99, device=torch.device('cpu'), logger=None, **kwargs):
+        super().__init__(policy, value, sampler, policy_lr=policy_lr,
+                    num_envs=num_envs, discount=discount,
+                    device=device, logger=logger, **kwargs)
+        self.T = T
+
+    def learn_from_episodes(self, episodes, num_minibatches=4):
+        # Extract per-episode tensors/lists
+        states_list, log_probs_list, rewards_list, actions_list, entropy_list = self._extract_episode_data(episodes)
+        if not states_list:
+            return
+
+        # Prepare batches: compute discounted returns, and then aggregate states, returns, etc.
+        states_batch, returns_batch, log_probs_batch, actions_batch, entropy_batch = self._prepare_batches(
+            states_list, log_probs_list, rewards_list, actions_list, entropy_list
+        )
+
+        # Normalize the returns
+        normalized_returns = self._normalize_returns(returns_batch)
+        # Log statistics
+        self._log_training_stats(actions_batch)
+        self.train_value(normalized_returns, states_batch)
+
+        self.policy.load_state_dict(self.policy_old.state_dict())
+        for i in range(4):
+            # Create minibatches
+            dataset = torch.utils.data.TensorDataset(states_batch, log_probs_batch, normalized_returns, actions_batch, entropy_batch)
+            batch_size = len(states_batch) // num_minibatches
+            data_loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+            for states_minibatch, log_probs_minibatch, returns_minibatch, actions_minibatch, entropy_minibatch in data_loader:
+                if len(states_minibatch) < batch_size // 2 or len(states_minibatch) < 2:
+                    continue
+                # Policy Update
+                with torch.no_grad():
+                    updated_values = self.value(states_minibatch).squeeze(-1)
+
+                advantages = returns_minibatch - updated_values
+                std = advantages.std()
+                if torch.isnan(std).any():
+                    import pdb;pdb.set_trace()
+                self.logger.log_scalar("Raw advantage mean:", advantages.mean().item())
+                self.logger.log_scalar("Raw advantage std:", std.item())
+
+                # Finally, train the policy (using log probs computed from current policy)
+                if len(entropy_minibatch.shape) == 2 and entropy_minibatch.shape[1] == 1:
+                    entropy_minibatch = entropy_minibatch.flatten()
+
+                self.train_policy(log_probs_minibatch, advantages, entropy_minibatch, states_minibatch, actions_minibatch)
+        self.policy_old.load_state_dict(self.policy.state_dict())
+
+    def _prepare_batches(self, states_list, log_probs_list, rewards_list, actions_list, entropy_list):
+        """
+        From lists of per-episode data, compute discounted returns for each episode
+        then concat all episodes to form large batches.
+        Also, recompute log probabilities from current policy for consistency.
+        """
+        returns_list = [self._compute_discounted_returns(rewards) for rewards in rewards_list]
+        import pdb;pdb.set_trace()
+        # Concatenate all episodes along dimension 0 (the time dimension)
+        states_batch = torch.cat(states_list, dim=0).to(self.device)
+        returns_batch = torch.cat(returns_list, dim=0).to(self.device)
+        actions_batch = torch.cat(actions_list, dim=0).to(self.device)
+        log_probs_batch = torch.cat(log_probs_list, dim=0).to(self.device).reshape(returns_batch.shape)
+        entropy_batch = torch.cat(entropy_list, dim=0).to(self.device)
+
+        return states_batch, returns_batch, log_probs_batch, actions_batch, entropy_batch

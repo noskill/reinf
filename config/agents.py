@@ -119,7 +119,7 @@ class CartpoleReinforceCfg(TrainingCfg):
 
 # Example specific configurations
 @configclass
-class CartpolePPOCfg(CartpoleReinforceCfg):
+class CartpoleVGPCfg(CartpoleReinforceCfg):
     experiment_name: str = "cartpole_ppo"
     algorithm: PPOAlgorithmCfg = PPOAlgorithmCfg(
         policy_lr=1.0e-3,
@@ -139,17 +139,28 @@ class CartpolePPOCfg(CartpoleReinforceCfg):
 
 
 @configclass
-class CartpoleVGPCfg(CartpolePPOCfg):
-    experiment_name: str = "cartpole_vpg"
-    algorithm: VPGAlgorithmCfg = VPGAlgorithmCfg(
+class CartpolePPOCfg(CartpoleVGPCfg):
+    experiment_name: str = "cartpole_ppo"
+    algorithm: BaseAlgorithmCfg = PPOAlgorithmCfg(
         policy_lr=1.0e-3,
         entropy_coef=0.01,
     )
+
+
+@configclass
+class CartpolePPOMICfg(CartpolePPOCfg):
+    pass
+
+    T_lr = 0.0001
 
 
 # Register configs with Hydra
 cs = ConfigStore.instance()
 cs.store(name="base_config", node=TrainingCfg)
 cs.store(name="cartpole_ppo", node=CartpolePPOCfg)
+cs.store(name="cartpole_vpg", node=CartpoleVGPCfg)
 cs.store(name="cartpole_reinforce", node=CartpoleReinforceCfg)
-
+# from isaaclab_tasks.utils.hydra import register_task_to_hydra
+# register_task_to_hydra("Isaac-Cartpole-v0", "cartpole_ppo")
+# register_task_to_hydra("Isaac-Cartpole-v0", "cartpole_reinforce")
+# register_task_to_hydra("Isaac-Cartpole-v0", "cartpole_vpg")

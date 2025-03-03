@@ -24,7 +24,7 @@ parser.add_argument("--seed", type=int, default=54234, help="Seed used for envir
 parser.add_argument(
     "--algorithm", 
     type=str, 
-    choices=["ppo", "reinforce", "vpg"],
+    choices=["ppo", "reinforce", "vpg", "ppomi"],
     default="ppo",
     help="Algorithm to use for training"
 )
@@ -65,9 +65,9 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 from isaaclab.envs import ManagerBasedRLEnvCfg, DirectRLEnvCfg, DirectMARLEnvCfg, multi_agent_to_single_agent
 from config.agents import TrainingCfg, PPOAlgorithmCfg, ReinforceAlgorithmCfg, CartpolePPOCfg, CartpoleReinforceCfg, SamplerCfg, VPGAlgorithmCfg, CartpoleVGPCfg
 from omegaconf import OmegaConf
-from ppo import PPO
+from ppo import PPO, PPOMI
 from vpg import VPG
-from venv import VectorEnvWrapper
+from on_policy_train import setup_env, OnPolicyTrainer
 
 
 class ValueNetwork(nn.Module):
@@ -96,90 +96,6 @@ class PolicyNetwork(nn.Module):
         x = F.relu(self.layer2(x))
         return self.layer3(x)
 
-
-class OnPolicyTrainer:
-    def __init__(self, env, agent, config: TrainingCfg, seed=42):
-        self.env = env
-        self.agent = agent
-        self.config = config
-        self.seed = seed
-
-    def train(self):
-        # Set random seeds
-        torch.manual_seed(self.seed)
-        random.seed(self.seed)
-        np.random.seed(self.seed)
-        
-        # Create checkpoint directory
-        os.makedirs(self.config.checkpoint_dir, exist_ok=True)
-        
-        # Load checkpoint if specified
-        start_episode = 0
-        if self.config.checkpoint:
-            print(f"Loading checkpoint from {self.config.checkpoint}")
-            self.load_checkpoint(self.config.checkpoint)
-            start_episode = self.agent.logger.episode_count
-        
-        for i in range(start_episode, self.n_episodes):
-            obs = self.env.reset()
-            done = torch.zeros(len(obs), dtype=bool)
-            self.agent.episode_start()
-            step = 0
-            
-            while not done.all():
-                action = self.agent.get_action(obs, done)
-                if action.ndim == 1:
-                    action = action.unsqueeze(1)
-                next_obs, reward, terminated, info = self.env.step(action)
-                done = terminated
-                # terminal_reward = -2 * np.exp(-(step/300)**2)
-                terminal_reward = 0
-                changed = self.agent.update(obs, action, reward + done * terminal_reward, done, next_obs)
-                if changed:
-                    break
-                obs = next_obs
-                step += 1
-                
-            self.agent.logger.increment_episode()
-            
-            # Save checkpoint periodically
-            if i > 0 and i % self.config.save_interval == 0:
-                checkpoint_path = os.path.join(
-                    self.config.checkpoint_dir,
-                    f"checkpoint_episode_{i}.pt"
-                )
-                print(f"Saving checkpoint to {checkpoint_path}")
-                self.save_checkpoint(checkpoint_path)
-                
-            if i % 10 == 0:
-                print(f"Iteration {i}")
-            sys.stdout.flush()
-
-    @property
-    def n_episodes(self):
-        return self.config.algorithm.n_episodes
-
-    def save_checkpoint(self, path):
-        checkpoint = {
-            'agent_state': self.agent.get_state_dict(),
-            'optimizer_state': self.agent.optimizer_policy.state_dict(),
-            'episode': self.agent.logger.episode_count,
-            'seed': self.seed,
-            'config': self.config.to_omegaconf(),
-        }
-        torch.save(checkpoint, path)
-
-    def load_checkpoint(self, path):
-        checkpoint = torch.load(path)
-        self.agent.load_state_dict(checkpoint['agent_state'])
-        self.agent.optimizer_policy.load_state_dict(checkpoint['optimizer_state'])
-        self.agent.logger.episode_count = checkpoint['episode']
-        self.seed = checkpoint['seed']
-
-        # Convert loaded config back to the proper class if needed
-        loaded_config = checkpoint['config']
-        if isinstance(loaded_config, dict):
-            self.config = type(self.config).from_omegaconf(OmegaConf.create(loaded_config))
 
 
 def create_networks(obs_dim: int, action_dim: int, config: TrainingCfg, device):
@@ -258,46 +174,27 @@ def create_agent(
         raise ValueError(f"Unknown algorithm type: {type(algorithm_cfg)}")
 
 
-def setup_env(env_cfg: Union[ManagerBasedRLEnvCfg, DirectRLEnvCfg, DirectMARLEnvCfg], args_cli, experiment_dir):
+
+from omegaconf import OmegaConf
+from dataclasses import asdict
+
+
+def merge_config_overrides(training_cfg, hydra_args):
     """
-    Creates and configures the training environment.
-    
-    Args:
-        env_cfg: Environment configuration from IsaacLab
-        args_cli: Command line arguments
-        
-    Returns:
-        Wrapped environment ready for training
+    Merges overrides from hydra_cfg into the given training_cfg object.
     """
-    # Override some environment settings from CLI if provided.
-    env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
-    env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
-   
-    # Create the base environment using gym.make
-    env = gym.make(
-        args_cli.task,
-        cfg=env_cfg,
-        render_mode="rgb_array" if args_cli.video else None
-    )
+    override_dict = {}
+    for override in hydra_args:
+        # Look for lines like +algorithm.policy_lr=0.0001 or algorithm.discount=0.95
+        # We strip leading '+' in case user types +algorithm.policy_lr=0.0001
+        override_clean = override.lstrip('+')
+        if '=' in override_clean:
+            key, value_str = override_clean.split('=', 1)
+            override_dict[key] = value_str
 
-    # Add video recording wrapper if requested
-    if args_cli.video:
-        video_kwargs = {
-            "video_folder": os.path.join(experiment_dir, "videos", "train"),
-            "step_trigger": lambda step: step % args_cli.video_interval == 0,
-            "video_length": args_cli.video_length,
-            "disable_logger": True,
-        }
-        env = gym.wrappers.RecordVideo(env, **video_kwargs)
-
-    # Convert multi-agent to single-agent if needed
-    # if isinstance(env.unwrapped, MultiAgentEnv):
-    #     env = multi_agent_to_single_agent(env)
-
-    # Add the vectorized environment wrapper
-    env = VectorEnvWrapper(env)
-
-    return env
+    if "algorithm.policy_lr" in override_dict:
+        training_cfg.algorithm.policy_lr = float(override_dict["algorithm.policy_lr"])
+    return training_cfg
 
 @hydra_task_config(args_cli.task, "")  # Use empty string for agent_cfg_entry_point
 def main(
@@ -305,15 +202,17 @@ def main(
     agent_cfg=None  # This will be None initially
 ):
 
-    
     # Load config based on algorithm choice
     if args_cli.algorithm == "ppo":
         training_cfg = CartpolePPOCfg()
     elif args_cli.algorithm == 'vpg':
         training_cfg = CartpoleVGPCfg()
+    elif args_cli.algorithm == "ppomi":
+        training_cfg = CartpolePPOMICfg()
     else:
         training_cfg = CartpoleReinforceCfg()
 
+    training_cfg = merge_config_overrides(training_cfg, hydra_args)
     # Create experiment directory
     experiment_dir = training_cfg.logging.get_experiment_dir(
         algorithm_type=training_cfg.algorithm.type,
@@ -351,7 +250,15 @@ def main(
         logger=logger
     )
     
-    trainer = OnPolicyTrainer(env, agent, training_cfg, args_cli.seed)
+    trainer = OnPolicyTrainer(
+        env=env, 
+        agent=agent, 
+        n_episodes=training_cfg.algorithm.n_episodes,
+        checkpoint_dir=checkpoint_dir,
+        save_interval=args_cli.save_interval,
+        checkpoint=args_cli.checkpoint,
+        seed=args_cli.seed
+    )
     trainer.train()
     
     env.close()
