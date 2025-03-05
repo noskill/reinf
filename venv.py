@@ -1,3 +1,4 @@
+import torch
 from isaaclab.envs import DirectRLEnv, ManagerBasedRLEnv, VecEnvObs
 import gymnasium as gym
 
@@ -24,13 +25,18 @@ class VectorEnvWrapper:
 
     def reset(self):
         obs_dict, info = self.env.reset()
+        return self.extract_obs(obs_dict)
+
+    def extract_obs(self, obs_dict):
         obs = obs_dict["policy"]
+        if hasattr(obs, 'keys'):
+            keys = sorted(obs.keys())
+            return torch.cat([obs[key] for key in keys], dim=1)
         return obs
 
     def step(self, actions):
         obs, rew, terminated, truncated, info = self.env.step(actions)
-        assert len(obs.keys()) == 1
-        obs = obs["policy"]
+        obs = self.extract_obs(obs)
         done = terminated | truncated
         return obs, rew, done, info
 

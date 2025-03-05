@@ -62,6 +62,8 @@ class ReinforceBase(Agent):
         })
         self.state_normalizer = None
 
+    def get_policy_for_action(self):
+        return self.policy
 
     def episode_start(self):
         self.reset_episodes()
@@ -75,11 +77,15 @@ class ReinforceBase(Agent):
         active_states = state[active_mask]
         if not isinstance(active_states, torch.Tensor):
             active_states = torch.FloatTensor(active_states)
-        actions, log_probs, dist = self.sampler(self.policy, active_states)
+
+        policy = self.get_policy_for_action()
+
+        actions, log_probs, dist = self.sampler(policy, active_states)
         if isinstance(dist, TransformedDistribution):
             entropy = dist.base_dist.entropy()
         else:
             entropy = dist.entropy()
+        entropy = entropy.mean(dim=-1, keepdims=True)
         full_actions = torch.zeros(
             (active_mask.shape[0], actions.shape[1] if len(actions.shape) > 1 else 1)
         ).to(actions)
@@ -89,7 +95,7 @@ class ReinforceBase(Agent):
         for idx, env_idx in enumerate(active_env_indices):
             self.add_transition(env_idx, active_states[idx], actions[idx], log_probs[idx], entropy[idx])
 
-        return full_actions.flatten()
+        return full_actions
 
     def update(self, obs, actions, rewards, dones, next_obs):
         for env_idx in range(self.num_envs):

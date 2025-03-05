@@ -86,11 +86,13 @@ def create_networks(obs_dim: int, action_dim: int, hidden_dim=256, device='cpu')
     return policy, value
 
 def create_sampler(action_space):
+    shape = action_space.shape
+    if len(shape) != 1:
+        raise RuntimeError("unexpected action space size " + str(shape))
     if isinstance(action_space, gym.spaces.Discrete):
         return DiscreteActionSampler()
     elif isinstance(action_space, gym.spaces.Box):
-        return NormalActionSampler(a_min=-2, a_max=2)
-        #return NormalActionSampler(a_min=action_space.low[0], a_max=action_space.high[0])
+        return NormalActionSampler(shape[0], a_min=-2, a_max=2)
     else:
         raise ValueError(f"Unsupported action space type: {type(action_space)}")
 

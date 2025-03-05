@@ -96,7 +96,7 @@ class PPO(VPG, EpisodesPoolMixin):
         # with torch.no_grad():
         #     _, _, dist_old = self.sampler(self.policy_old, states_batch)
 
-        log_probs_new = dist.log_prob(actions_batch)
+        log_probs_new = dist.log_prob(actions_batch).mean(-1, keepdim=True)
         log_probs_old = log_probs.detach()
         # log_probs_old = dist_old.log_prob(actions_batch)
 
@@ -172,29 +172,8 @@ class PPO(VPG, EpisodesPoolMixin):
         self.optimizer_policy.step()
         self.logger.log_scalar("policy loss:", policy_loss.item())
 
-    def get_action(self, state, done):
-        active_mask = ~done
-        if not any(active_mask):
-            return np.zeros((self.num_envs,) + self.policy_old.action_shape)
-
-        active_states = state[active_mask]
-        if not isinstance(active_states, torch.Tensor):
-            active_states = torch.FloatTensor(active_states)
-        actions, log_probs, dist = self.sampler(self.policy_old, active_states)
-        if isinstance(dist, TransformedDistribution):
-            entropy = dist.base_dist.entropy()
-        else:
-            entropy = dist.entropy()
-        full_actions = torch.zeros(
-            (active_mask.shape[0], actions.shape[1] if len(actions.shape) > 1 else 1)
-        ).to(actions)
-        full_actions[active_mask] = actions.reshape(full_actions[active_mask].shape)
-
-        active_env_indices = torch.where(active_mask)[0]
-        for idx, env_idx in enumerate(active_env_indices):
-            self.add_transition(env_idx, active_states[idx], actions[idx], log_probs[idx], entropy[idx])
-
-        return full_actions.flatten()
+    def get_policy_for_action(self):
+        return self.policy_old
 
 
 class PPOMI(PPO):
