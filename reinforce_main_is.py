@@ -22,7 +22,7 @@ parser.add_argument("--task", type=str, default=None, help="Name of the task (e.
 parser.add_argument("--seed", type=int, default=None, help="Seed used for environment randomization.")
 parser.add_argument("--checkpoint", type=str, default=None, help="Path to load checkpoint from")
 parser.add_argument("--save_interval", type=int, default=100, help="Save checkpoint every N episodes")
-parser.add_argument("--algorithm", type=str, choices=["ppo", "reinforce", "vpg"], default="reinforce", help="Algorithm to use for training.")
+parser.add_argument("--algorithm", type=str, choices=["ppo", "reinforce", "vpg", "ppod"], default="reinforce", help="Algorithm to use for training.")
 # Let AppLauncher add its own CLI args.
 AppLauncher.add_app_launcher_args(parser)
 
@@ -182,6 +182,31 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             entropy_coef=entropy_coef,
             value_loss_coef=value_loss_coef,
             value_clip=value_clip,
+            sampler=sampler,
+            logger=logger
+        )
+    elif args_cli.algorithm == "ppod":
+        from ppod import PPOD
+        embedding_dim = 8
+        policy, value = create_networks(
+            obs_dim=obs_dim + embedding_dim,
+            action_dim=action_dim,
+            hidden_dim=hidden_dim,
+            device=device,
+        )
+        num_learning_epochs = 4
+        agent = PPOD(
+            policy=policy,
+            value=value,
+            obs_dim=obs_dim,
+            num_envs=num_envs,
+            policy_lr=policy_lr,
+            embedding_dim=embedding_dim,
+            value_lr=value_lr,
+            discount=discount,
+            device=device,
+            entropy_coef=entropy_coef,
+            num_learning_epochs=num_learning_epochs,
             sampler=sampler,
             logger=logger
         )
