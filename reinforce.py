@@ -45,12 +45,13 @@ class ReinforceBase(Agent):
         self.num_envs = num_envs
         self.policy = policy
         self.sampler = sampler
-        self.optimizer_policy = optim.Adam(self.policy.parameters(), lr=policy_lr)
+        self.policy_lr = policy_lr
         self.discount = discount
         self.mean_reward = -10000
         self.mean_std = 0
         self.device = device
         self.version = 0
+        self.create_optimizers()
         self.entropy_coef = entropy_coef
         self.entropy_thresh = 0.2
         super().__init__(logger=logger)
@@ -61,6 +62,10 @@ class ReinforceBase(Agent):
             'entropy_thresh': self.entropy_thresh
         })
         self.state_normalizer = None
+        self.data_types = ['states', 'actions', 'log_probs', 'entropy', 'rewards']
+
+    def create_optimizers(self):
+        self.optimizer_policy = optim.Adam(self.policy.parameters(), lr=self.policy_lr)
 
     def get_policy_for_action(self):
         return self.policy
@@ -69,7 +74,7 @@ class ReinforceBase(Agent):
         self.reset_episodes()
         self.active_envs = np.ones(self.num_envs, dtype=bool)
 
-    def get_action(self, state, done):
+    def process_states(self, state, done):
         active_mask = ~done
         if not any(active_mask):
             return np.zeros((self.num_envs,) + self.policy.action_shape)
@@ -77,15 +82,18 @@ class ReinforceBase(Agent):
         active_states = state[active_mask]
         if not isinstance(active_states, torch.Tensor):
             active_states = torch.FloatTensor(active_states)
+        return active_states
 
+    def get_action(self, state, done):
         policy = self.get_policy_for_action()
-
+        active_states = self.process_states(state, done)
         actions, log_probs, dist = self.sampler(policy, active_states)
         if isinstance(dist, TransformedDistribution):
             entropy = dist.base_dist.entropy()
         else:
             entropy = dist.entropy()
         entropy = entropy.mean(dim=-1, keepdims=True)
+        active_mask = ~done
         full_actions = torch.zeros(
             (active_mask.shape[0], actions.shape[1] if len(actions.shape) > 1 else 1)
         ).to(actions)
@@ -123,7 +131,7 @@ class ReinforceBase(Agent):
         for episode in completed_episodes:
             episode_lengths.append(len(episode))
             # Sum up rewards for the episode
-            episode_return = sum(reward for _, _, _,_, reward in episode)
+            episode_return = sum(item[-1] for item in episode)
             episode_returns.append(episode_return)
 
         # Calculate statistics
@@ -138,7 +146,12 @@ class ReinforceBase(Agent):
 
     def learn_from_episodes(self, episodes):
         # Extract per-episode tensors/lists
-        states_list, log_probs_list, rewards_list, actions_list, entropy_list = self._extract_episode_data(episodes)
+        data_dict = self._extract_episode_data(episodes)
+        states_list = data_dict['states']
+        log_probs_list = data_dict['log_probs']
+        actions_list = data_dict['actions']
+        rewards_list = data_dict['rewards']
+        entropy_list = data_dict['entropy']
         if not states_list:
             return
 
@@ -158,7 +171,7 @@ class ReinforceBase(Agent):
         # Finally, train the policy (using log probs computed from current policy)
         self.train_policy(log_probs_batch, normalized_returns, entropy_batch, states_batch, actions_batch)
 
-    def _extract_episode_data(self, episodes):
+    def _extract_episode_data2(self, episodes):
         """
         From a list of episodes, each consisting of a sequence of (state, action, log_prob, entropy, reward),
         return four lists: states_list, log_probs_list, rewards_list, and actions_list, entropy_list.
@@ -172,7 +185,6 @@ class ReinforceBase(Agent):
         for episode in episodes:
             if not episode:
                 continue
-
             states, log_probs, rewards, actions, entropy = [], [], [], [], []
             for (s, a, log_p, e, r) in episode:
                 states.append(s)
@@ -180,7 +192,6 @@ class ReinforceBase(Agent):
                 rewards.append(r)
                 actions.append(a)
                 entropy.append(e)
-
             # Stack (or convert) collected data so that each episode becomes a tensor
             states_list.append(torch.stack(states))
             log_probs_list.append(torch.stack(log_probs))
@@ -188,6 +199,47 @@ class ReinforceBase(Agent):
             actions_list.append(torch.stack(actions))
             entropy_list.append(torch.stack(entropy))
         return states_list, log_probs_list, rewards_list, actions_list, entropy_list
+
+    def _extract_episode_data(self, episodes):
+        """
+        From a list of episodes, each consisting of a sequence of tuples with various data elements,
+        extract and organize the data by type across all episodes.
+
+        Args:
+            episodes: List of episodes, where each episode is a list of data tuples
+
+        Returns:
+            Dictionary where keys are data types and values are lists of tensors (one tensor per episode)
+        """
+        # Define the structure of our data tuple and corresponding empty lists
+        data_types = self.data_types
+        data_lists = {data_type: [] for data_type in data_types}
+
+        # Process each episode
+        for episode in episodes:
+            if not episode:
+                continue
+
+            # Initialize temporary lists for this episode
+            episode_data = {data_type: [] for data_type in data_types}
+
+            # Extract data from each step in the episode
+            for step_data in episode:
+                # Unpack the step data into the corresponding lists
+                for i, data_type in enumerate(data_types):
+                    episode_data[data_type].append(step_data[i])
+
+            # Convert lists to tensors and add to the main data lists
+            for data_type in data_types:
+                if data_type == 'rewards':
+                    # Rewards are typically scalar values
+                    data_lists[data_type].append(torch.tensor(episode_data[data_type], dtype=torch.float32))
+                else:
+                    # Other data are typically already tensors
+                    data_lists[data_type].append(torch.stack(episode_data[data_type]))
+
+        # Return the organized data
+        return data_lists
 
     def _compute_discounted_returns(self, rewards):
         """

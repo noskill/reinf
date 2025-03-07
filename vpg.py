@@ -26,22 +26,33 @@ class Value(nn.Module):
 class VPGBase(ReinforceBase):
     def __init__(self, policy, value, sampler, policy_lr=0.0001, value_lr=0.001, num_envs=8,
                  discount=0.99, device=torch.device('cpu'), logger=None, entropy_coef=0.01):
+        self.value = value
+        self.value_lr = value_lr
+        self.weight_decay_value = 0
         super().__init__(policy, sampler, policy_lr=policy_lr,
                     num_envs=num_envs, discount=discount,
                     device=device, logger=logger, entropy_coef=entropy_coef)
-        self.value = value
         self.sampler = sampler
-        weight_decay_value = 0
-        self.optimizer_value = optim.Adam(self.value.parameters(), lr=value_lr, weight_decay=weight_decay_value)
+        self.create_optimizers()
         self.hparams.update({
             'value_lr': value_lr,
-            'weight_decay_vl': weight_decay_value
+            'weight_decay_vl': self.weight_decay_value
         })
         self.state_normalizer = RunningNorm()
 
+    def create_optimizers(self):
+        super().create_optimizers()
+        self.optimizer_value = optim.Adam(self.value.parameters(),
+                                          lr=self.value_lr, weight_decay=self.weight_decay_value)
+
     def learn_from_episodes(self, episodes):
         # Extract per-episode tensors/lists
-        states_list, log_probs_list, rewards_list, actions_list, entropy_list = self._extract_episode_data(episodes)
+        data_dict = self._extract_episode_data(episodes)
+        states_list = data_dict['states']
+        log_probs_list = data_dict['log_probs']
+        actions_list = data_dict['actions']
+        rewards_list = data_dict['rewards']
+        entropy_list = data_dict['entropy']
         if not states_list:
             return
 
