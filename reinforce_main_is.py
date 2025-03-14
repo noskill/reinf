@@ -15,14 +15,17 @@ from isaaclab.app import AppLauncher
 #
 parser = argparse.ArgumentParser(description="Train an agent with IsaacLab.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
-parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
-parser.add_argument("--video_interval", type=int, default=2000, help="Interval between video recordings (in steps).")
+parser.add_argument("--video-length", type=int, default=200, help="Length of the recorded video (in steps).")
+parser.add_argument("--video-interval", type=int, default=2000, help="Interval between video recordings (in steps).")
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task (e.g. Isaac-Cartpole-v0, Pendulum-v1, etc.).")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for environment randomization.")
 parser.add_argument("--checkpoint", type=str, default=None, help="Path to load checkpoint from")
-parser.add_argument("--save_interval", type=int, default=100, help="Save checkpoint every N episodes")
-parser.add_argument("--algorithm", type=str, choices=["ppo", "reinforce", "vpg", "ppod"], default="reinforce", help="Algorithm to use for training.")
+parser.add_argument("--save-interval", type=int, default=100, help="Save checkpoint every N episodes")
+parser.add_argument("--max-episode-s", type=int, default=None, help="set environment max episode length in seconds")
+parser.add_argument("--algorithm", type=str, choices=["ppo", "reinforce", "vpg", "ppod", "ppodr"], default="reinforce", help="Algorithm to use for training.")
+parser.add_argument("--experiment-dir", type=str, default=None, help="Directory to save files.")
+parser.add_argument("--experiment-name", type=str, default=None, help="experiment name subdir.")
 # Let AppLauncher add its own CLI args.
 AppLauncher.add_app_launcher_args(parser)
 
@@ -92,33 +95,13 @@ def create_sampler(action_space):
     if isinstance(action_space, gym.spaces.Discrete):
         return DiscreteActionSampler()
     elif isinstance(action_space, gym.spaces.Box):
-        return NormalActionSampler(shape[0], a_min=-2, a_max=2)
+        return NormalActionSampler(shape[0], a_min=-20, a_max=20, transform=False)
     else:
         raise ValueError(f"Unsupported action space type: {type(action_space)}")
 
 
-@hydra_task_config(args_cli.task, "")
-def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg=None):
-    # Set random seed if not provided
-    if args_cli.seed is None:
-        args_cli.seed = random.randint(0, 10000)
-    env_cfg.seed = args_cli.seed
-
-    # Override environment settings from CLI if provided
-    if args_cli.num_envs is not None:
-        env_cfg.scene.num_envs = args_cli.num_envs
-    if args_cli.device is not None:
-        env_cfg.sim.device = args_cli.device
-
-    # Define logging directories
-    experiment_name = f"{args_cli.algorithm}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
-    experiment_dir = os.path.abspath(os.path.join("logs", "runs", experiment_name))
-    checkpoint_dir = os.path.join(experiment_dir, "checkpoints")
-    print(f"[INFO] Logging experiment in directory: {experiment_dir}")
-
-    env = setup_env(env_cfg, args_cli, experiment_dir)
+def create_agent(args_cli, env_cfg, env, logger):
     num_envs = env.num_envs
-
     # Determine observation and action dimensions
     obs_space = env.observation_space
     action_space = env.action_space
@@ -129,12 +112,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     else:
         action_dim = action_space.shape[0] * 2  # For mean and std in continuous actions
 
-    # Create logger
-    logger = Logger(experiment_dir)
-
     # Create networks using imported classes
     device = env_cfg.sim.device
-    hidden_dim = 64  # You can adjust this value
+    hidden_dim = 556  # You can adjust this value
     policy, value = create_networks(
         obs_dim=obs_dim,
         action_dim=action_dim,
@@ -150,9 +130,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     value_lr = 0.001
     discount = 0.99
     entropy_coef = 0.01
-    n_episodes = 5000
 
-    # Create agent based on selected algorithm, using your existing Agent class
     if args_cli.algorithm == "ppo":
         num_learning_epochs = 4
         agent = PPO(
@@ -210,6 +188,31 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             sampler=sampler,
             logger=logger
         )
+    elif args_cli.algorithm == 'ppodr':
+        from ppod import PPODRunning
+        embedding_dim = 8
+        policy, value = create_networks(
+            obs_dim=obs_dim + embedding_dim,
+            action_dim=action_dim,
+            hidden_dim=hidden_dim,
+            device=device,
+        )
+        num_learning_epochs = 4
+        agent = PPODRunning(
+            policy=policy,
+            value=value,
+            obs_dim=obs_dim,
+            num_envs=num_envs,
+            policy_lr=policy_lr,
+            embedding_dim=embedding_dim,
+            value_lr=value_lr,
+            discount=discount,
+            device=device,
+            entropy_coef=entropy_coef,
+            num_learning_epochs=num_learning_epochs,
+            sampler=sampler,
+            logger=logger
+        )
     else:
         # Default to REINFORCE
         # For REINFORCE, the value network is not used
@@ -233,7 +236,43 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             entropy_coef=entropy_coef,
             logger=logger
         )
+    return agent
 
+
+@hydra_task_config(args_cli.task, "")
+def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg=None):
+    # Set random seed if not provided
+    if args_cli.seed is None:
+        args_cli.seed = random.randint(0, 10000)
+    env_cfg.seed = args_cli.seed
+    if args_cli.max_episode_s is not None:
+        env_cfg.episode_length_s = args_cli.max_episode_s
+
+    # Override environment settings from CLI if provided
+    if args_cli.num_envs is not None:
+        env_cfg.scene.num_envs = args_cli.num_envs
+    if args_cli.device is not None:
+        env_cfg.sim.device = args_cli.device
+
+    # Define logging directories
+    if args_cli.experiment_name is None:
+        experiment_name = f"{args_cli.algorithm}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+    else:
+        experiment_name = args_cli.experiment_name
+    if args_cli.experiment_dir is None:
+        experiment_dir = os.path.abspath(os.path.join("logs", "runs", experiment_name))
+    else:
+        experiment_dir = args_cli.experiment_dir
+    checkpoint_dir = os.path.join(experiment_dir, "checkpoints")
+    print(f"[INFO] Logging experiment in directory: {experiment_dir}")
+
+    env = setup_env(env_cfg, args_cli, experiment_dir)
+
+    # Create logger
+    logger = Logger(experiment_dir)
+
+    agent = create_agent(args_cli, env_cfg, env, logger)
+    n_episodes = 5000
     # Create trainer
     trainer = OnPolicyTrainer(
         env=env, 
