@@ -82,13 +82,8 @@ class VPGBase(ReinforceBase):
         self.train_policy(log_probs_batch, advantages,
                           entropy_batch, states_batch, actions_batch)
 
-
-
-    def train_value(self, returns, states_batch):
+    def train_value(self, returns, states_batch, value_epochs = 2,  mini_batch_size = 128):
         # Value Network Update
-        value_epochs = 2
-        mini_batch_size = 128
-
         for epoch in range(value_epochs):
 
             indices = np.random.permutation(len(states_batch))
@@ -101,13 +96,16 @@ class VPGBase(ReinforceBase):
                 value_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.value.parameters(), 0.4)
                 self.optimizer_value.step()
-
         self.logger.log_scalar(f"value loss",  value_loss)
+
+    def load_state_dict(self, sd):
+        super().load_state_dict(sd)
+        self.value.load_state_dict(sd['value'])
+        self.optimizer_value.load_state_dict(sd['optimizer_value'])
 
 
 class VPG(VPGBase, EpisodesPoolMixin):
     pass
-
 
 
 

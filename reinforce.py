@@ -286,8 +286,8 @@ class ReinforceBase(Agent):
             self.mean_std * (n - 1) / n + returns_batch.std() / n
         )
 
-        returns_std = returns_batch.std() + 1e-8  # prevent division by zero
-        return (returns_batch - self.mean_reward) / (self.mean_std + 1e-8)
+        returns_std = returns_batch.std() + 1e-7  # prevent division by zero
+        return (returns_batch - returns_batch.mean()) / returns_std
 
     def _log_training_stats(self, actions_batch):
         """
@@ -342,7 +342,6 @@ class ReinforceBase(Agent):
         return {
             'policy': self.policy.state_dict(),
             'value': self.value.state_dict() if hasattr(self, 'value') else None,
-            'policy_old': self.policy_old.state_dict() if hasattr(self, 'policy_old') else None,
             'optimizer_policy': self.optimizer_policy.state_dict(),
             'optimizer_value': self.optimizer_value.state_dict() if hasattr(self, 'optimizer_value') else None,
             'mean_reward': self.mean_reward,
@@ -352,13 +351,7 @@ class ReinforceBase(Agent):
 
     def load_state_dict(self, state_dict):
         self.policy.load_state_dict(state_dict['policy'])
-        if state_dict['value'] and hasattr(self, 'value'):
-            self.value.load_state_dict(state_dict['value'])
-        if state_dict['policy_old'] and hasattr(self, 'policy_old'):
-            self.policy_old.load_state_dict(state_dict['policy_old'])
         self.optimizer_policy.load_state_dict(state_dict['optimizer_policy'])
-        if state_dict['optimizer_value'] and hasattr(self, 'optimizer_value'):
-            self.optimizer_value.load_state_dict(state_dict['optimizer_value'])
         self.mean_reward = state_dict['mean_reward']
         self.mean_std = state_dict['mean_std']
         if state_dict['state_normalizer'] and self.state_normalizer:

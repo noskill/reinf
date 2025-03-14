@@ -160,9 +160,14 @@ class PPOBase(VPGBase):
         m = (entropy_dist < self.entropy_thresh)
         e_loss = -(self.entropy_coef * entropy_dist * m).to(log_probs).mean()
 
+        # they should be the same shape
+        assert log_probs_new.shape == log_probs_old.shape
+        log_ratio = log_probs_new - log_probs_old
+        # Clamp log ratio BEFORE exponentiating
+        log_ratio_clamped = log_ratio.clamp(-10, 10)
+
         # Finally, compute ratio
-        # Avoid doing .reshape(log_probs.shape); they should be the same shape anyway.
-        ratio = torch.exp(log_probs_new - log_probs_old).clamp(-20, 20)
+        ratio = torch.exp(log_ratio_clamped).clamp(-18, 18)
 
         # Double‐check ratio shape
         assert ratio.shape == log_probs.shape, (
@@ -206,6 +211,10 @@ class PPOBase(VPGBase):
 
     def get_policy_for_action(self):
         return self.policy_old
+
+    def load_state_dict(self, sd):
+        super().load_state_dict(sd)
+        self.policy_old.load_state_dict(self.policy.state_dict())
 
 
 class PPO(PPOBase, EpisodesPoolMixin):

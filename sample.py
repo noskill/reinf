@@ -19,7 +19,7 @@ class ActionSampler:
 
 
 class NormalActionSampler(ActionSampler):
-    def __init__(self, action_dim, a_min=-2.0, a_max=2.0, reparameterize=False):
+    def __init__(self, action_dim, a_min=-2.0, a_max=2.0, reparameterize=False, transform=True):
         """
         Parameters:
             action_dim (int): Number of action dimensions.
@@ -31,6 +31,7 @@ class NormalActionSampler(ActionSampler):
         self.a_min = a_min
         self.a_max = a_max
         self.reparameterize = reparameterize
+        self.transform = transform
 
     def __call__(self, policy, state):
         state = self._prepare_state(state)
@@ -51,17 +52,18 @@ class NormalActionSampler(ActionSampler):
 
         # Base Normal distribution (diagonal covariance)
         base_dist = Normal(mu, sigma)
+        transformed_dist = base_dist
+        if self.transform:
+            # Transform sequence
+            transforms = [
+                TanhTransform(cache_size=1),
+                AffineTransform(
+                    loc=(self.a_min + self.a_max) / 2.0,
+                    scale=(self.a_max - self.a_min) / 2.0,
+                ),
+            ]
 
-        # Transform sequence
-        transforms = [
-            TanhTransform(cache_size=1),
-            AffineTransform(
-                loc=(self.a_min + self.a_max) / 2.0,
-                scale=(self.a_max - self.a_min) / 2.0,
-            ),
-        ]
-
-        transformed_dist = TransformedDistribution(base_dist, transforms)
+            transformed_dist = TransformedDistribution(base_dist, transforms)
 
         # Sample action (with reparameterization if requested)
         if self.reparameterize:
