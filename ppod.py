@@ -146,18 +146,18 @@ class PPODPool(EpisodesPoolMixin):
 class PPOD(PPOBase, PPODPool):
     """ Diversity is all you need implementation"""
 
-    def __init__(self, policy, value, sampler, obs_dim, policy_lr=0.0001, value_lr=0.001, num_envs=8, discount=0.99, device=torch.device('cpu'), logger=None, num_learning_epochs=4, clip_param=None, n_skills=8, embedding_dim=8, **kwargs):
+    def __init__(self, policy, value, sampler, obs_dim, policy_lr=0.0001, value_lr=0.001, num_envs=8, discount=0.99, device=torch.device('cpu'), logger=None, num_learning_epochs=4, clip_param=None, n_skills=8, embedding_dim=8, continious=False, **kwargs):
         self.n_skills = n_skills
         self.embedding_dim = embedding_dim
 
         self.embedding = nn.Embedding(self.n_skills, embedding_dim).to(device)
         self.embedding_old = copy.deepcopy(self.embedding).to(device)
-        self.discriminator = SkillDiscriminator(obs_dim, n_skills, continuous=False).to(device)
+        self.discriminator = SkillDiscriminator(obs_dim, n_skills, continuous=continious).to(device)
         self.discriminator_lr = policy_lr / 10
+        self.continious = continious
         super().__init__(policy, value, sampler, policy_lr=policy_lr,
                     num_envs=num_envs, discount=discount,
                     device=device, logger=logger, **kwargs)
-
         logits = torch.tensor([1 / self.n_skills for i in range(self.n_skills)])
         logits = torch.stack([logits for _ in range(self.num_envs)])
         self.skill_logits = logits.to(device)
@@ -372,6 +372,7 @@ class PPODRunning(PPOD):
         self.sync_threshold = 0.05  # Sync if target is better by this margin
         self.reset_threshold = 0.2  # Reset to target if accuracy drops by this much
         self.previous_accuracy = None
+        self.iteration_count = 0
 
     def learn_from_episodes(self, episodes, num_minibatches=4):
         # Extract per-episode tensors/lists
@@ -393,10 +394,23 @@ class PPODRunning(PPOD):
 
         states_without_skill = states_batch[:, :-self.embedding_dim]
 
-        accuracy, skill_pred = self.desc_accuracy(self.target_discriminator, states_without_skill, skill_batch)
-        self.logger.log_scalar("desc accuracy before", accuracy)
+        target_accuracy_before, _ = self.desc_accuracy(self.target_discriminator, states_without_skill, skill_batch)
+        accuracy_before, skill_pred = self.desc_accuracy(self.discriminator, states_without_skill, skill_batch)
+        self.logger.log_scalar("desc accuracy before", accuracy_before)
+        self.logger.log_scalar("target desc accuracy before", target_accuracy_before)
 
+        # Check for significant accuracy drop
+        if self.previous_accuracy is not None:
+            accuracy_drop = self.previous_accuracy - accuracy_before
 
+            # If accuracy dropped significantly, reset to target
+            if accuracy_drop > self.reset_threshold and target_accuracy_before > accuracy_before:
+                print(f"Discriminator accuracy dropped by {accuracy_drop:.4f}, resetting to target")
+                self.sync_discriminator_to_target()
+                # Recompute accuracy after reset
+                accuracy_before, _ = self.desc_accuracy(self.discriminator, states_without_skill, skill_batch)
+        self.previous_accuracy = accuracy_before
+        # Compute rewards using TARGET discriminator for stability
         rew_desc = []
         for episode_states, episode_skill in zip(states_list, skill_list):
             s_without_skill = episode_states[:, :-self.embedding_dim]
@@ -432,7 +446,7 @@ class PPODRunning(PPOD):
         self.train_discriminator(states_without_skill.detach(), skill_batch.detach())
         self.update_target_discriminator()
         accuracy, _ = self.desc_accuracy(self.target_discriminator, states_without_skill, skill_batch)
-        self.logger.log_scalar("desc accuracy after", accuracy)  # e.g., 0.8532
+        self.logger.log_scalar("desc accuracy after", accuracy)
         self.policy_old.load_state_dict(self.policy.state_dict())
         self.embedding_old.load_state_dict(self.embedding.state_dict())
 
@@ -444,3 +458,14 @@ class PPODRunning(PPOD):
                 target_param.data.copy_(
                     target_param.data * (1.0 - self.tau) + param.data * self.tau
                 )
+
+    def sync_discriminator_to_target(self):
+        """Fully synchronize main discriminator to target"""
+        self.discriminator.load_state_dict(self.target_discriminator.state_dict())
+        self.logger.log_scalar("discriminator_sync_to_target", 1.0)
+
+    def sync_target_to_discriminator(self):
+        """Fully synchronize target discriminator to main"""
+        self.target_discriminator.load_state_dict(self.discriminator.state_dict())
+        self.logger.log_scalar("target_sync_to_discriminator", 1.0)
+
