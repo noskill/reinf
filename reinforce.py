@@ -319,7 +319,8 @@ class ReinforceBase(Agent):
             self.logger.log_scalar("mu loss:", mu_loss.item())
 
         mu_coef = 0.001
-        policy_loss = -(log_probs * returns).mean() + self.entropy_coef * e_loss + mu_loss * mu_coef
+        log_clamped = log_probs.clamp(-10, 10)
+        policy_loss = -(log_clamped * returns).mean() + self.entropy_coef * e_loss + mu_loss * mu_coef
         if policy_loss.abs() > 100:
             import pdb;pdb.set_trace()
             return
