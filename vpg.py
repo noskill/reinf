@@ -67,15 +67,18 @@ class VPGBase(ReinforceBase):
 
         # Log statistics
         self._log_training_stats(actions_batch)
-        self.train_value(normalized_returns, states_batch)
+        self.train_value(normalized_returns, states_batch, value_epochs=3)
 
         # Policy Update
         with torch.no_grad():
             updated_values = self.value(states_batch).squeeze(-1)
 
         advantages = normalized_returns - updated_values
-        self.logger.log_scalar("Raw advantage mean:", advantages.mean().item())
-        self.logger.log_scalar("Raw advantage std:", advantages.std().item())
+        advantage_std = advantages.std()
+        advantage_mean = advantages.mean()
+        self.logger.log_scalar("Raw advantage mean:", advantage_mean.item())
+        self.logger.log_scalar("Raw advantage std:", advantage_std.item())
+        advantages = (advantages - advantage_mean) / advantage_std
         # Finally, train the policy (using log probs computed from current policy)
         if len(entropy_batch.shape) == 2 and entropy_batch.shape[1] == 1:
             entropy_batch = entropy_batch.flatten()

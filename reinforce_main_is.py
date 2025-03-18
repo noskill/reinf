@@ -147,7 +147,6 @@ def create_agent(args_cli, env_cfg, env, logger):
             logger=logger
         )
     elif args_cli.algorithm == "vpg":
-        value_loss_coef = 0.5
         value_clip = 0.2
         agent = VPG(
             policy=policy,
@@ -158,8 +157,6 @@ def create_agent(args_cli, env_cfg, env, logger):
             discount=discount,
             device=device,
             entropy_coef=entropy_coef,
-            value_loss_coef=value_loss_coef,
-            value_clip=value_clip,
             sampler=sampler,
             logger=logger
         )
@@ -221,11 +218,6 @@ def create_agent(args_cli, env_cfg, env, logger):
             action_dim = action_space.shape[0] * 2
         else:
             action_dim = action_space.n
-        policy = PolicyNetwork(
-            n_obs=obs_dim,
-            n_action=action_dim,
-            hidden_dim=hidden_dim
-        ).to(device)
         agent = Reinforce(
             policy=policy,
             sampler=sampler,

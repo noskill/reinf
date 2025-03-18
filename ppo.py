@@ -83,13 +83,15 @@ class PPOBase(VPGBase):
 
             advantages = returns_minibatch - updated_values
             advantage_std = advantages.std()
+            advantage_mean = advantages.mean()
+
 
             if torch.isnan(advantage_std).any():
                 import pdb; pdb.set_trace()
 
             self.logger.log_scalar("Raw advantage mean:", advantages.mean().item())
             self.logger.log_scalar("Raw advantage std:", advantage_std.item())
-
+            advantages = (advantages - advantage_mean) / advantage_std
             # Ensure proper entropy shape
             if len(entropy_minibatch.shape) == 2 and entropy_minibatch.shape[1] == 1:
                 entropy_minibatch = entropy_minibatch.flatten()
