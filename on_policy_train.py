@@ -81,7 +81,7 @@ class OnPolicyTrainer:
 
         for i in range(start_episode, self.n_episodes):
             obs = self.env.reset()
-            done = torch.zeros(len(obs), dtype=bool)
+            done = torch.zeros(self.env.num_envs, dtype=bool)
             self.agent.episode_start()
             step = 0
 

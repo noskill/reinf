@@ -26,6 +26,10 @@ parser.add_argument("--max-episode-s", type=int, default=None, help="set environ
 parser.add_argument("--algorithm", type=str, choices=["ppo", "reinforce", "vpg", "ppod", "ppodr"], default="reinforce", help="Algorithm to use for training.")
 parser.add_argument("--experiment-dir", type=str, default=None, help="Directory to save files.")
 parser.add_argument("--experiment-name", type=str, default=None, help="experiment name subdir.")
+parser.add_argument("--embedding-dim", type=int, default=8, help="embedding dimentions for diayn implementation")
+parser.add_argument("--continious-skills", action="store_true", default=False, help="whether should use continious distribution for skills")
+parser.add_argument("--skill-dim", type=int, default=8, help="size of sample space of categorical skill distribution or size of skill vector for continious skills")
+parser.set_defaults(flatten_obs=True)
 # Let AppLauncher add its own CLI args.
 AppLauncher.add_app_launcher_args(parser)
 
@@ -44,191 +48,27 @@ simulation_app = app_launcher.app
 import random
 from datetime import datetime
 
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import gymnasium as gym
-
-# Import your agent components
-from reinforce import Reinforce  # Your REINFORCE implementation
-from vpg import VPG  # Your VPG implementation
-from ppo import PPO  # Your PPO implementation
-from sample import DiscreteActionSampler, NormalActionSampler  # Action samplers
-from log import Logger  # Your logging utility
-from agent import Agent  # Your BaseAgent class
+from log import Logger
 from isaaclab_tasks.utils.hydra import hydra_task_config
 from isaaclab.envs import ManagerBasedRLEnvCfg, DirectRLEnvCfg, DirectMARLEnvCfg
 
-# Import the PolicyNetwork from reinforce_main.py
-from reinforce_main import PolicyNetwork
-
-# Import the Value network (named Value) from vpg_main.py
-from vpg_main import Value
-
-# Import setup_env from on_policy_train.py
 from on_policy_train import setup_env, OnPolicyTrainer
+from cfg_util import replace_remote_with_local, replace_urls_in_config
+from agent_util import create_agent
 
 
-# Utility functions for creating networks and agents
-
-def create_networks(obs_dim: int, action_dim: int, hidden_dim=256, device='cpu'):
-    # Use the imported PolicyNetwork
-    policy = PolicyNetwork(
-        n_obs=obs_dim,
-        n_action=action_dim,
-        hidden_dim=hidden_dim
-    ).to(device)
-        
-    # Use the imported Value network (named Value)
-    value = Value(
-        n_obs=obs_dim,
-        hidden_dim=hidden_dim
-    ).to(device)
-        
-    return policy, value
-
-def create_sampler(action_space):
-    shape = action_space.shape
-    if len(shape) != 1:
-        raise RuntimeError("unexpected action space size " + str(shape))
-    if isinstance(action_space, gym.spaces.Discrete):
-        return DiscreteActionSampler()
-    elif isinstance(action_space, gym.spaces.Box):
-        return NormalActionSampler(shape[0], a_min=-20, a_max=20, transform=False)
-    else:
-        raise ValueError(f"Unsupported action space type: {type(action_space)}")
-
-
-def create_agent(args_cli, env_cfg, env, logger):
-    num_envs = env.num_envs
-    # Determine observation and action dimensions
-    obs_space = env.observation_space
-    action_space = env.action_space
-    obs_dim = gym.spaces.flatdim(obs_space)
-
-    if isinstance(action_space, gym.spaces.Discrete):
-        action_dim = action_space.n
-    else:
-        action_dim = action_space.shape[0] * 2  # For mean and std in continuous actions
-
-    # Create networks using imported classes
-    device = env_cfg.sim.device
-    hidden_dim = 556  # You can adjust this value
-    policy, value = create_networks(
-        obs_dim=obs_dim,
-        action_dim=action_dim,
-        hidden_dim=hidden_dim,
-        device=device,
-    )
-
-    # Create sampler
-    sampler = create_sampler(action_space)
-
-    # Define hyperparameters
-    policy_lr = 0.0001
-    value_lr = 0.001
-    discount = 0.99
-    entropy_coef = 0.01
-
-    if args_cli.algorithm == "ppo":
-        num_learning_epochs = 4
-        agent = PPO(
-            policy=policy,
-            value=value,
-            num_envs=num_envs,
-            policy_lr=policy_lr,
-            value_lr=value_lr,
-            discount=discount,
-            device=device,
-            entropy_coef=entropy_coef,
-            num_learning_epochs=num_learning_epochs,
-            sampler=sampler,
-            logger=logger
-        )
-    elif args_cli.algorithm == "vpg":
-        value_clip = 0.2
-        agent = VPG(
-            policy=policy,
-            value=value,
-            num_envs=num_envs,
-            policy_lr=policy_lr,
-            value_lr=value_lr,
-            discount=discount,
-            device=device,
-            entropy_coef=entropy_coef,
-            sampler=sampler,
-            logger=logger
-        )
-    elif args_cli.algorithm == "ppod":
-        from ppod import PPOD
-        embedding_dim = 8
-        policy, value = create_networks(
-            obs_dim=obs_dim + embedding_dim,
-            action_dim=action_dim,
-            hidden_dim=hidden_dim,
-            device=device,
-        )
-        num_learning_epochs = 4
-        agent = PPOD(
-            policy=policy,
-            value=value,
-            obs_dim=obs_dim,
-            num_envs=num_envs,
-            policy_lr=policy_lr,
-            embedding_dim=embedding_dim,
-            value_lr=value_lr,
-            discount=discount,
-            device=device,
-            entropy_coef=entropy_coef,
-            num_learning_epochs=num_learning_epochs,
-            sampler=sampler,
-            logger=logger
-        )
-    elif args_cli.algorithm == 'ppodr':
-        from ppod import PPODRunning
-        embedding_dim = 8
-        policy, value = create_networks(
-            obs_dim=obs_dim + embedding_dim,
-            action_dim=action_dim,
-            hidden_dim=hidden_dim,
-            device=device,
-        )
-        num_learning_epochs = 4
-        agent = PPODRunning(
-            policy=policy,
-            value=value,
-            obs_dim=obs_dim,
-            num_envs=num_envs,
-            policy_lr=policy_lr,
-            embedding_dim=embedding_dim,
-            value_lr=value_lr,
-            discount=discount,
-            device=device,
-            entropy_coef=entropy_coef,
-            num_learning_epochs=num_learning_epochs,
-            sampler=sampler,
-            logger=logger
-        )
-    else:
-        # Default to REINFORCE
-        # For REINFORCE, the value network is not used
-        # Adjust the action_dim accordingly
-        if not isinstance(action_space, gym.spaces.Discrete):
-            action_dim = action_space.shape[0] * 2
-        else:
-            action_dim = action_space.n
-        agent = Reinforce(
-            policy=policy,
-            sampler=sampler,
-            num_envs=num_envs,
-            policy_lr=policy_lr,
-            discount=discount,
-            device=device,
-            entropy_coef=entropy_coef,
-            logger=logger
-        )
-    return agent
+def save_args_to_log(args, log_dir):
+    """Save command-line arguments to a log directory"""
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f'args.json')
+    
+    # Convert args to dictionary and save to JSON
+    args_dict = vars(args)
+    with open(log_file, 'w') as f:
+        import json
+        json.dump(args_dict, f, indent=4)
+    
+    return log_file
 
 
 @hydra_task_config(args_cli.task, "")
@@ -246,6 +86,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if args_cli.device is not None:
         env_cfg.sim.device = args_cli.device
 
+    env_cfg = replace_urls_in_config(env_cfg)
+    #env_cfg.scene.robot.spawn.usd_path = replace_remote_with_local(env_cfg.scene.robot.spawn.usd_path)
     # Define logging directories
     if args_cli.experiment_name is None:
         experiment_name = f"{args_cli.algorithm}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
@@ -264,7 +106,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     logger = Logger(experiment_dir)
 
     agent = create_agent(args_cli, env_cfg, env, logger)
-    n_episodes = 5000
+    n_episodes = 1500
+    
+    save_args_to_log(args_cli, experiment_dir)
     # Create trainer
     trainer = OnPolicyTrainer(
         env=env, 
@@ -279,6 +123,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # Close the environment
     env.close()
+
 
 # 5. Run main() and close the simulation app
 if __name__ == "__main__":

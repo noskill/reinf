@@ -1,9 +1,10 @@
 
 
 class Agent():
-    def __init__(self, *args, logger=None, **kwargs):
+    def __init__(self, *args, logger=None, state_extractor=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.logger = logger
+        self.state_extractor = state_extractor
         self.hparams = dict()
 
     def log_hparams(self):
