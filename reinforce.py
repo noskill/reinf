@@ -54,7 +54,7 @@ class ReinforceBase(Agent):
         self.create_optimizers()
         self.entropy_coef = entropy_coef
         self.entropy_thresh = 0.2
-        super().__init__(logger=logger)
+        super().__init__(logger=logger, **kwargs)
         self.hparams.update( {
             'policy_lr': policy_lr,
             'discount': discount,
@@ -373,7 +373,7 @@ class Reinforce(ReinforceBase, EpisodesPoolMixin):
     ):
         super().__init__(policy, sampler, policy_lr=policy_lr,
                          num_envs=num_envs, discount=discount,
-                         device=device, logger=logger)
+                         device=device, logger=logger, **kwargs)
 
 
 class ReinforceWithOldEpisodes(ReinforceBase, EpisodesOldPoolMixin):

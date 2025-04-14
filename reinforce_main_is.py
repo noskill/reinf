@@ -53,7 +53,6 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 from isaaclab.envs import ManagerBasedRLEnvCfg, DirectRLEnvCfg, DirectMARLEnvCfg
 
 from on_policy_train import setup_env, OnPolicyTrainer
-from cfg_util import replace_remote_with_local, replace_urls_in_config
 from agent_util import create_agent
 
 
@@ -86,8 +85,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if args_cli.device is not None:
         env_cfg.sim.device = args_cli.device
 
-    env_cfg = replace_urls_in_config(env_cfg)
-    #env_cfg.scene.robot.spawn.usd_path = replace_remote_with_local(env_cfg.scene.robot.spawn.usd_path)
     # Define logging directories
     if args_cli.experiment_name is None:
         experiment_name = f"{args_cli.algorithm}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"

@@ -140,7 +140,7 @@ class SkillEmbedding(nn.Module):
             self.model = nn.Embedding(skill_dim, embedding_dim).to(device)
             logits = torch.tensor([1 / skill_dim for i in range(skill_dim)])
             self.logits = logits.to(device)
-    
+
     def forward(self, skills):
         """Project skills to embedding space"""
         if not self.continuous:
@@ -168,23 +168,23 @@ class SkillAugmentedPolicy(nn.Module):
         self.policy = policy
         self.skill_embedding = skill_embedding
         self.skill_dim = skill_dim
-        
+
     def forward(self, states):
         """
         Forward pass that embeds skills and concatenates with states
         before passing to the policy.
-        
+
         Args:
             states: State observations [batch_size x state_dim]
             skills: Skill vectors or indices [batch_size x skill_dim] or [batch_size]
-            
+
         Returns:
             Policy output for the augmented states
         """
         augmented_states = self.augment_states(states)
         # Pass through the policy
         return self.policy(augmented_states)
-    
+
     def augment_states(self, states):
         skills = states[:, -self.skill_dim:]
         st = states[:, :-self.skill_dim]
@@ -207,8 +207,8 @@ class PPOD(PPOBase, PPODPool):
     def __init__(self, policy, value, sampler, obs_dim,
                  skill_dim=8, embedding_dim=8, continious=False,
                  policy_lr=0.0001, num_envs=8, discount=0.99,
-                 device=torch.device('cpu'), logger=None, num_learning_epochs=4, discriminator=None, 
-                 discriminator_fields=None, **kwargs):
+                 device=torch.device('cpu'), logger=None, num_learning_epochs=4, discriminator=None,
+                 discriminator_fields=None, desc_discard_steps=0, **kwargs):
         self.skill_dim = skill_dim
         self.embedding_dim = embedding_dim
         self.continious = continious
@@ -226,12 +226,45 @@ class PPOD(PPOBase, PPODPool):
 
         self.discriminator_lr = policy_lr / 10
         self.desc_fields = discriminator_fields
+        self.desc_discard_steps = desc_discard_steps
         # Initialize superclasses (PPOBase, Pool)
         super().__init__(policy, value, sampler, policy_lr=policy_lr,
                          num_envs=num_envs, discount=discount, device=device, logger=logger,
                          num_learning_epochs=num_learning_epochs, **kwargs)
 
         self.data_types = ['states', 'actions', 'log_probs', 'entropy', 'skill', 'rewards']
+
+    def prepare_discriminator_batches(self, states_list, skills_list):
+        """
+        Filter states and skills for discriminator training by removing warmup steps from each episode.
+
+        Args:
+            states_list: List of state tensors for each episode
+            skills_list: List of skill tensors for each episode
+
+        Returns:
+            Tuple of (filtered_states_batch, filtered_skills_batch) as concatenated tensors
+        """
+        filtered_states = []
+        filtered_skills = []
+
+        for episode_states, episode_skills in zip(states_list, skills_list):
+            filtered_states.append(episode_states[self.desc_discard_steps:])
+
+            # Handle both continuous and discrete skills
+            if self.continious or episode_skills.dim() > 1:
+                # For continuous skills or already expanded discrete skills
+                filtered_skills.append(episode_skills[self.desc_discard_steps:])
+            else:
+                # For discrete skills that are constant for the episode
+                # Repeat the skill for each state after warmup
+                filtered_skills.append(episode_skills.repeat(len(episode_states) - self.desc_discard_steps))
+
+        # Concatenate all filtered episodes
+        filtered_states_batch = torch.cat(filtered_states, dim=0).to(self.device)
+        filtered_skills_batch = torch.cat(filtered_skills, dim=0).to(self.device)
+
+        return filtered_states_batch, filtered_skills_batch
 
     def create_optimizers(self):
         super().create_optimizers()
@@ -263,11 +296,18 @@ class PPOD(PPOBase, PPODPool):
             active_skills = active_skills.unsqueeze(dim=1)
         active_states = torch.cat([active_states, active_skills], dim=1)
         return active_states
-    
+
     def compute_reward_from_discriminator(self, states, skill, discriminator=None):
-        """Compute rewards using the specified discriminator (or default to self.discriminator)"""
+        """Compute rewards using the specified discriminator (or default to self.discriminator)
+
+        states Tensor episode_length x N
+        skill Tensor episode_length  for discrete (episode_length x self.skill_dim) for continious
+        """
 
         discriminator = discriminator or self.discriminator
+        result = torch.zeros(states.shape[0]).to(states)
+        states = states[self.desc_discard_steps:]
+        skill = skill[self.desc_discard_steps:]
         desc_input = self.get_descriminator_input(states)
 
         skill_estimate = discriminator(desc_input)
@@ -284,14 +324,14 @@ class PPOD(PPOBase, PPODPool):
         else:
             assert skill_estimate.dim() == 2
             batch_size, num_skills = skill_estimate.shape
-            
+
             # Apply log_softmax to get log probabilities
             log_probs = F.log_softmax(skill_estimate, dim=-1)
- 
+
             # Skill should be a 1D tensor of indices [batch_size]
             assert skill.dim() == 1
             assert skill.shape[0] == batch_size
-            
+
             # Convert to long and add dimension for gather
             skill_indices = skill.long().unsqueeze(-1)
 
@@ -305,11 +345,12 @@ class PPOD(PPOBase, PPODPool):
             prior_log_prob = prior_log_prob.expand(batch_size)
             # This should be a vector of length batch_size
             assert prior_log_prob.shape == (batch_size,)
-            
+
             # DIAYN reward: log q(z|s) - log p(z)
             reward = discriminator_log_prob - prior_log_prob
             assert reward.shape == (batch_size,)
-        return reward.detach()
+        result[self.desc_discard_steps:] = reward.detach()
+        return result
 
     def evaluate_discriminator(self, discriminator, states, skills):
         desc_input = self.get_descriminator_input(states)
@@ -326,11 +367,48 @@ class PPOD(PPOBase, PPODPool):
                 performance = (pred == skills).float().mean().item()
             return performance
 
+    def filter_short_episodes(self, data_dict, min_length):
+        """
+        Filter out episodes that are shorter than the specified minimum length.
+
+        Args:
+            data_dict: Dictionary containing episode data
+            min_length: Minimum episode length to keep
+
+        Returns:
+            Filtered data dictionary or None if no valid episodes remain
+        """
+        states = data_dict['states']
+        valid_indices = []
+
+        for i, episode_states in enumerate(states):
+            if len(episode_states) > min_length:
+                valid_indices.append(i)
+
+        if not valid_indices:
+            return None  # No valid episodes
+
+        # Create a new filtered dictionary
+        filtered_dict = {}
+        for key, value in data_dict.items():
+            filtered_dict[key] = [value[i] for i in valid_indices]
+
+        return filtered_dict
+
     def learn_from_episodes(self, episodes, num_minibatches=4):
         data_dict = self._extract_episode_data(episodes)
-        states, log_probs, actions, rewards, entropy, skills = \
-            data_dict['states'], data_dict['log_probs'], data_dict['actions'], \
-            data_dict['rewards'], data_dict['entropy'], data_dict['skill']
+
+        # Filter out episodes that are too short
+        filtered_dict = self.filter_short_episodes(data_dict, self.desc_discard_steps)
+        if filtered_dict is None:
+            return  # No valid episodes
+
+        states = filtered_dict['states']
+        log_probs = filtered_dict['log_probs']
+        actions = filtered_dict['actions']
+        rewards = filtered_dict['rewards']
+        entropy = filtered_dict['entropy']
+        skills = filtered_dict['skill']
 
         if not states:
             return
@@ -338,10 +416,11 @@ class PPOD(PPOBase, PPODPool):
         states_batch, returns, log_probs, actions, entropy = self._prepare_batches(
             states, log_probs, rewards, actions, entropy)
         skills_batch = torch.cat(skills, dim=0).to(self.device)
-        states_no_skill = states_batch[:, :-self.skill_state_len]
+        # Prepare filtered batches for discriminator (skipping warmup steps)
+        desc_states_batch, desc_skills_batch = self.prepare_discriminator_batches(states, skills)
 
         # Evaluate discriminator performance
-        performance = self.evaluate_discriminator(self.discriminator, states_batch, skills_batch)
+        performance = self.evaluate_discriminator(self.discriminator, desc_states_batch, desc_skills_batch)
         if self.continious:
             self.logger.log_scalar("discriminator_mse", performance)
         else:
@@ -371,7 +450,7 @@ class PPOD(PPOBase, PPODPool):
                               actions, entropy, num_minibatches, skills_batch)
 
         # Train discriminator
-        self.train_discriminator(states_batch, skills_batch)
+        self.train_discriminator(desc_states_batch, desc_skills_batch)
 
         # Sync networks after training
         self.policy_old.load_state_dict(self.policy.state_dict())
@@ -409,7 +488,11 @@ class PPOD(PPOBase, PPODPool):
         return result
 
     def train_discriminator(self, states, skills):
-        """Train the discriminator to predict skills from states"""
+        """Train the discriminator to predict skills from states
+
+        states batch_size x M
+        skills batch_size x N or batch_size
+        """
         train_epochs = 1
         mini_batch_size = 128
         desc_input = self.get_descriminator_input(states)
@@ -456,7 +539,7 @@ class PPODRunning(PPOD):
 
         # Polyak averaging coefficient (τ)
         self.tau = 0.1  # Slow update rate
-        
+
         # Synchronization settings
         self.sync_interval = 100
         self.sync_threshold = 0.05
@@ -466,20 +549,27 @@ class PPODRunning(PPOD):
 
     def learn_from_episodes(self, episodes, num_minibatches=4):
         data_dict = self._extract_episode_data(episodes)
-        states, log_probs, actions, rewards, entropy, skills = \
-            data_dict['states'], data_dict['log_probs'], data_dict['actions'], \
-            data_dict['rewards'], data_dict['entropy'], data_dict['skill']
+        # Filter out episodes that are too short
+        filtered_dict = self.filter_short_episodes(data_dict, self.desc_discard_steps)
+        if filtered_dict is None:
+            return  # No valid episodes
 
+        states = filtered_dict['states']
+        log_probs = filtered_dict['log_probs']
+        actions = filtered_dict['actions']
+        rewards = filtered_dict['rewards']
+        entropy = filtered_dict['entropy']
+        skills = filtered_dict['skill']
         if not states:
             return
-            
+
         states_batch, returns, log_probs, actions, entropy = self._prepare_batches(
             states, log_probs, rewards, actions, entropy)
         skills_batch = torch.cat(skills, dim=0).to(self.device)
-
+        desc_states_batch, desc_skills_batch = self.prepare_discriminator_batches(states, skills)
         # Evaluate main and target discriminator performance
-        target_perf = self.evaluate_discriminator(self.target_discriminator, states_batch, skills_batch)
-        main_perf = self.evaluate_discriminator(self.discriminator, states_batch, skills_batch)
+        target_perf = self.evaluate_discriminator(self.target_discriminator, desc_states_batch, desc_skills_batch)
+        main_perf = self.evaluate_discriminator(self.discriminator, desc_states_batch, desc_skills_batch)
         performance_drop = None
         # Log performance metrics
         if self.continious:
@@ -494,7 +584,7 @@ class PPODRunning(PPOD):
             # For accuracy, higher is better
             is_target_better = target_perf > main_perf
             performance_drop = (self.previous_performance or main_perf) - main_perf
-        
+
         if performance_drop is not None:
             self.logger.log_scalar("performance_drop", performance_drop)
             self.logger.log_scalar("is_target_better", is_target_better * 1.0)
@@ -503,10 +593,10 @@ class PPODRunning(PPOD):
             self.logger.log_scalar("discriminator_reset", 1.0)
             print(f"Discriminator performance dropped by {performance_drop:.4f}, resetting to target")
             self.sync_discriminator_to_target()
-            
+
             # Re-evaluate after reset
-            main_perf = self.evaluate_discriminator(self.discriminator, states_batch, skills_batch)
-        
+            main_perf = self.evaluate_discriminator(self.discriminator, desc_states_batch, desc_skills_batch)
+
         self.previous_performance = main_perf
 
         # Compute discriminator-based rewards using TARGET discriminator
@@ -529,7 +619,7 @@ class PPODRunning(PPOD):
 
         # Sync networks before training
         self.policy.load_state_dict(self.policy_old.state_dict())
-        
+
         if entropy.dim() == 2:
             entropy = entropy.mean(dim=1)
         # Train policy
@@ -538,11 +628,11 @@ class PPODRunning(PPOD):
                               actions, entropy, num_minibatches, skills_batch)
 
         # Train discriminator
-        self.train_discriminator(states_batch, skills_batch)
-        
+        self.train_discriminator(desc_states_batch, desc_skills_batch)
+
         # Update target discriminator via Polyak averaging
         self.update_target_discriminator()
-        
+
         self.policy_old.load_state_dict(self.policy.state_dict())
 
     def update_target_discriminator(self):
@@ -557,11 +647,11 @@ class PPODRunning(PPOD):
     def sync_discriminator_to_target(self):
         """Fully synchronize main discriminator to target"""
         self.discriminator.load_state_dict(self.target_discriminator.state_dict())
-        
+
     def sync_target_to_discriminator(self):
         """Fully synchronize target discriminator to main"""
         self.target_discriminator.load_state_dict(self.discriminator.state_dict())
-        
+
     def get_state_dict(self):
         sd = super().get_state_dict()
         sd['target_discriminator'] = self.target_discriminator.state_dict()

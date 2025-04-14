@@ -214,7 +214,7 @@ class PPOBase(VPGBase):
     def get_policy_for_action(self):
         return self.policy_old
 
-    def load_state_dict(self, sd):
+    def load_state_dict(self, sd, ignore_missing=False):
         super().load_state_dict(sd)
         self.policy_old.load_state_dict(self.policy.state_dict())
 
