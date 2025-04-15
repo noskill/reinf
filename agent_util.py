@@ -51,7 +51,10 @@ def create_agent(args_cli, env_cfg, env, logger):
     obs_space = env.observation_space
     action_space = env.action_space
     obs_dim = gym.spaces.flatdim(obs_space)
-    state_extractor = StateExtractor.from_dict_observation(obs_space)
+    state_extractor = None
+    if hasattr(obs_space, 'keys'):
+        state_extractor = StateExtractor.from_dict_observation(obs_space)
+
     if isinstance(action_space, gym.spaces.Discrete):
         action_dim = action_space.n
     else:
