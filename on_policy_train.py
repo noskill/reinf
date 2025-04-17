@@ -27,10 +27,14 @@ def setup_env(env_cfg: Union['ManagerBasedRLEnvCfg', 'DirectRLEnvCfg', 'DirectMA
     env = gym.make(
         args_cli.task,
         cfg=env_cfg,
-        render_mode="rgb_array" if args_cli.video else None
+        render_mode="rgb_array" if args_cli.video else None,
+        disable_env_checker=True  # This disables the PassiveEnvChecker
     )
 
-    seed = env.env.seed(int(args_cli.seed))
+    seed = int(args_cli.seed)
+    base_env = env.unwrapped
+    base_env.seed(seed)
+
     print('set seed to ' + str(seed))
     # Add video recording wrapper if requested
     if args_cli.video:

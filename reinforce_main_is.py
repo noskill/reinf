@@ -45,6 +45,7 @@ app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
 import grab
+import envs
 import random
 from datetime import datetime
 
