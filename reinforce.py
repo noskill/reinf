@@ -105,7 +105,7 @@ class ReinforceBase(Agent):
 
         return full_actions
 
-    def update(self, obs, actions, rewards, dones, next_obs):
+    def update(self, obs, actions, rewards, dones, next_obs, info=None):
         for env_idx in range(self.num_envs):
             self.add_reward(env_idx, rewards[env_idx])
 

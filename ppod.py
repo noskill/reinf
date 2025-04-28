@@ -665,3 +665,10 @@ class PPODRunning(PPOD):
             if not ignore_missing:
                 raise e
 
+    def update(self, obs, actions, rewards, dones, next_obs, info=None):
+        if 'grasp_success_rate' in info:
+            self.logger.log_scalar('grasp_success_rate', info['grasp_success_rate'])
+
+        if 'stack_success_rate' in info:
+            self.logger.log_scalar('stack_success_rate', info['stack_success_rate'])
+        return super().update(obs, actions, rewards, dones, next_obs, info=info)

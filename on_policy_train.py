@@ -1,4 +1,5 @@
 import os
+import time
 import sys
 from venv import VectorEnvWrapper
 from typing import Union
@@ -97,11 +98,10 @@ class OnPolicyTrainer:
                 done = terminated
                 # terminal_reward = -2 _np.exp(-(step/300)_*2) * done
                 terminal_reward = 0
-                changed = self.agent.update(obs, action, reward + terminal_reward, done, next_obs)
+                changed = self.agent.update(obs, action, reward + terminal_reward, done, next_obs, info=info)
                 if changed:
                     break
                 obs = next_obs
-                step += 1
 
             self.agent.logger.increment_episode()
 

@@ -16,5 +16,5 @@ class Agent():
     def get_action(self, state, done):
         pass
 
-    def update(self, obs, actions, rewards, dones, next_obs):
+    def update(self, obs, actions, rewards, dones, next_obs, info=None):
         pass
