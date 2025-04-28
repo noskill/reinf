@@ -95,6 +95,8 @@ class OnPolicyTrainer:
                 if action.ndim == 1:
                     action = action.unsqueeze(1)
                 next_obs, reward, terminated, info = self.env.step(action)
+                if torch.isnan(reward).any():
+                    import pdb;pdb.set_trace()
                 done = terminated
                 # terminal_reward = -2 _np.exp(-(step/300)_*2) * done
                 terminal_reward = 0
