@@ -79,6 +79,9 @@ class NormalActionSampler(ActionSampler):
 
         return action, log_prob, transformed_dist
 
+    def split_out(self, out):
+        return  torch.chunk(out, chunks=2, dim=-1)
+
 
 class BetaActionSampler(ActionSampler):
     def __init__(self, a_min=-2.0, a_max=2.0):

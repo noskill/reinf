@@ -120,8 +120,8 @@ class PPOBase(VPGBase):
         mu_loss = torch.tensor(0.0, device=self.device)
         if states_batch is not None and isinstance(self.sampler, NormalActionSampler):
             out = self.policy(states_batch)
-            mu = out[..., :1]
-            # shape check for mu here if you want
+            mu, _ = self.sampler.split_out(out)
+            mu = torch.clamp(mu, -1e6, 1e6)
             mu_loss = 0.01 * torch.mean(mu**2 * (mu.abs() > 2))
             self.logger.log_scalar("mu loss:", mu_loss.item())
 
