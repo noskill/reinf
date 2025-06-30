@@ -10,22 +10,7 @@ np = numpy
 
 from agent_reinf import Agent
 from pool import *
-
-
-class RunningNorm:
-    def __init__(self, epsilon=1e-4):
-        self.mean = None
-        self.std = None
-        self.epsilon = epsilon
-
-    def __call__(self, x):
-        if self.mean is None:
-            self.mean = x.mean(0, keepdim=True)
-            self.std = x.std(0, keepdim=True) + self.epsilon
-        else:
-            self.mean = 0.99 * self.mean + 0.01 * x.mean(0, keepdim=True)
-            self.std = 0.99 * self.std + 0.01 * x.std(0, keepdim=True)
-        return (x - self.mean) / self.std
+from util import RunningNorm
 
 
 class ReinforceBase(Agent):
@@ -266,7 +251,7 @@ class ReinforceBase(Agent):
         returns_batch = torch.cat(returns_list, dim=0).to(self.device)
         actions_batch = torch.cat(actions_list, dim=0).to(self.device)
         log_probs_batch = torch.cat(log_probs_list, dim=0).to(self.device).reshape(returns_batch.shape)
-        entropy_batch = torch.cat(entropy_list, dim=0).to(self.device)
+        entropy_batch = torch.cat(entropy_list, dim=0).to(self.device).reshape(log_probs_batch.shape)
 
         return states_batch, returns_batch, log_probs_batch, actions_batch, entropy_batch
 

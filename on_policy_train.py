@@ -84,7 +84,7 @@ class OnPolicyTrainer:
             self.load_checkpoint(self.checkpoint)
             start_episode = self.agent.logger.episode_count
 
-        for i in range(start_episode, self.n_episodes):
+        for i in range(start_episode, start_episode + self.n_episodes):
             obs = self.env.reset()
             done = torch.zeros(self.env.num_envs, dtype=bool)
             self.agent.episode_start()

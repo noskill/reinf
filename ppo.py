@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from sample import NormalActionSampler
 np = numpy
 from pool import EpisodesPoolMixin
-from reinforce import RunningNorm
+from util import RunningNorm
 import copy
 
 

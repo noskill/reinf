@@ -1,6 +1,7 @@
 import numpy
 import copy
 import torch
+import random
 import torch.optim as optim
 from torch.distributions import Categorical, Normal, Uniform
 import torch.nn as nn
@@ -208,7 +209,7 @@ class PPOD(PPOBase, PPODPool):
                  skill_dim=8, embedding_dim=8, continious=False,
                  policy_lr=0.0001, num_envs=8, discount=0.99,
                  device=torch.device('cpu'), logger=None, num_learning_epochs=4, discriminator=None,
-                 discriminator_fields=None, desc_discard_steps=0, **kwargs):
+                 discriminator_fields=None, desc_discard_steps=0, disc_lr=-1, **kwargs):
         self.skill_dim = skill_dim
         self.embedding_dim = embedding_dim
         self.continious = continious
@@ -223,8 +224,8 @@ class PPOD(PPOBase, PPODPool):
 
         # Create the augmented policy
         policy = SkillAugmentedPolicy(policy, self.skill_embedding, self.skill_state_len)
-
-        self.discriminator_lr = policy_lr / 10
+        assert disc_lr > 0
+        self.discriminator_lr = disc_lr
         self.desc_fields = discriminator_fields
         self.desc_discard_steps = desc_discard_steps
         # Initialize superclasses (PPOBase, Pool)
@@ -233,6 +234,7 @@ class PPOD(PPOBase, PPODPool):
                          num_learning_epochs=num_learning_epochs, **kwargs)
 
         self.data_types = ['states', 'actions', 'log_probs', 'entropy', 'skill', 'rewards']
+        self.p_drop = kwargs.get('p_drop', 0)
 
     def prepare_discriminator_batches(self, states_list, skills_list):
         """
@@ -297,6 +299,16 @@ class PPOD(PPOBase, PPODPool):
         active_states = torch.cat([active_states, active_skills], dim=1)
         return active_states
 
+    def compute_additional_reward(self, states, skill, discriminator=None, episode_lengths=None, **kwargs):
+        result = []
+        s = 0
+        for el in episode_lengths:
+            st = states[s: s + el]
+            sk = skill[s: s + el]
+            result.append(self.compute_reward_from_discriminator(st, sk, discriminator=discriminator))
+            s += el
+        return result
+
     def compute_reward_from_discriminator(self, states, skill, discriminator=None):
         """Compute rewards using the specified discriminator (or default to self.discriminator)
 
@@ -308,7 +320,7 @@ class PPOD(PPOBase, PPODPool):
         result = torch.zeros(states.shape[0]).to(states)
         states = states[self.desc_discard_steps:]
         skill = skill[self.desc_discard_steps:]
-        desc_input = self.get_descriminator_input(states)
+        desc_input = self.get_descriminator_input(states, p_drop=self.p_drop)
 
         skill_estimate = discriminator(desc_input)
         if self.continious:
@@ -427,15 +439,15 @@ class PPOD(PPOBase, PPODPool):
             self.logger.log_scalar("discriminator_accuracy", performance)
 
         # Compute discriminator-based rewards
-        disc_rewards = []
-        idx = 0
-        for episode_states, episode_skill in zip(states, skills):
-            reward_desc = self.compute_reward_from_discriminator(episode_states, episode_skill)
+        episode_lengths = [len(s) for s in states]
+        additional_reward_per_episode = self.compute_additional_reward(states_batch, skills_batch, episode_lengths=episode_lengths)
+        new_rewards = []
+        for idx in range(len(rewards)):
+            reward_desc = additional_reward_per_episode[idx]
             total_reward = reward_desc + rewards[idx].to(reward_desc.device)
-            disc_rewards.append(total_reward)
-            idx += 1
+            new_rewards.append(total_reward)
 
-        new_returns = torch.cat([self._compute_discounted_returns(r) for r in disc_rewards], dim=0).to(self.device)
+        new_returns = torch.cat([self._compute_discounted_returns(r) for r in new_rewards], dim=0).to(self.device)
         new_returns = self._normalize_returns(new_returns)
         augmented_states = self.policy_old.augment_states(states_batch)
         # Training
@@ -480,11 +492,16 @@ class PPOD(PPOBase, PPODPool):
             # Train policy
             self.train_policy(log_probs_mb, advantages, entropy_mb, states_mb, actions_mb)
 
-    def get_descriminator_input(self, states):
+    def get_descriminator_input(self, states, p_drop=0):
         if self.desc_fields is None:
             result = self.state_extractor.remove(states, ["actions", "skill"])
         else:
             result = self.state_extractor.extract(states, self.desc_fields)
+        if p_drop > 0:
+            size = self.state_extractor.get_fields_size(self.desc_fields[-1])
+            res = result.clone()
+            res[:, -size:] *= float(random.random() < p_drop)
+            result = res
         return result
 
     def train_discriminator(self, states, skills):
@@ -493,9 +510,9 @@ class PPOD(PPOBase, PPODPool):
         states batch_size x M
         skills batch_size x N or batch_size
         """
-        train_epochs = 1
+        train_epochs = 2
         mini_batch_size = 128
-        desc_input = self.get_descriminator_input(states)
+        desc_input = self.get_descriminator_input(states, p_drop=self.p_drop)
         for epoch in range(train_epochs):
             indices = torch.randperm(len(desc_input))
             for start in range(0, len(desc_input), mini_batch_size):
@@ -515,6 +532,8 @@ class PPOD(PPOBase, PPODPool):
         sd['skill_embedding'] = self.skill_embedding.state_dict()
         sd['discriminator'] = self.discriminator.state_dict()
         sd['optimizer_discriminator'] = self.optimizer_discriminator.state_dict()
+        sd['desc_fields'] = self.desc_fields
+        sd['desc_discard_steps'] = self.desc_discard_steps
         return sd
 
     def load_state_dict(self, sd, ignore_missing=False):
@@ -600,18 +619,16 @@ class PPODRunning(PPOD):
         self.previous_performance = main_perf
 
         # Compute discriminator-based rewards using TARGET discriminator
-        disc_rewards = []
-        idx = 0
-        for episode_states, episode_skill in zip(states, skills):
-            # Use the parent method but specify the target discriminator
-            reward_desc = self.compute_reward_from_discriminator(
-                episode_states, episode_skill, discriminator=self.target_discriminator
-            )
+        episode_lengths = [len(s) for s in states]
+        additional_reward_per_episode = self.compute_additional_reward(states_batch, skills_batch,
+                                                                       episode_lengths=episode_lengths, discriminator=self.target_discriminator)
+        new_rewards = []
+        for idx in range(len(rewards)):
+            reward_desc = additional_reward_per_episode[idx]
             total_reward = reward_desc + rewards[idx].to(reward_desc.device)
-            disc_rewards.append(total_reward)
-            idx += 1
+            new_rewards.append(total_reward)
 
-        new_returns = torch.cat([self._compute_discounted_returns(r) for r in disc_rewards], dim=0).to(self.device)
+        new_returns = torch.cat([self._compute_discounted_returns(r) for r in new_rewards], dim=0).to(self.device)
         new_returns = self._normalize_returns(new_returns)
         augmented_states = self.policy_old.augment_states(states_batch)
         # Training

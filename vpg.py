@@ -6,7 +6,8 @@ import torch.optim as optim
 import torch.nn.functional as F
 np = numpy
 from pool import EpisodesPoolMixin
-from reinforce import ReinforceBase, RunningNorm
+from reinforce import ReinforceBase
+from util import RunningNorm
 
 
 class Value(nn.Module):
