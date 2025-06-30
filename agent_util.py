@@ -23,13 +23,13 @@ def create_networks(obs_dim: int, action_dim: int, hidden_dim=256, device='cpu')
         n_action=action_dim,
         hidden_dim=hidden_dim
     ).to(device)
-        
+
     # Use the imported Value network (named Value)
     value = Value(
         n_obs=obs_dim,
         hidden_dim=hidden_dim
     ).to(device)
-        
+
     return policy, value
 
 
@@ -74,8 +74,9 @@ def create_agent(args_cli, env_cfg, env, logger):
     sampler = create_sampler(action_space)
 
     # Define hyperparameters
-    policy_lr = 0.0001
-    value_lr = 0.001
+    policy_lr = args_cli.policy_lr if args_cli.policy_lr is not None else 0.001
+    value_lr = args_cli.value_lr if args_cli.value_lr is not None else 0.001
+    disc_lr = args_cli.disc_lr
     discount = 0.99
     entropy_coef = 0.01
 
@@ -88,6 +89,7 @@ def create_agent(args_cli, env_cfg, env, logger):
             num_envs=num_envs,
             policy_lr=policy_lr,
             value_lr=value_lr,
+            disc_lr=disc_lr,
             discount=discount,
             device=device,
             entropy_coef=entropy_coef,
@@ -111,9 +113,13 @@ def create_agent(args_cli, env_cfg, env, logger):
             logger=logger,
             **common_args
         )
-    elif args_cli.algorithm in ('ppodr', "ppod"):
+    elif args_cli.algorithm in ('ppodr', "ppod", "ppod_novel"):
         if args_cli.algorithm == 'ppodr':
             from ppod import PPODRunning as PPOD
+        elif args_cli.algorithm == 'ppod_novel':
+            from ppod_novel import PPODNovel as PPOD
+            from clustering import SmartClusteringNovelty
+            common_args['novelty'] = SmartClusteringNovelty()
         else:
             from ppod import PPOD
         from ppod import SkillDiscriminator
@@ -127,12 +133,12 @@ def create_agent(args_cli, env_cfg, env, logger):
             device=device,
         )
         num_learning_epochs = 4
+        discard_steps = 0
         state_extractor.add_field_at_end("skill", shape=(skill_dim if continious else 1,))
-        
-        sk_size = state_extractor.get_fields_size('skill')
-        desc_fields = ['cube_positions', 'cube_orientations', 'eef_pos']
-        desc_input_size = state_extractor.get_fields_size(desc_fields)
 
+        sk_size = state_extractor.get_fields_size('skill')
+        desc_fields = ['cube_positions', 'cube_orientations', 'eef_pos', 'eef_quat', 'gripper_pos']
+        desc_input_size = state_extractor.get_fields_size(desc_fields)
         # Discriminator supports continuous or discrete
         discriminator = SkillDiscriminator(
             desc_input_size, skill_dim, continuous=continious).to(device)
@@ -154,7 +160,8 @@ def create_agent(args_cli, env_cfg, env, logger):
             discriminator=discriminator,
             skill_dim=skill_dim,
             discriminator_fields=desc_fields,
-            desc_discard_steps=100,
+            desc_discard_steps=discard_steps,
+            disc_lr=disc_lr,
             **common_args
         )
     else:

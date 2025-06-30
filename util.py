@@ -230,3 +230,73 @@ class StateExtractor:
             total_size += field_size
 
         return total_size
+
+
+class RunningNorm:
+    def __init__(self, epsilon=1e-5, momentum=0.999, min_std=1e-2, device=None):
+        self.epsilon = epsilon
+        self.momentum = momentum
+        self.min_std = min_std
+        self.mean = None
+        self.std = None
+
+        # For datatype consistency
+        self.use_torch = None
+        self.device = device
+        self.dtype = None
+
+    def _mean(self, x):
+        if isinstance(x, torch.Tensor):
+            return x.mean(dim=0, keepdim=True)
+        else:  # numpy
+            return x.mean(axis=0, keepdims=True)
+
+    def _std(self, x):
+        if isinstance(x, torch.Tensor):
+            # unbiased=False matches numpy's default behavior
+            return x.std(dim=0, unbiased=False, keepdim=True)
+        else:
+            return x.std(axis=0, keepdims=True)
+
+    def _maximum(self, x, val):
+        if isinstance(x, torch.Tensor):
+            return torch.clamp(x, min=val)
+        else:
+            return np.maximum(x, val)
+
+    def __call__(self, x):
+        # Detect and fix the type at first call
+        if self.use_torch is None:
+            if isinstance(x, torch.Tensor):
+                self.use_torch = True
+                self.dtype = x.dtype
+                self.device = x.device if self.device is None else self.device
+            elif isinstance(x, np.ndarray):
+                self.use_torch = False
+                self.dtype = x.dtype
+            else:
+                raise TypeError("Input must be NumPy array or PyTorch tensor.")
+
+        # Enforce consistent types on subsequent calls
+        if self.use_torch and not isinstance(x, torch.Tensor):
+            raise TypeError("Initialized with PyTorch tensor but received NumPy array.")
+        if not self.use_torch and not isinstance(x, np.ndarray):
+            raise TypeError("Initialized with NumPy array but received PyTorch tensor.")
+
+        # Calculate mean and std using unified API
+        batch_mean = self._mean(x)
+        batch_std = self._std(x) + self.epsilon
+
+        # Update running mean and std
+        if self.mean is None:
+            self.mean = batch_mean
+            self.std = batch_std
+        else:
+            self.mean = self.momentum * self.mean + (1 - self.momentum) * batch_mean
+            self.std = self.momentum * self.std + (1 - self.momentum) * batch_std
+            assert 0.2 < self.std # sanity check
+
+        # Normalize
+        normalized = (x - self.mean) / (self.std + self.epsilon)
+
+        return normalized

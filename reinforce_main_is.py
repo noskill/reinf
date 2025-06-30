@@ -23,12 +23,16 @@ parser.add_argument("--seed", type=int, default=None, help="Seed used for enviro
 parser.add_argument("--checkpoint", type=str, default=None, help="Path to load checkpoint from")
 parser.add_argument("--save-interval", type=int, default=100, help="Save checkpoint every N episodes")
 parser.add_argument("--max-episode-s", type=int, default=None, help="set environment max episode length in seconds")
-parser.add_argument("--algorithm", type=str, choices=["ppo", "reinforce", "vpg", "ppod", "ppodr"], default="reinforce", help="Algorithm to use for training.")
+parser.add_argument("--algorithm", type=str, choices=["ppo", "reinforce", "vpg", "ppod", "ppodr", "ppod_novel"], default="reinforce", help="Algorithm to use for training.")
 parser.add_argument("--experiment-dir", type=str, default=None, help="Directory to save files.")
 parser.add_argument("--experiment-name", type=str, default=None, help="experiment name subdir.")
 parser.add_argument("--embedding-dim", type=int, default=8, help="embedding dimentions for diayn implementation")
 parser.add_argument("--continious-skills", action="store_true", default=False, help="whether should use continious distribution for skills")
 parser.add_argument("--skill-dim", type=int, default=8, help="size of sample space of categorical skill distribution or size of skill vector for continious skills")
+parser.add_argument("--n-episodes", type=int, default=1500, help="number of episodes to run")
+parser.add_argument("--disc-lr", type=float, default=None, help="learning rate of descriminator in DIAYN")
+parser.add_argument("--policy-lr", type=float, default=None, help="learning rate of policy function")
+parser.add_argument("--value-lr", type=float, default=None, help="learning rate of value function")
 parser.set_defaults(flatten_obs=True)
 # Let AppLauncher add its own CLI args.
 AppLauncher.add_app_launcher_args(parser)
@@ -104,7 +108,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     logger = Logger(experiment_dir)
 
     agent = create_agent(args_cli, env_cfg, env, logger)
-    n_episodes = 1500
+    n_episodes = args_cli.n_episodes
     
     save_args_to_log(args_cli, experiment_dir)
     # Create trainer
