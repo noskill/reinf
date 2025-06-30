@@ -13,7 +13,9 @@ class CustomFrankaStackEnv(ManagerBasedRLEnv):
     stack_reward_weight = 10.0
     distance_reward_weight = 0.5
 
-    def __init__(self, cfg: ManagerBasedRLEnvCfg = None, render_mode=None, env_cfg_entry_point=None, **kwargs):
+    def __init__(self, cfg: ManagerBasedRLEnvCfg = None, render_mode=None, env_cfg_entry_point=None,
+                         reward_on: bool = True,
+                         **kwargs):
         if cfg is None and env_cfg_entry_point is not None:
             cfg = env_cfg_entry_point()
         super().__init__(cfg, render_mode=render_mode)
@@ -22,6 +24,7 @@ class CustomFrankaStackEnv(ManagerBasedRLEnv):
         self.ee_frame_cfg = SceneEntityCfg("ee_frame")
         self.cube_cfgs = [SceneEntityCfg(f"cube_{i}") for i in range(1,4)]
         self.episode_flags = {}
+        self.reward_on = reward_on
 
     def reset(self, env_ids=None, seed=None, options=None):
         obs, info = super().reset(env_ids=env_ids, seed=seed, options=options)
@@ -140,6 +143,7 @@ class CustomFrankaStackEnv(ManagerBasedRLEnv):
         """Override step to use our custom reward calculation."""
         # Call the parent step method but ignore its reward calculation
         obs, rewards, terminated, truncated, info = super().step(action)
-        rewards, info = self.compute_reward(obs, info)
+        if self.reward_on:
+            rewards, info = self.compute_reward(obs, info)
         # Return with your custom rewards
         return obs, rewards, terminated, truncated, info
