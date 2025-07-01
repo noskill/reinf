@@ -137,7 +137,7 @@ def create_agent(args_cli, env_cfg, env, logger):
         state_extractor.add_field_at_end("skill", shape=(skill_dim if continious else 1,))
 
         sk_size = state_extractor.get_fields_size('skill')
-        desc_fields = ['cube_positions', 'cube_orientations', 'eef_pos', 'eef_quat', 'gripper_pos']
+        desc_fields = ['object', 'cube_positions', 'cube_orientations', 'eef_pos', 'eef_quat', 'gripper_pos']
         desc_input_size = state_extractor.get_fields_size(desc_fields)
         # Discriminator supports continuous or discrete
         discriminator = SkillDiscriminator(
