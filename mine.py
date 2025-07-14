@@ -1,7 +1,7 @@
-import random
 import torch
 import numpy as np
 import argparse
+import random
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
@@ -11,8 +11,9 @@ def generate_correlated_gaussian(rho, n_samples):
     """
     Generate correlated Gaussian samples with correlation coefficient rho
     """
-    x = torch.randn(n_samples)
-    z = torch.randn(n_samples)
+    # Draw standard normal samples as column vectors
+    x = torch.randn(n_samples, 1)
+    z = torch.randn(n_samples, 1)
     # Convert rho to tensor to avoid type mismatch
     rho_tensor = torch.tensor(rho)
     y = rho_tensor * x + torch.sqrt(1 - rho_tensor**2) * z
@@ -32,11 +33,11 @@ def generate_multivariate_gaussian(n_samples, dim, rho):
     cov_xx = np.eye(dim)
     cov_yy = np.eye(dim)
     cov_xy = rho * np.eye(dim)
-    
+
     # Build the full covariance matrix
     cov = np.block([[cov_xx, cov_xy],
                     [cov_xy.T, cov_yy]])
-    
+
     # Generate samples
     data = np.random.multivariate_normal(mu, cov, n_samples)
     x = torch.tensor(data[:, :dim], dtype=torch.float32)
@@ -55,6 +56,33 @@ def generate_multivariate_gaussian(n_samples, dim, rho):
     # combined = torch.cat([x, y], dim=1)
 
     return x, y, true_mi
+
+
+def generate_nonlinear_2d_data(n_samples, rho=0.6, noise_std=0.1):
+    """
+    Generates data where a 2D Gaussian is passed through a non-linear function.
+
+    1. Starts with a 2D correlated Gaussian variable `x`.
+    2. Creates a second variable `y` by element-wise squaring `x` and adding noise.
+    """
+    # Define the initial 2D Gaussian distribution
+    dim = 2
+    mu = np.zeros(dim)
+    cov = [[1, rho],
+           [rho, 1]]
+
+    # Generate the first variable, x
+    x_data = np.random.multivariate_normal(mu, cov, n_samples)
+    x = torch.tensor(x_data, dtype=torch.float32)
+
+    # Generate the second variable, y = x^2 + noise
+    noise = torch.randn(n_samples, dim) * noise_std
+    y = torch.square(x) + noise
+
+    # True MI is not known analytically, but it should be significantly positive
+    true_mi_label = "Unknown (but > 0)"
+
+    return x, y, true_mi_label
 
 
 def generate_independent_data(n_samples):
@@ -94,12 +122,12 @@ class MINEDataset(Dataset):
         # Convert idx to tensor if it's a list
         if isinstance(idx, list):
             idx = torch.tensor(idx)
-        
+
         # Handle both single items and batches
         if torch.is_tensor(idx):
             x_i = self.x[idx]
             y_i = self.y[idx]
-            
+
             # Generate random indices for shuffled y, same size as input idx
             y_shuffle_idx = torch.randint(0, self.length, (len(idx),))
             y_shuffle = self.y[y_shuffle_idx]
@@ -107,15 +135,15 @@ class MINEDataset(Dataset):
             # Single item case
             x_i = self.x[idx]
             y_i = self.y[idx]
-            
+
             # Generate single random index for shuffled y
             y_shuffle_idx = torch.randint(0, self.length, (1,)).item()
             y_shuffle = self.y[y_shuffle_idx]
         return x_i, y_i, y_shuffle
-    
+
 
 class LogMeanExp(torch.autograd.Function):
-    """Custom function for computing log(mean(exp(x))) with corrected gradients 
+    """Custom function for computing log(mean(exp(x))) with corrected gradients
        that replace the empirical mean with a moving average (ma_et) for the backward pass.
     """
     @staticmethod
@@ -143,50 +171,73 @@ class LogMeanExp(torch.autograd.Function):
 def log_mean_exp_with_moving_avg(x, ma_et):
     return LogMeanExp.apply(x, ma_et)
 
-
-class Net(nn.Module):
+# Use TNetwork for the T function representation
+# Use TNetwork for the T function representation
+from t_networks import TNetwork
+## -------------------------------------------------------------------
+## Define both original and factored T-network implementations
+## -------------------------------------------------------------------
+## Original T-network: full MLP over joint inputs (x,y)
+class OriginalNet(nn.Module):
+    """Original MLP-based T-network: single network on (x,y)."""
     def __init__(self, input_size=2):
-        super(Net, self).__init__()
+        super(OriginalNet, self).__init__()
         self.layer1 = nn.Linear(input_size, 128)
         self.layer2 = nn.Linear(128, 64)
         self.dropout1 = nn.Dropout(0.25)
         self.dropout2 = nn.Dropout(0.5)
         self.fc1 = nn.Linear(64, 64)
         self.fc2 = nn.Linear(64, 1)
-        # Initialize moving average; here we use a Python float.
-        self.ma_et = 1.0  
+        self.ma_et = 1.0
         self.alpha = 0.01
 
     def forward(self, x, y):
-        # Concatenate two inputs into a 2D vector.
-        combined = torch.cat([x,y], dim=1)
+        combined = torch.cat([x, y], dim=1)
         x = F.relu(self.layer1(combined))
         x = F.relu(self.layer2(x))
-
         x = F.relu(self.fc1(x))
-
-        x = self.fc2(x)
-        return x
+        return self.fc2(x)
 
     def mutual_information(self, joint, marginal):
-        # Process joint samples;
-        # joint is a tuple (x_joint, y_joint)
         t_joint = self.forward(joint[0], joint[1])
-        # Process marginal samples;
-        # marginal is a tuple (x_marginal, y_marginal)
         t_marginal = self.forward(marginal[0], marginal[1])
-        
-        # Update the moving average for the marginal term:
+        exp_t = torch.exp(t_marginal)
+        current = torch.mean(exp_t).item()
+        self.ma_et = (1 - self.alpha) * self.ma_et + self.alpha * current
+        ma_tensor = torch.tensor(self.ma_et, device=t_marginal.device, dtype=t_marginal.dtype)
+        return torch.mean(t_joint) - log_mean_exp_with_moving_avg(t_marginal, ma_tensor)
+
+## Factored T-network: log t1(x,z) - log t2(x) - log t3(z)
+class FactoredNet(TNetwork):
+    """Factored T-network: log t1(x,z) - log t2(x) - log t3(z)."""
+    def __init__(self, input_size=2):
+        x_dim = input_size // 2
+        z_dim = input_size - x_dim
+        super(FactoredNet, self).__init__(x_dim, z_dim)
+        self.ma_et = 1.0
+        self.alpha = 0.01
+
+    def mutual_information(self, joint, marginal):
+        t_joint = self.forward(joint[0], joint[1])
+        t_marginal = self.forward(marginal[0], marginal[1])
         exp_t_marginal = torch.exp(t_marginal)
         current_estimate = torch.mean(exp_t_marginal).item()
         self.ma_et = (1 - self.alpha) * self.ma_et + self.alpha * current_estimate
-        
-        # Use our custom autograd function to compute the log-mean-exp with the corrected gradient.
-        # Note that we pass the moving average as a tensor. Consider ensuring it’s on the proper device:
         ma_tensor = torch.tensor(self.ma_et, device=t_marginal.device, dtype=t_marginal.dtype)
-        # The MI estimate uses the joint term (as is) and the negative term with our custom gradient.
         mi = torch.mean(t_joint) - log_mean_exp_with_moving_avg(t_marginal, ma_tensor)
         return mi
+
+# Default alias to the factored implementation
+Net = FactoredNet
+
+def build_net(input_size, model_type='factored'):
+    """Factory for selecting T-network implementation: 'original' or 'factored'."""
+    if model_type == 'original':
+        return OriginalNet(input_size)
+    elif model_type in ('factored', 'new'):
+        return FactoredNet(input_size)
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}")
 
 def train(args, model, device, train_loader, optimizer, epoch):
     model.train()
@@ -194,7 +245,7 @@ def train(args, model, device, train_loader, optimizer, epoch):
         batch_x, batch_y, batch_y_shuffle = batch_x.to(device), batch_y.to(device), batch_y_shuffle.to(device)
         joint = (batch_x, batch_y)
         marginal = (batch_x, batch_y_shuffle)
-        
+
         optimizer.zero_grad()
         # negate to maximize MI
         loss = - model.mutual_information(joint, marginal)
@@ -219,6 +270,8 @@ def main():
     parser.add_argument('--dry-run', action='store_true', default=False)
     parser.add_argument('--seed', type=int, default=1)
     parser.add_argument('--log-interval', type=int, default=10)
+    parser.add_argument('--model-type', choices=['original','factored'], default='factored',
+                        help='Which T-network implementation to use')
     args = parser.parse_args()
 
     # Setup device
@@ -230,10 +283,13 @@ def main():
     torch.manual_seed(args.seed)
     if use_cuda:
         torch.cuda.manual_seed(args.seed)
-
+        torch.cuda.manual_seed_all(args.seed)
+    # Ensure deterministic behavior in cuDNN
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
     # Generate data
-    rho = 0.5
+    rho = 0.35
     n_samples = 10000
     x, y, true_mi = generate_nonlinear_data(n_samples)
     x, y, true_mi = generate_multivariate_gaussian(n_samples, 10, rho)
@@ -255,7 +311,7 @@ def main():
                              generator=torch.Generator().manual_seed(args.seed))
 
     # Initialize model and optimizer
-    model = Net(x.shape[1] + y.shape[1]).to(device)
+    model = build_net(x.shape[1] + y.shape[1], args.model_type).to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=args.gamma)
 
