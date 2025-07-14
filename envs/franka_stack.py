@@ -140,10 +140,9 @@ class CustomFrankaStackEnv(ManagerBasedRLEnv):
         return reward, info
 
     def step(self, action: torch.Tensor):
-        """Override step to use our custom reward calculation."""
-        # Call the parent step method but ignore its reward calculation
+        """Override step to compute events and apply rewards conditionally."""
         obs, rewards, terminated, truncated, info = super().step(action)
+        rewards_calc, info = self.compute_reward(obs, info)
         if self.reward_on:
-            rewards, info = self.compute_reward(obs, info)
-        # Return with your custom rewards
+            rewards = rewards_calc
         return obs, rewards, terminated, truncated, info
