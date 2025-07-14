@@ -1,3 +1,4 @@
+import random
 import torch
 import numpy as np
 import argparse
@@ -17,6 +18,65 @@ def generate_correlated_gaussian(rho, n_samples):
     y = rho_tensor * x + torch.sqrt(1 - rho_tensor**2) * z
     true_mi = -0.5 * np.log(1 - rho**2)
     return x, y, true_mi
+
+
+def generate_multivariate_gaussian(n_samples, dim, rho):
+    """
+    Generates correlated multivariate Gaussian data.
+    X and Y are `dim`-dimensional vectors.
+    """
+    # Create a covariance matrix for the 2*dim vector [X, Y]
+    # Cov(X) = Cov(Y) = I
+    # Cov(X, Y) = rho * I
+    mu = np.zeros(2 * dim)
+    cov_xx = np.eye(dim)
+    cov_yy = np.eye(dim)
+    cov_xy = rho * np.eye(dim)
+    
+    # Build the full covariance matrix
+    cov = np.block([[cov_xx, cov_xy],
+                    [cov_xy.T, cov_yy]])
+    
+    # Generate samples
+    data = np.random.multivariate_normal(mu, cov, n_samples)
+    x = torch.tensor(data[:, :dim], dtype=torch.float32)
+    y = torch.tensor(data[:, dim:], dtype=torch.float32)
+
+    # True MI for multivariate Gaussian
+    # I(X;Y) = -0.5 * log(det(I - rho^2)) = -0.5 * log((1-rho^2)^dim)
+    true_mi = -0.5 * np.log(np.linalg.det(cov_xx @ cov_yy - cov_xy @ cov_xy.T))
+    # A simpler form for this specific covariance structure:
+    true_mi_simple = -0.5 * dim * np.log(1 - rho**2)
+
+
+    # Note: Your network input_size must be changed to 2 * dim
+    # self.layer1 = nn.Linear(2 * dim, 128)
+    # And the concatenation logic needs to handle matrices:
+    # combined = torch.cat([x, y], dim=1)
+
+    return x, y, true_mi
+
+
+def generate_independent_data(n_samples):
+    """Generates two independent standard normal vectors."""
+    x = torch.randn(n_samples)
+    y = torch.randn(n_samples)
+    true_mi = 0.0
+    return x, y, true_mi
+
+
+def generate_nonlinear_data(n_samples):
+    """
+    Generates data with a non-linear (sine wave) relationship.
+    The ground truth MI is not easily known, but should be > 0.
+    """
+    x = torch.rand(n_samples) * 4 * np.pi - 2 * np.pi # X from -2pi to 2pi
+    noise = torch.randn(n_samples) * 0.2
+    y = torch.sin(x) + noise
+    # True MI is unknown, but we expect a positive value.
+    # We can't calculate 'true_mi' here, so we just test for a positive result.
+    return x, y, "Unknown (but > 0)"
+
 
 class MINEDataset(Dataset):
     def __init__(self, x, y):
@@ -49,9 +109,8 @@ class MINEDataset(Dataset):
             y_i = self.y[idx]
             
             # Generate single random index for shuffled y
-            y_shuffle_idx = torch.randint(0, self.length, (1,))
+            y_shuffle_idx = torch.randint(0, self.length, (1,)).item()
             y_shuffle = self.y[y_shuffle_idx]
-            
         return x_i, y_i, y_shuffle
     
 
@@ -100,7 +159,7 @@ class Net(nn.Module):
 
     def forward(self, x, y):
         # Concatenate two inputs into a 2D vector.
-        combined = torch.cat([x.view(-1, 1), y.view(-1, 1)], dim=1)
+        combined = torch.cat([x,y], dim=1)
         x = F.relu(self.layer1(combined))
         x = F.relu(self.layer2(x))
 
@@ -126,7 +185,7 @@ class Net(nn.Module):
         # Note that we pass the moving average as a tensor. Consider ensuring it’s on the proper device:
         ma_tensor = torch.tensor(self.ma_et, device=t_marginal.device, dtype=t_marginal.dtype)
         # The MI estimate uses the joint term (as is) and the negative term with our custom gradient.
-        mi = -torch.mean(t_joint) + log_mean_exp_with_moving_avg(t_marginal, ma_tensor)
+        mi = torch.mean(t_joint) - log_mean_exp_with_moving_avg(t_marginal, ma_tensor)
         return mi
 
 def train(args, model, device, train_loader, optimizer, epoch):
@@ -137,7 +196,8 @@ def train(args, model, device, train_loader, optimizer, epoch):
         marginal = (batch_x, batch_y_shuffle)
         
         optimizer.zero_grad()
-        loss = model.mutual_information(joint, marginal)
+        # negate to maximize MI
+        loss = - model.mutual_information(joint, marginal)
         loss.backward()
         optimizer.step()
 
@@ -164,40 +224,66 @@ def main():
     # Setup device
     use_cuda = not args.no_cuda and torch.cuda.is_available()
     device = torch.device("cuda" if use_cuda else "cpu")
+    # Reproducibility
+    random.seed(args.seed)
+    np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    if use_cuda:
+        torch.cuda.manual_seed(args.seed)
+
 
     # Generate data
     rho = 0.5
     n_samples = 10000
+    x, y, true_mi = generate_nonlinear_data(n_samples)
+    x, y, true_mi = generate_multivariate_gaussian(n_samples, 10, rho)
     x, y, true_mi = generate_correlated_gaussian(rho, n_samples)
-    import pdb;pdb.set_trace()
-    # Create dataset
+
+    # Create dataset and deterministic train/test split
     dataset = MINEDataset(x, y)
     train_size = int(0.8 * len(dataset))
     test_size = len(dataset) - train_size
-    train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
+    split_gen = torch.Generator()
+    split_gen.manual_seed(args.seed)
+    train_dataset, test_dataset = random_split(dataset, [train_size, test_size], generator=split_gen)
 
-    # Create data loaders
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=args.test_batch_size, shuffle=True)
+    # Create data loaders with fixed shuffle seed
+    loader_gen = torch.Generator()
+    loader_gen.manual_seed(args.seed)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, generator=loader_gen)
+    test_loader = DataLoader(test_dataset, batch_size=args.test_batch_size, shuffle=True,
+                             generator=torch.Generator().manual_seed(args.seed))
 
     # Initialize model and optimizer
-    model = Net().to(device)
+    model = Net(x.shape[1] + y.shape[1]).to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=args.gamma)
 
-    print(f"True MI: {true_mi:.4f}")
+    print(f"True MI: {true_mi}")
 
     # Training loop
     for epoch in range(1, args.epochs + 1):
         train(args, model, device, train_loader, optimizer, epoch)
-        if epoch % 10 == 0:
-            batch_x, batch_y, batch_y_shuffle = test_dataset[:]
-            joint = (batch_x, batch_y)
-            marginal = (batch_x, batch_y_shuffle)
-            loss = model.mutual_information(torch.stack(joint, dim=1).to(device), torch.stack(marginal, dim=1).to(device))
-            print('test loss ' + str(loss))
+        if epoch % 10 == 0 or epoch == args.epochs:
+            test_estimates = []
+            model.eval()
+            with torch.no_grad():
+                # Get all data from the test dataset
+                batch_x, batch_y, batch_y_shuffle = test_dataset[:]
+                batch_x, batch_y, batch_y_shuffle = batch_x.to(device), batch_y.to(device), batch_y_shuffle.to(device)
+
+                joint_test = (batch_x, batch_y)
+                marginal_test = (batch_x, batch_y_shuffle)
+
+                # The function returns the loss (negative MI), so we negate it.
+                mi_estimate = model.mutual_information(joint_test, marginal_test).item()
+                test_estimates.append(mi_estimate)
+            avg_test_mi = sum(test_estimates) / len(test_estimates)
+            print(f'\nTest MI Estimate: {avg_test_mi:.4f}\n')
+            model.train()
+
         scheduler.step()
+        print(f"True MI: {true_mi}")
 
 if __name__ == '__main__':
     main()
