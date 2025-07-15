@@ -89,7 +89,7 @@ class OnPolicyTrainer:
             done = torch.zeros(self.env.num_envs, dtype=bool)
             self.agent.episode_start()
             step = 0
-
+            info = None
             while not done.all():
                 action = self.agent.get_action(obs, done)
                 if action.ndim == 1:
@@ -104,7 +104,11 @@ class OnPolicyTrainer:
                 if changed:
                     break
                 obs = next_obs
-
+            if info is not None:
+                if "grasp_success_rate" in info:
+                    self.agent.logger.log_scalar("grasp_success_rate", info["grasp_success_rate"])
+                if "stack_success_rate" in info:
+                    self.agent.logger.log_scalar("stack_success_rate", info["stack_success_rate"])
             self.agent.logger.increment_episode()
 
             # Save checkpoint periodically
