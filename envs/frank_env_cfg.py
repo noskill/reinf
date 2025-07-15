@@ -1,4 +1,7 @@
 from isaaclab_tasks.manager_based.manipulation.stack.config.franka.stack_joint_pos_env_cfg import FrankaCubeStackEnvCfg, EventCfg
+from isaaclab_tasks.manager_based.manipulation.stack.mdp import franka_stack_events
+from envs.utils import set_object_poses, SceneEntityPoseCfg as SceneEntityCfg
+from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.utils import configclass
 
 
@@ -15,13 +18,34 @@ class DeterministicEventCfg(EventCfg):
     )
 
     reset_cube_positions  = EventTerm(
-        func=franka_stack_events.set_object_poses,
+        func=set_object_poses,
         mode="reset",
         params={
             "asset_cfgs": [
-               SceneEntityCfg("cube_1", pos=[0.4,0,0.0203]),
-               SceneEntityCfg("cube_2", pos=[0.55,0.05,0.0203]),
-               SceneEntityCfg("cube_3", pos=[0.60,-0.1,0.0203]),
+               SceneEntityCfg(
+                   "cube_1",
+                   joint_ids=[],
+                   body_ids=[],
+                   fixed_tendon_ids=[],
+                   object_collection_ids=[],
+                   pos=[0.4, 0.0, 0.0203],
+               ),
+               SceneEntityCfg(
+                   "cube_2",
+                   joint_ids=[],
+                   body_ids=[],
+                   fixed_tendon_ids=[],
+                   object_collection_ids=[],
+                   pos=[0.55, 0.05, 0.0203],
+               ),
+               SceneEntityCfg(
+                   "cube_3",
+                   joint_ids=[],
+                   body_ids=[],
+                   fixed_tendon_ids=[],
+                   object_collection_ids=[],
+                   pos=[0.60, -0.1, 0.0203],
+               ),
             ]
         }
     )
