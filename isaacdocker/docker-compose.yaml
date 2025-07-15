@@ -1,0 +1,59 @@
+version: '3.8'
+
+services:
+  isaaclab:
+    image: isaaclab:latest
+    container_name: isaaclab
+    # Use interactive mode to keep the container running
+    stdin_open: true
+    tty: true
+    # Run as the host user to avoid permission issues with mounted volumes
+    # Uncomment if needed: user: "${UID}:${GID}"
+    environment:
+      # Display for X11 forwarding
+      - DISPLAY=${DISPLAY}
+      # Set Nucleus asset root directory
+      - NUCLEUS_ASSET_ROOT_DIR_LOCAL=/mnt/fileserver/shared/IsaacLabAssets
+      # Add any other environment variables you need
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - ACCEPT_EULA=Y
+    volumes:
+      # X11 socket for GUI
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      # X11 authority for authentication
+      - ${HOME}/.Xauthority:/root/.Xauthority
+      # Isaac Lab assets
+      - /mnt/fileserver/shared/IsaacLabAssets:/mnt/fileserver/shared/IsaacLabAssets
+      # Your custom Isaac Lab directory
+      - /home/imgen/projects/IsaacLab/my/:/home/imgen/isaac-lab/my/
+      - /home/imgen/projects/IsaacLab/exts/:/home/imgen/isaac-lab/exts/
+      - /home/imgen/projects/IsaacLab/exts/:/isaac-lab/exts/
+      - /home/imgen/.cache/:/home/imgen/.cache/
+      # Optional: Mount the entire Isaac Lab directory if needed
+      # - /home/imgen/projects/IsaacLab:/isaac-lab
+      # Optional: Cache directories to persist between runs
+      - isaaclab_pip_cache:/root/.cache/pip
+      - isaaclab_nvidia_cache:/root/.cache/nvidia
+      - isaaclab_ov_cache:/root/.cache/ov
+    network_mode: host
+    # Use NVIDIA runtime for GPU access
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Working directory inside the container
+    working_dir: /isaac-lab
+    # Command to run when starting the container
+    # command: ./isaaclab.sh -p ./my/your_script.py
+    # Or use this to get an interactive shell
+    command: bash
+      #entrypoint: [] 
+
+volumes:
+  isaaclab_pip_cache:
+  isaaclab_nvidia_cache:
+  isaaclab_ov_cache:
