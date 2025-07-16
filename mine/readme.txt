@@ -4,7 +4,8 @@
 This project explores multi-agent reinforcement learning (RL) systems where agents communicate to optimize their empowerment, 
 defined as the mutual information (MI) between an agent’s actions (or messages) and the subsequent state of the environment, 
 given the current state. Specifically, we use MI-based intrinsic rewards—( MI(S', A | s) ) for agents with environmental actions
-and ( MI(S', M | s) ) for agents with communication-only actions. 
+and ( MI(S', M | s) ) for agents with communication-only actions.
+
 The goal is to investigate how emergent communication protocols arise among agents to maximize their collective or 
 individual control over the environment, potentially augmented by sparse extrinsic rewards from the
 environment to guide task-specific behavior.
@@ -18,8 +19,12 @@ Empowerment as Intrinsic Motivation: Each agent aims to maximize its empowerment
 
 Communication: 
 
-Agents exchange discrete messages (e.g., directional signals or "null" for silence) to share information or coordinate actions. Communication is resource-constrained, with an energy cost to encourage efficiency and prevent redundant signaling.
-Optional Extrinsic Rewards: To align empowerment with task-specific goals, experiments may incorporate small extrinsic rewards (e.g., for achieving a cooperative objective like reaching a goal or capturing a target), allowing us to compare purely intrinsic vs. hybrid reward strategies.
+Agents exchange messages (e.g., directional signals or "null" for silence) to share information or coordinate actions. 
+Communication is resource-constrained, with an energy cost to prevent redundant signaling.
+
+
+Optional Extrinsic Rewards: 
+To align empowerment with task-specific goals, experiments may incorporate small extrinsic rewards (e.g., for achieving a cooperative objective like reaching a goal or capturing a target), allowing us to compare purely intrinsic vs. hybrid reward strategies.
 
 Resource Constraints: Actions and messages cost energy, with success rates tied to an agent’s energy level. This mimics real-world limitations and encourages strategic decision-making, reducing fixation on trivial or repetitive behaviors.
 
