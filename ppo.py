@@ -66,7 +66,8 @@ class PPOBase(VPGBase):
             states_batch, log_probs_batch, normalized_returns, actions_batch, entropy_batch
         )
 
-        batch_size = len(states_batch) // num_minibatches
+        # Ensure non-zero batch size (can happen for very small datasets).
+        batch_size = max(1, len(states_batch) // num_minibatches)
         data_loader = torch.utils.data.DataLoader(
             dataset, batch_size=batch_size, shuffle=True
         )
@@ -91,6 +92,16 @@ class PPOBase(VPGBase):
 
             self.logger.log_scalar("Raw advantage mean:", advantages.mean().item())
             self.logger.log_scalar("Raw advantage std:", advantage_std.item())
+
+            # Log action statistics (mean & std) for the current minibatch
+            self.logger.log_scalar(
+                "actions mean",
+                actions_minibatch.to(torch.float32).mean().item(),
+            )
+            self.logger.log_scalar(
+                "actions std",
+                actions_minibatch.to(torch.float32).std().item(),
+            )
             advantages = (advantages - advantage_mean) / advantage_std
             # Ensure proper entropy shape
             if len(entropy_minibatch.shape) == 2 and entropy_minibatch.shape[1] == 1:
@@ -130,7 +141,29 @@ class PPOBase(VPGBase):
         # with torch.no_grad():
         #     _, _, dist_old = self.sampler(self.policy_old, states_batch)
 
-        log_probs_new = dist.log_prob(actions_batch).mean(-1, keepdim=True)
+        # ------------------------------------------------------------------
+        # Correct computation of joint log-probability
+        # ------------------------------------------------------------------
+        #  1. Categorical (discrete) distributions already return a scalar.
+        #  2. Distributions wrapped in `torch.distributions.Independent` (or
+        #     any other multivariate distribution) likewise return a scalar.
+        #  3. Product of independent 1-D Normals (or when a Transform is
+        #     applied) returns a vector of per-dimension log-probs; we **sum**
+        #     these to obtain the joint log-probability.
+        if isinstance(dist, torch.distributions.Categorical):
+            act = actions_batch.squeeze(-1) if actions_batch.dim() == 2 else actions_batch
+            logp = dist.log_prob(act)
+        else:
+            logp = dist.log_prob(actions_batch)
+
+        # If logp already has shape (B,) we keep it; otherwise sum.
+        if logp.dim() == 1:
+            log_probs_new = logp.unsqueeze(-1)
+        else:
+            import warnings
+            warnings.warn(
+                "PPO: summing per-dimension log-probs to obtain joint log-probability.")
+            log_probs_new = logp.sum(-1, keepdim=True)
         log_probs_old = log_probs.detach()
         # log_probs_old = dist_old.log_prob(actions_batch)
 
@@ -252,7 +285,7 @@ class PPOMI(PPO):
         for i in range(4):
             # Create minibatches
             dataset = torch.utils.data.TensorDataset(states_batch, log_probs_batch, normalized_returns, actions_batch, entropy_batch)
-            batch_size = len(states_batch) // num_minibatches
+            batch_size = max(1, len(states_batch) // num_minibatches)
             data_loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
             for states_minibatch, log_probs_minibatch, returns_minibatch, actions_minibatch, entropy_minibatch in data_loader:
                 if len(states_minibatch) < batch_size // 2 or len(states_minibatch) < 2:
