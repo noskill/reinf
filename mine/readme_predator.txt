@@ -61,7 +61,15 @@ Energy replenishes slowly (e.g., 0.01 per step) or fully on prey capture.
 Optional Shared Reward: 
 A small extrinsic reward for prey capture (e.g., +1 for all predators) could align their goals, but pure empowerment can test if communication emerges intrinsically.
 
-Framework: 
-    Use PettingZoo’s Multi-Agent Particle Environment (MPE), specifically Simple Tag, modified for three predators with partial observability.Install: pip install pettingzoo[mpe].
-    Base code is Python-based, lightweight, and supports communication.
+Framework:
+    Use the MPE2 package, specifically Simple Tag v3, modified for three predators with partial observability.
+    Install: pip install mpe2
+
+Example:
+```python
+from mpe2.simple_tag_v3 import env
+# Create a tag environment with 3 predators (adversaries) and 1 prey by default
+environment = env()
+```  
+Base code is Python-based, lightweight, and supports communication.
 

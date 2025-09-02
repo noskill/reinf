@@ -77,7 +77,11 @@ class ReinforceBase(Agent):
             entropy = dist.base_dist.entropy()
         else:
             entropy = dist.entropy()
-        entropy = entropy.mean(dim=-1, keepdims=True)
+
+        # Ensure entropy is a column vector (B,1) for consistent downstream
+        # handling, **without** accidentally reducing across the batch.
+        if entropy.dim() == 1:
+            entropy = entropy.unsqueeze(-1)
         active_mask = ~done
         full_actions = torch.zeros(
             (active_mask.shape[0], actions.shape[1] if len(actions.shape) > 1 else 1)
