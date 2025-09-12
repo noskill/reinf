@@ -52,9 +52,20 @@ class NormalActionSampler(ActionSampler):
 
         # Base Normal distribution (diagonal covariance)
         base_dist = Normal(mu, sigma)
-        transformed_dist = base_dist
+
+        # Construct the distribution such that `log_prob` already aggregates over
+        # the *event* dimensions, yielding exactly **one** scalar per action
+        # vector in the batch.
+
+        # Prepare an `Independent` wrapper up-front so we can refer to it
+        # regardless of the branch taken below.
+        independent_dist = Independent(base_dist, 1)
+
         if self.transform:
-            # Transform sequence
+            # 1. First re-interpret the Normal as an `Independent` distribution so
+            #    the event dim (=`action_dim`) gets treated jointly.
+            # 2. Apply non-linear squashing (tanh) followed by affine scaling to
+            #    match the environment action bounds.
             transforms = [
                 TanhTransform(cache_size=1),
                 AffineTransform(
@@ -62,8 +73,9 @@ class NormalActionSampler(ActionSampler):
                     scale=(self.a_max - self.a_min) / 2.0,
                 ),
             ]
-
-            transformed_dist = TransformedDistribution(base_dist, transforms)
+            transformed_dist = TransformedDistribution(independent_dist, transforms)
+        else:
+            transformed_dist = independent_dist
 
         # Sample action (with reparameterization if requested)
         if self.reparameterize:
@@ -74,8 +86,28 @@ class NormalActionSampler(ActionSampler):
         # Clamp action to valid boundaries
         action = torch.clamp(action, self.a_min + 1e-4, self.a_max - 1e-4)
 
-        # Log probability of selected action
-        log_prob = transformed_dist.log_prob(action).mean(-1, keepdim=True)
+        # Log probability of selected action. `TransformedDistribution.log_prob` already
+        # aggregates across the event dimensions, so additional averaging is unnecessary
+        # and incorrectly shrinks the tensor. We keep the original shape returned by
+        # `log_prob` to maintain consistency with the action/entropy tensors.
+        log_prob = transformed_dist.log_prob(action)
+
+        # ------------------------------------------------------------------
+        # Shape safety checks
+        # ------------------------------------------------------------------
+        # Expect *exactly* one log-prob scalar per sample (B,) or (B,1)
+        assert log_prob.dim() == 1 or (log_prob.dim() == 2 and log_prob.shape[1] == 1), \
+            f"log_prob has invalid shape {log_prob.shape}; expected (B,) or (B,1)."
+
+        # Likewise, each entropy call on `transformed_dist` must obey this rule
+        # Compute entropy if available; fall back to base distribution otherwise
+        try:
+            entropy = transformed_dist.entropy()
+        except NotImplementedError:
+            entropy = transformed_dist.base_dist.entropy()
+
+        assert entropy.dim() == 1 or (entropy.dim() == 2 and entropy.shape[1] == 1), \
+            f"entropy has invalid shape {entropy.shape}; expected (B,) or (B,1)."
 
         return action, log_prob, transformed_dist
 

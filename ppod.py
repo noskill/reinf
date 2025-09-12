@@ -637,8 +637,12 @@ class PPODRunning(PPOD):
         # Sync networks before training
         self.policy.load_state_dict(self.policy_old.state_dict())
 
-        if entropy.dim() == 2:
-            entropy = entropy.mean(dim=1)
+        # `entropy` already has the correct shape (same as the sampled action).
+        # Do **not** average across action dimensions. Instead, verify the shape
+        # is either `(B,)` or `(B, 1)` – i.e. exactly **one** scalar per sampled
+        # action vector.
+        assert entropy.dim() == 1 or (entropy.dim() == 2 and entropy.shape[1] == 1), \
+            f"Entropy shape {entropy.shape} is invalid; expected (B,) or (B,1)."
         # Train policy
         for _ in range(self.num_learning_epochs):
             self._learn_epoch(states_batch, log_probs, new_returns,

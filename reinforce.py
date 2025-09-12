@@ -73,10 +73,26 @@ class ReinforceBase(Agent):
         policy = self.get_policy_for_action()
         active_states = self.process_states(state, done)
         actions, log_probs, dist = self.sampler(policy, active_states)
-        if isinstance(dist, TransformedDistribution):
-            entropy = dist.base_dist.entropy()
-        else:
+
+        # ------------------------------------------------------------------
+        # Obtain entropy safely. Some `TransformedDistribution` instances do
+        # not implement an analytic entropy; fall back to the base
+        # distribution in that case.
+        # ------------------------------------------------------------------
+        try:
             entropy = dist.entropy()
+        except NotImplementedError:
+            if hasattr(dist, 'base_dist'):
+                entropy = dist.base_dist.entropy()
+            else:
+                raise
+
+        # Validate that each action produces *exactly* one log-prob and one
+        # entropy scalar.
+        assert log_probs.dim() == 1 or (log_probs.dim() == 2 and log_probs.shape[1] == 1), \
+            f"log_probs shape {log_probs.shape} invalid; expected (B,) or (B,1)."
+        assert entropy.dim() == 1 or (entropy.dim() == 2 and entropy.shape[1] == 1), \
+            f"entropy shape {entropy.shape} invalid; expected (B,) or (B,1)."
 
         # Ensure entropy is a column vector (B,1) for consistent downstream
         # handling, **without** accidentally reducing across the batch.
