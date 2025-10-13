@@ -1,8 +1,28 @@
-from isaaclab_tasks.manager_based.manipulation.stack.config.franka.stack_joint_pos_env_cfg import FrankaCubeStackEnvCfg, EventCfg
+from isaaclab_tasks.manager_based.manipulation.stack.config.franka.stack_joint_pos_env_cfg import (
+    FrankaCubeStackEnvCfg,
+    EventCfg,
+)
+from isaaclab_tasks.manager_based.manipulation.stack.stack_env_cfg import ObservationsCfg
 from isaaclab_tasks.manager_based.manipulation.stack.mdp import franka_stack_events
-from envs.utils import set_object_poses, SceneEntityPoseCfg as SceneEntityCfg
-from isaaclab.managers import EventTermCfg as EventTerm
+from .utils import set_object_poses, SceneEntityPoseCfg as SceneEntityCfg
+from isaaclab.managers import EventTermCfg as EventTerm, ObservationTermCfg as ObsTerm
 from isaaclab.utils import configclass
+
+from .observations import cube_positions_centered, cube_velocities_from_history
+
+
+@configclass
+class CubeVelocityPolicyObsCfg(ObservationsCfg.PolicyCfg):
+    cubes_positions_centered: ObsTerm = ObsTerm(func=cube_positions_centered)
+    cube_velocities: ObsTerm = ObsTerm(func=cube_velocities_from_history)
+
+    def __post_init__(self):
+        super().__post_init__()
+
+
+@configclass
+class CubeVelocityObservationsCfg(ObservationsCfg):
+    policy: CubeVelocityPolicyObsCfg = CubeVelocityPolicyObsCfg()
 
 
 # deterministic EventCfg: no randomization on reset
@@ -54,11 +74,22 @@ class DeterministicEventCfg(EventCfg):
 
 # subclass the original env cfg and swap in our deterministic events
 @configclass
-class DeterministicFrankaCubeStackEnvCfg(FrankaCubeStackEnvCfg):
+class FrankaCubeStackWithVelocityEnvCfg(FrankaCubeStackEnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations = CubeVelocityObservationsCfg()
+
+
+@configclass
+class DeterministicFrankaCubeStackEnvCfg(FrankaCubeStackWithVelocityEnvCfg):
     def __post_init__(self):
         # run all of the original setup
         super().__post_init__()
         # replace the events with our deterministic ones
         self.events = DeterministicEventCfg()
 
-
+        # Ensure that contact sensors are activated on all rigid bodies of the
+        # Franka robot so that ContactSensor instances on finger links work
+        # without additional manual API application.
+        if hasattr(self.scene, "robot") and hasattr(self.scene.robot, "spawn"):
+            self.scene.robot.spawn.activate_contact_sensors = True
