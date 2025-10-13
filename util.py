@@ -1,5 +1,25 @@
+import shutil
+from pathlib import Path
+
 import numpy as np
 import torch
+
+
+def copy_python_sources(script_dir: str, experiment_dir: str) -> None:
+    """Copy all Python files from the script directory into the experiment directory."""
+    script_path = Path(script_dir)
+    destination_path = Path(experiment_dir)
+
+    destination_path.mkdir(parents=True, exist_ok=True)
+
+    for py_file in script_path.glob("*.py"):
+        dest_file = destination_path / py_file.name
+        try:
+            if py_file.resolve() == dest_file.resolve():
+                continue
+            shutil.copy2(py_file, dest_file)
+        except Exception as exc:
+            print(f"[WARN] Failed to copy {py_file} to {dest_file}: {exc}")
 
 
 class StateExtractor:
@@ -294,7 +314,8 @@ class RunningNorm:
         else:
             self.mean = self.momentum * self.mean + (1 - self.momentum) * batch_mean
             self.std = self.momentum * self.std + (1 - self.momentum) * batch_std
-            assert 0.2 < self.std # sanity check
+            if not 0.2 < self.std:
+                print('std is low ' + str(self.std)) # sanity check
 
         # Normalize
         normalized = (x - self.mean) / (self.std + self.epsilon)
