@@ -4,15 +4,18 @@ import gymnasium as gym
 
 
 class VectorEnvWrapper:
-    def __init__(self, env):
+    def __init__(self, env, return_dict_observations=False):
         self.env = env
         self.device = getattr(env.unwrapped, "device", "cpu")
+        self.return_dict_observations = return_dict_observations
 
     # Forward the observation_space property.
     @property
     def observation_space(self) -> gym.spaces.Space:
-        observation_space = self.unwrapped.single_observation_space["policy"]
-        return observation_space
+        policy_space = self.unwrapped.single_observation_space["policy"]
+        if self.return_dict_observations:
+            return policy_space
+        return gym.spaces.flatten_space(policy_space)
 
     # Forward the action_space property.
     # bound for 100 like stable-baselines3
@@ -29,6 +32,8 @@ class VectorEnvWrapper:
 
     def extract_obs(self, obs_dict):
         obs = obs_dict["policy"]
+        if self.return_dict_observations:
+            return obs
         if hasattr(obs, 'keys'):
             keys = sorted(obs.keys())
             return torch.cat([obs[key] for key in keys], dim=1)
