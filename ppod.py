@@ -8,109 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from ppo import PPOBase
 from pool import EpisodesPoolMixin
-
-
-class SkillDiscriminator(nn.Module):
-    """
-    Discriminator network that maps states to skill vectors.
-
-    In DIAYN with continuous skills, this network tries to predict the continuous
-    skill vector z that generated a particular state s.
-    """
-    def __init__(self, state_dim, skill_dim, hidden_dims=[256, 256], continuous=True):
-        """
-        Args:
-            state_dim (int): Dimension of the state space
-            skill_dim (int): Dimension of the skill space
-            hidden_dims (list): Dimensions of hidden layers
-            continuous (bool): Whether skills are continuous or discrete
-        """
-        super(SkillDiscriminator, self).__init__()
-
-        self.continuous = continuous
-        self.skill_dim = skill_dim
-
-        # Build the network
-        layers = []
-        prev_dim = state_dim
-
-        # Hidden layers
-        for dim in hidden_dims:
-            layers.append(nn.Linear(prev_dim, dim))
-            layers.append(nn.ReLU())
-            prev_dim = dim
-
-        # Network backbone
-        self.network = nn.Sequential(*layers)
-
-        # Output layer depends on whether skills are continuous or discrete
-        if continuous:
-            # For continuous skills: predict the skill vector directly
-            self.output_layer = nn.Linear(prev_dim, skill_dim)
-        else:
-            # For discrete skills: output logits for each skill category
-            self.output_layer = nn.Linear(prev_dim, skill_dim)
-
-    def forward(self, state, softmax=True):
-        """
-        Forward pass through the discriminator.
-
-        Args:
-            state (torch.Tensor): State observation [batch_size x state_dim]
-
-        Returns:
-            torch.Tensor: Predicted skill vectors or logits
-        """
-        features = self.network(state)
-        output = self.output_layer(features)
-        if not self.continuous and softmax:
-            output = output.softmax(dim=1)
-        return output
-
-    def compute_mi_loss(self, states, skills):
-        """
-        Compute the loss for maximizing mutual information.
-
-        For continuous skills, we use MSE loss to predict the exact skill vector.
-        For discrete skills, we use cross-entropy loss.
-
-        Args:
-            states (torch.Tensor): Batch of states [batch_size x state_dim]
-            skills (torch.Tensor): Batch of skills
-                - For continuous: [batch_size x skill_dim]
-                - For discrete: [batch_size] (indices)
-
-        Returns:
-            torch.Tensor: Loss (to be minimized)
-        """
-        predictions = self.forward(states, softmax=False)
-        if self.continuous:
-            # For continuous skills: use MSE loss
-            loss = F.mse_loss(predictions, skills)
-        else:
-            # For discrete skills: use cross-entropy loss
-            loss = F.cross_entropy(predictions, skills)
-
-        return loss
-
-    def predict_skill(self, state):
-        """
-        Predict the skill that generated this state.
-
-        Args:
-            state (torch.Tensor): State observation
-
-        Returns:
-            torch.Tensor: Predicted skill vector or index
-        """
-        with torch.no_grad():
-            output = self.forward(state)
-
-            if not self.continuous:
-                # For discrete skills: return the most likely skill index
-                output = torch.argmax(output, dim=-1)
-
-        return output
+from networks import SkillDiscriminator
 
 
 class PPODPool(EpisodesPoolMixin):
@@ -201,6 +99,10 @@ class SkillAugmentedPolicy(nn.Module):
         """Return the action shape from the underlying policy"""
         return self.policy.action_shape
 
+    @property
+    def first_layer(self):
+        return getattr(self.policy, "first_layer", None)
+
 
 class PPOD(PPOBase, PPODPool):
     """Unified DIAYN PPO supporting both Continuous and Categorical skills."""
@@ -235,6 +137,7 @@ class PPOD(PPOBase, PPODPool):
 
         self.data_types = ['states', 'actions', 'log_probs', 'entropy', 'skill', 'rewards']
         self.p_drop = kwargs.get('p_drop', 0)
+        print('feature dropout ', str(self.p_drop))
 
     def prepare_discriminator_batches(self, states_list, skills_list):
         """
@@ -249,24 +152,26 @@ class PPOD(PPOBase, PPODPool):
         """
         filtered_states = []
         filtered_skills = []
+        episode_lengths = []
 
         for episode_states, episode_skills in zip(states_list, skills_list):
-            filtered_states.append(episode_states[self.desc_discard_steps:])
+            episode_slice = episode_states[self.desc_discard_steps:]
+            if episode_slice.shape[0] == 0:
+                continue
+            filtered_states.append(episode_slice)
+            episode_lengths.append(episode_slice.shape[0])
 
             # Handle both continuous and discrete skills
-            if self.continious or episode_skills.dim() > 1:
-                # For continuous skills or already expanded discrete skills
-                filtered_skills.append(episode_skills[self.desc_discard_steps:])
-            else:
-                # For discrete skills that are constant for the episode
-                # Repeat the skill for each state after warmup
-                filtered_skills.append(episode_skills.repeat(len(episode_states) - self.desc_discard_steps))
+            skill_slice = episode_skills[self.desc_discard_steps:]
+            if skill_slice.dim() == 0:
+                skill_slice = skill_slice.repeat(episode_slice.shape[0])
+            filtered_skills.append(skill_slice)
 
         # Concatenate all filtered episodes
         filtered_states_batch = torch.cat(filtered_states, dim=0).to(self.device)
         filtered_skills_batch = torch.cat(filtered_skills, dim=0).to(self.device)
 
-        return filtered_states_batch, filtered_skills_batch
+        return filtered_states_batch, filtered_skills_batch, episode_lengths
 
     def create_optimizers(self):
         super().create_optimizers()
@@ -277,7 +182,7 @@ class PPOD(PPOBase, PPODPool):
         self.optimizer_discriminator = optim.Adam(
             self.discriminator.parameters(),
             lr=self.discriminator_lr,
-            weight_decay=0.001
+            weight_decay=0.0002
         )
 
     def episode_start(self):
@@ -407,6 +312,56 @@ class PPOD(PPOBase, PPODPool):
 
         return filtered_dict
 
+    def _log_descriptor_stats(self, states, episode_lengths=None):
+        if self.logger is None or states.numel() == 0:
+            return
+
+        with torch.no_grad():
+            try:
+                desc_input = self.get_descriminator_input(states, p_drop=0)
+            except Exception:
+                desc_input = None
+
+            if desc_input is not None and desc_input.numel() > 0:
+                norms = desc_input.norm(dim=1)
+                self.logger.log_scalar("descriptor_norm_mean", norms.mean().item())
+                if norms.shape[0] > 1:
+                    self.logger.log_scalar("descriptor_norm_std", norms.std(unbiased=False).item())
+                feature_var = desc_input.var(dim=0, unbiased=False).mean().item()
+                self.logger.log_scalar("descriptor_feature_var_mean", feature_var)
+
+            key_slices = getattr(self.state_extractor, "key_slices", {})
+            for field in ("cube_positions", "cubes_positions_centered", "cube_velocities"):
+                if field not in key_slices:
+                    continue
+                try:
+                    values = self.state_extractor.extract(states, field)
+                except Exception:
+                    continue
+                if values.numel() == 0:
+                    continue
+                if values.shape[0] > 1:
+                    self.logger.log_scalar(f"{field}_std", values.std(unbiased=False).item())
+                if values.shape[1] % 3 == 0:
+                    z_values = values[:, 2::3]
+                    self.logger.log_scalar(f"{field}_z_mean", z_values.mean().item())
+                    if z_values.shape[0] > 1:
+                        self.logger.log_scalar(f"{field}_z_std", z_values.std(unbiased=False).item())
+
+            if episode_lengths:
+                lengths = [l for l in episode_lengths if l > 0]
+                if lengths:
+                    cumulative = torch.tensor(lengths, device=states.device).cumsum(dim=0) - 1
+                    cumulative = cumulative.clamp(max=states.shape[0] - 1)
+                    final_states = states[cumulative]
+                    if "cube_positions" in key_slices:
+                        final_pos = self.state_extractor.extract(final_states, "cube_positions")
+                        if final_pos.numel() > 0 and final_pos.shape[1] % 3 == 0:
+                            final_z = final_pos[:, 2::3]
+                            self.logger.log_scalar("final_cube_z_mean", final_z.mean().item())
+                            if final_z.shape[0] > 1:
+                                self.logger.log_scalar("final_cube_z_std", final_z.std(unbiased=False).item())
+
     def learn_from_episodes(self, episodes, num_minibatches=4):
         data_dict = self._extract_episode_data(episodes)
 
@@ -429,7 +384,9 @@ class PPOD(PPOBase, PPODPool):
             states, log_probs, rewards, actions, entropy)
         skills_batch = torch.cat(skills, dim=0).to(self.device)
         # Prepare filtered batches for discriminator (skipping warmup steps)
-        desc_states_batch, desc_skills_batch = self.prepare_discriminator_batches(states, skills)
+        desc_states_batch, desc_skills_batch, desc_episode_lengths = self.prepare_discriminator_batches(states, skills)
+        if states_batch.numel() > 0:
+            self._log_descriptor_stats(states_batch, episode_lengths=[len(s) for s in states])
 
         # Evaluate discriminator performance
         performance = self.evaluate_discriminator(self.discriminator, desc_states_batch, desc_skills_batch)
@@ -462,7 +419,7 @@ class PPOD(PPOBase, PPODPool):
                               actions, entropy, num_minibatches, skills_batch)
 
         # Train discriminator
-        self.train_discriminator(desc_states_batch, desc_skills_batch)
+        self.train_discriminator(desc_states_batch, desc_skills_batch, episode_lengths=desc_episode_lengths)
 
         # Sync networks after training
         self.policy_old.load_state_dict(self.policy.state_dict())
@@ -498,33 +455,90 @@ class PPOD(PPOBase, PPODPool):
         else:
             result = self.state_extractor.extract(states, self.desc_fields)
         if p_drop > 0:
-            size = self.state_extractor.get_fields_size(self.desc_fields[-1])
-            res = result.clone()
-            res[:, -size:] *= float(random.random() < p_drop)
-            result = res
+            p_drop = float(p_drop)
+            if p_drop >= 1.0:
+                result = torch.zeros_like(result)
+            else:
+                mask = (torch.rand_like(result) >= p_drop).to(result.dtype)
+                result = result * mask
+        # raw features are not normalised
+        # there were some instabilities in training with normalisation
         return result
 
-    def train_discriminator(self, states, skills):
+    def train_discriminator(self, states, skills, episode_lengths):
         """Train the discriminator to predict skills from states
 
         states batch_size x M
         skills batch_size x N or batch_size
         """
-        train_epochs = 2
+        train_epochs = 4
         mini_batch_size = 128
         desc_input = self.get_descriminator_input(states, p_drop=self.p_drop)
+
+        num_episodes = len(episode_lengths)
+        num_samples = len(desc_input)
+        if num_samples == 0:
+            return
+        holdout_size = int(max(1, round(num_episodes * 0.05))) if num_episodes > 2 else 0
+
+        if holdout_size >= num_episodes:
+            holdout_size = max(1, num_episodes - 1)
+
+        assert holdout_size < num_episodes
+        sum_holdout = sum(episode_lengths[:holdout_size])
+        train_inputs = desc_input[sum_holdout:]
+        train_skills = skills[sum_holdout:]
+
+        holdout_inputs = desc_input[:sum_holdout]
+        holdout_skills = skills[:sum_holdout]
+
+
+        total_loss = 0.0
+        loss_steps = 0
+        first_layer_grad_sum = 0.0
+        first_layer_grad_steps = 0
+
         for epoch in range(train_epochs):
-            indices = torch.randperm(len(desc_input))
-            for start in range(0, len(desc_input), mini_batch_size):
+            if len(train_inputs) == 0:
+                break
+            indices = torch.randperm(len(train_inputs))
+            for start in range(0, len(train_inputs), mini_batch_size):
                 self.optimizer_discriminator.zero_grad()
-                end = min(start + mini_batch_size, len(desc_input))
+                end = min(start + mini_batch_size, len(train_inputs))
                 batch_idx = indices[start:end]
-                loss = self.discriminator.compute_mi_loss(desc_input[batch_idx], skills[batch_idx])
+                loss = self.discriminator.compute_mi_loss(train_inputs[batch_idx], train_skills[batch_idx])
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), 1)
+
+                first_layer = getattr(self.discriminator, "first_layer", None)
+                if first_layer is not None and hasattr(first_layer, "weight") and first_layer.weight.grad is not None:
+                    first_layer_grad_sum += first_layer.weight.grad.norm().item()
+                    first_layer_grad_steps += 1
+
                 self.optimizer_discriminator.step()
 
-        self.logger.log_scalar("discriminator_loss", loss.item())
+                total_loss += loss.item()
+                loss_steps += 1
+
+        if loss_steps > 0:
+            self.logger.log_scalar("discriminator_loss", total_loss / loss_steps)
+        if first_layer_grad_steps > 0:
+            self.logger.log_scalar(
+                "discriminator_first_layer_grad_norm",
+                first_layer_grad_sum / first_layer_grad_steps
+            )
+
+        with torch.no_grad():
+            if len(holdout_inputs) > 0:
+                predictions = self.discriminator(holdout_inputs, softmax=False)
+                if self.continious:
+                    holdout_mse = F.mse_loss(predictions, holdout_skills)
+                else:
+                    probs = predictions.softmax(dim=-1)
+                    target_indices = holdout_skills.view(-1).to(torch.long)
+                    target = F.one_hot(target_indices, num_classes=probs.shape[-1]).to(probs.dtype)
+                    holdout_mse = F.mse_loss(probs, target)
+                self.logger.log_scalar("discriminator_holdout_mse", holdout_mse.item())
 
     # checkpointing support
     def get_state_dict(self):
@@ -545,6 +559,8 @@ class PPOD(PPOBase, PPODPool):
         except KeyError as e:
             if not ignore_missing:
                 raise e
+            else:
+                logger.warning("error in loading state dictionary", e)
 
 
 class PPODRunning(PPOD):
@@ -557,10 +573,10 @@ class PPODRunning(PPOD):
         self.target_discriminator = copy.deepcopy(self.discriminator)
 
         # Polyak averaging coefficient (τ)
-        self.tau = 0.1  # Slow update rate
+        self.tau = 0.05  # Slow update rate
 
         # Synchronization settings
-        self.sync_interval = 100
+        self.sync_interval = 50
         self.sync_threshold = 0.05
         self.reset_threshold = 0.2
         self.previous_performance = None
@@ -585,7 +601,7 @@ class PPODRunning(PPOD):
         states_batch, returns, log_probs, actions, entropy = self._prepare_batches(
             states, log_probs, rewards, actions, entropy)
         skills_batch = torch.cat(skills, dim=0).to(self.device)
-        desc_states_batch, desc_skills_batch = self.prepare_discriminator_batches(states, skills)
+        desc_states_batch, desc_skills_batch, episode_lengths = self.prepare_discriminator_batches(states, skills)
         # Evaluate main and target discriminator performance
         target_perf = self.evaluate_discriminator(self.target_discriminator, desc_states_batch, desc_skills_batch)
         main_perf = self.evaluate_discriminator(self.discriminator, desc_states_batch, desc_skills_batch)
@@ -618,6 +634,12 @@ class PPODRunning(PPOD):
 
         self.previous_performance = main_perf
 
+        # Book-keeping for periodic hard synchronisation of the target network
+        self.iteration_count += 1
+        if self.sync_interval > 0 and (self.iteration_count % self.sync_interval) == 0:
+            # Periodically reset the fast discriminator back to the slow target to curb drift
+            self.sync_discriminator_to_target()
+
         # Compute discriminator-based rewards using TARGET discriminator
         episode_lengths = [len(s) for s in states]
         additional_reward_per_episode = self.compute_additional_reward(states_batch, skills_batch,
@@ -649,7 +671,7 @@ class PPODRunning(PPOD):
                               actions, entropy, num_minibatches, skills_batch)
 
         # Train discriminator
-        self.train_discriminator(desc_states_batch, desc_skills_batch)
+        self.train_discriminator(desc_states_batch, desc_skills_batch, episode_lengths=episode_lengths)
 
         # Update target discriminator via Polyak averaging
         self.update_target_discriminator()
@@ -667,6 +689,7 @@ class PPODRunning(PPOD):
 
     def sync_discriminator_to_target(self):
         """Fully synchronize main discriminator to target"""
+        print('syncing discriminator to target')
         self.discriminator.load_state_dict(self.target_discriminator.state_dict())
 
     def sync_target_to_discriminator(self):
@@ -682,6 +705,9 @@ class PPODRunning(PPOD):
         super().load_state_dict(sd, ignore_missing)
         try:
             self.target_discriminator.load_state_dict(sd['target_discriminator'])
+            # Ensure the fast discriminator starts exactly from the slow copy when resuming
+            self.sync_discriminator_to_target()
+            self.iteration_count = 0
         except KeyError as e:
             if not ignore_missing:
                 raise e

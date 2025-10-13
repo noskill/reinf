@@ -238,6 +238,12 @@ class PPOBase(VPGBase):
                     import pdb;pdb.set_trace()
 
         self.logger.log_scalar("policy grad std:", np.std(grads))
+        first_layer = getattr(self.policy, "first_layer", None)
+        if first_layer is not None and hasattr(first_layer, "weight") and first_layer.weight.grad is not None:
+            self.logger.log_scalar(
+                "policy_first_layer_grad_norm",
+                first_layer.weight.grad.norm().item()
+            )
         self.logger.log_scalar("entropy mean:", entropy_dist.mean())
         self.logger.log_scalar("entropy loss:", e_loss)
 

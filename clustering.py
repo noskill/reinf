@@ -5,7 +5,7 @@ from util import RunningNorm
 
 
 class SmartClusteringNovelty:
-    def __init__(self, initial_clusters=80, adaptation_frequency=600_000):
+    def __init__(self, initial_clusters=10, adaptation_frequency=600_000, running_momentum=0.8):
         self.n_clusters = initial_clusters
         self.adaptation_frequency = adaptation_frequency
         self.state_buffer = []
@@ -15,8 +15,8 @@ class SmartClusteringNovelty:
         # Initialize model using MiniBatchKMeans
         self.model = MiniBatchKMeans(n_clusters=self.n_clusters, batch_size=self.batch_size)
         self.is_fitted = False
-        self.reward_scale = 1
-        self.running_norm = RunningNorm()
+        self.reward_scale = 0.1
+        self.running_norm = RunningNorm(momentum=running_momentum)
         self.max_clusters = 100
         self.min_clusters = 4
 
@@ -159,4 +159,3 @@ class SmartClusteringNovelty:
         normalized_rewards = self.running_norm(min_distances)
         clipped_result = np.clip(normalized_rewards, -3.0, 3.0)
         return clipped_result * self.reward_scale
-

@@ -53,7 +53,7 @@ def setup_env(env_cfg: Union['ManagerBasedRLEnvCfg', 'DirectRLEnvCfg', 'DirectMA
     #     env = multi_agent_to_single_agent(env)
 
     # Add the vectorized environment wrapper
-    env = VectorEnvWrapper(env)
+    env = VectorEnvWrapper(env, return_dict_observations=False)
 
     return env
 
@@ -67,6 +67,55 @@ class OnPolicyTrainer:
         self.save_interval = save_interval
         self.checkpoint = checkpoint
         self.seed = seed
+        self.max_episode_steps = getattr(self.env.unwrapped, "max_episode_length", None)
+        self.early_termination_scale = float(getattr(agent, "early_termination_penalty_scale", 0.0))
+
+    def compute_terminal_reward(self, terminated, info):
+        if self.early_termination_scale <= 0:
+            device = getattr(self.env, "device", torch.device("cpu"))
+            if isinstance(terminated, torch.Tensor):
+                return torch.zeros_like(terminated, dtype=torch.float32, device=terminated.device)
+            return torch.zeros(terminated.shape, dtype=torch.float32, device=device)
+
+        if not isinstance(terminated, torch.Tensor):
+            terminated_tensor = torch.tensor(terminated, dtype=torch.bool, device=self.env.device)
+        else:
+            terminated_tensor = terminated.to(self.env.device).bool()
+
+        if self.max_episode_steps is None or info is None or "episode_length_buf" not in info:
+            return torch.zeros_like(terminated_tensor, dtype=torch.float32)
+
+        steps_value = info["episode_length_buf"]
+        if not isinstance(steps_value, torch.Tensor):
+            steps_tensor = torch.tensor(steps_value, dtype=torch.float32, device=self.env.device)
+        else:
+            steps_tensor = steps_value.to(self.env.device).float()
+
+        remained_steps = (self.max_episode_steps - (steps_tensor + 1.0)).clamp_min(0.0)
+        terminated_float = terminated_tensor.float()
+        penalty = -self.early_termination_scale * (remained_steps / float(self.max_episode_steps))
+        penalty = penalty * terminated_float
+
+        if self.agent.logger is not None and terminated_tensor.any():
+            early_mask = (remained_steps > 0.0) & terminated_tensor
+            timeout_mask = (~early_mask) & terminated_tensor
+
+            early_count = early_mask.float().sum().item()
+            timeout_count = timeout_mask.float().sum().item()
+            total_terminated = early_count + timeout_count
+
+            if early_count > 0:
+                self.agent.logger.log_scalar("early_termination_penalty_sum", penalty[early_mask].sum().item())
+            self.agent.logger.log_scalar("early_termination_events", early_count)
+            self.agent.logger.log_scalar("timeout_events", timeout_count)
+
+            if timeout_count > 0:
+                ratio = early_count / timeout_count
+            else:
+                ratio = 0.0
+            self.agent.logger.log_scalar("early_to_timeout_ratio", ratio)
+
+        return penalty
 
     def train(self):
         # Set random seeds
@@ -88,7 +137,6 @@ class OnPolicyTrainer:
             obs = self.env.reset()
             done = torch.zeros(self.env.num_envs, dtype=bool)
             self.agent.episode_start()
-            step = 0
             info = None
             while not done.all():
                 action = self.agent.get_action(obs, done)
@@ -98,9 +146,20 @@ class OnPolicyTrainer:
                 if torch.isnan(reward).any():
                     import pdb;pdb.set_trace()
                 done = terminated
-                # terminal_reward = -2 _np.exp(-(step/300)_*2) * done
-                terminal_reward = 0
-                changed = self.agent.update(obs, action, reward + terminal_reward, done, next_obs, info=info)
+                terminal_reward = self.compute_terminal_reward(terminated, info)
+                if not isinstance(reward, torch.Tensor):
+                    reward = torch.tensor(reward, dtype=torch.float32, device=self.env.device)
+                reward = reward + terminal_reward.to(reward.device)
+                changed = self.agent.update(obs, action, reward, done, next_obs, info=info)
+                if changed and info is not None and "cube_displacement" in info and self.agent.logger is not None:
+                    displacement = info["cube_displacement"]
+                    if isinstance(displacement, torch.Tensor):
+                        values = displacement.detach().float().view(-1)
+                        if values.numel() > 0:
+                            mean = values.mean().item()
+                            std = values.std(unbiased=False).item() if values.numel() > 1 else 0.0
+                            self.agent.logger.log_scalar("cube_displacement_mean", mean)
+                            self.agent.logger.log_scalar("cube_displacement_std", std)
                 if changed:
                     break
                 obs = next_obs

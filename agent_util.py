@@ -86,7 +86,7 @@ def create_agent(args_cli, env_cfg, env, logger):
         action_dim = action_space.shape[0] * 2  # For mean and std in continuous actions
 
     device = env_cfg.sim.device
-    diayn_algorithms = ('ppodr', 'ppod', 'ppod_novel')
+    diayn_algorithms = ('ppodr', 'ppod', 'ppod_novel', 'ppodr_novel')
     uses_diayn = args_cli.algorithm in diayn_algorithms
 
     base_hidden_dims = (512, 512, 256, 256)
@@ -162,11 +162,15 @@ def create_agent(args_cli, env_cfg, env, logger):
             logger=logger,
             **common_args
         )
-    elif args_cli.algorithm in ('ppodr', "ppod", "ppod_novel"):
+    elif args_cli.algorithm in ('ppodr', "ppod", "ppod_novel", "ppodr_novel"):
         if args_cli.algorithm == 'ppodr':
             from ppod import PPODRunning as PPOD
         elif args_cli.algorithm == 'ppod_novel':
             from ppod_novel import PPODNovel as PPOD
+            from clustering import SmartClusteringNovelty
+            common_args['novelty'] = SmartClusteringNovelty()
+        elif args_cli.algorithm == 'ppodr_novel':
+            from ppod_novel import PPODNovelRunning as PPOD
             from clustering import SmartClusteringNovelty
             common_args['novelty'] = SmartClusteringNovelty()
         else:
@@ -178,13 +182,14 @@ def create_agent(args_cli, env_cfg, env, logger):
         args_cli.embedding_dim = embedding_dim
         policy, value = build_networks(obs_dim + embedding_dim)
         num_learning_epochs = 4
-        discard_steps = 0
+        discard_steps = 50
         if state_extractor is None:
             raise RuntimeError("DIAYN requires dict observations to extend with skill field")
         state_extractor.add_field_at_end("skill", shape=(skill_dim if continious else 1,))
 
         sk_size = state_extractor.get_fields_size('skill')
-        desc_fields = ['cube_positions', 'cube_orientations']
+        # desc_fields = ['object', 'cube_positions', 'cube_orientations', 'eef_pos', 'eef_quat', 'gripper_pos']
+        desc_fields = ['cubes_positions_centered', 'cube_orientations']
         desc_input_size = state_extractor.get_fields_size(desc_fields)
         # Discriminator supports continuous or discrete
         discriminator = SkillDiscriminator(
@@ -239,4 +244,3 @@ def create_agent(args_cli, env_cfg, env, logger):
             **common_args
         )
     return agent
-

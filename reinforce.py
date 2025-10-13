@@ -464,7 +464,7 @@ class ReinforceWithPrediction(ReinforceBase, EpisodesPoolMixin):
         )
         self.predictor = predictor
         self.prediction_bonus_scale = prediction_bonus_scale
-        weight_decay_predictor = 0.001
+        weight_decay_predictor = 0.00001
         self.optimizer_predictor = optim.Adam(
             self.predictor.parameters(),
             lr=predictor_lr,
