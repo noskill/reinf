@@ -1,108 +1,105 @@
-# RL Code-Base – High-Level Architecture  
+# RL Code-Base – High-Level Architecture
 
-This repository contains two closely related reinforcement-learning
-code-bases:
+This document describes the reinforcement-learning stack. It mixes a lightweight on-policy RL framework with IsaacLab
+task integrations and DIAYN-style diversity exploration.
 
-1.  **A generic on-policy RL framework** (files in the repo root).  
-    It implements REINFORCE, VPG, PPO and utilities such as logging,
-    data storage and environment wrappers.
-2.  **Task-specific sub-packages** (directories `mine/`, `envs/`,
-    `grab/`, …) that provide environments, specialised agents and
-    runnable training scripts.
+Two layers make up the project:
 
-The design follows the familiar “**env ↔ agent ↔ trainer**” loop while
-keeping hard experiment-specific code contained in its own folder.
+1. **On-policy baseline algorithms** – REINFORCE, VPG, PPO, and shared
+   utilities (`reinforce.py`, `vpg.py`, `ppo.py`, `sample.py`, `pool.py`).
+2. **Skill-based extensions and experiments** – DIAYN/PPOD agents,
+   novelty clustering, IsaacLab trainers, and task-specific code.
 
-## 1. Core packages / modules
+The training loop still follows the classic **env ⇄ agent ⇄ trainer**
+structure, but DIAYN adds an auxiliary discriminator and skill sampling
+path inside the agent.
 
-| Location               | Responsibility | Most relevant classes |
-|------------------------|----------------|-----------------------|
-| `reinforce.py`         | Lightweight on-policy **REINFORCE** baseline. Provides common helper code that more complex algorithms inherit from | `ReinforceBase` |
-| `vpg.py`               | **VPG** (REINFORCE + baseline) built on top of `ReinforceBase` | `VPGBase`, `VPG` |
-| `ppo.py`               | **PPO** implementation (clipped-ratio) | `PPOBase`, `PPO` |
-| `mine/empowerment_ppo.py` | PPO variant that adds an inverse model and intrinsic empowerment rewards | `EmpowermentPPO`, `InverseModel` |
-| `sample.py`            | Action samplers for discrete / Gaussian / transformed distributions | `DiscreteActionSampler`, `NormalActionSampler`, … |
-| `pool.py`              | Episode buffer & replay helpers; mix-in used by all on-policy agents | `EpisodesPoolMixin`, `EpisodesOldPoolMixin` |
-| `log.py`               | Thin wrapper around TensorBoard’s `SummaryWriter` with an  `episode_count` counter | `Logger` |
-| `on_policy_train.py`, `mine/comm_trainer.py` | Trainers that drive the  *env ↔ agent* interaction loop, checkpointing, seeding, video capture | `OnPolicyTrainer`, `CommTrainer` |
-| `envs/`, `mine/`, `grab/` | Task definitions (gym-style environments), tiny grid-worlds, IsaacGym tasks, etc. | e.g. `VecCommEnv`, `CustomFrankaStackEnv` |
+## 1. Core Packages and Modules
 
-
-## 2. Data flow (step-by-step)
-
-```
-┌──────┐      obs       ┌──────────┐  action  ┌─────────────┐
-│ Env  │ ─────────────▶ │  Agent   │─────────▶│  Sampler    │
-│      │ ◀───────────── │ (Policy) │ log π(a) │ (dist.sample)
-└──────┘   r, done      └────┬─────┘          └────┬────────┘
-                             │                   entropy
-                             │ transitions        │
-                             ▼                   ▼
-                        Episodes buffer   (optional) inverse-model
-                             │                   │
-                             ▼                   ▼
-                      Trainer `.should_learn()`  Empowerment reward
-                             │
-                             ▼
-                     Compute returns / advantages
-                             │
-                             ▼
-                        Optimise policy & value
-```
-
-Key points:
-
-* **Sampler** decouples distribution logic from the policy network.
-  All policies output *logits / means*; the sampler handles
-  `dist = Categorical(logits)` etc.  This keeps algorithms agnostic to
-  action space type.
-* **EpisodesPoolMixin** collects `(s, a, log π, entropy, r)` tuples per
-  environment.  Once *num_envs* episodes are complete `should_learn()`
-  triggers a policy update.
-* **EmpowermentPPO** augments rewards with
-
-  ```text
-  r_int = log q_ψ(a|s,s′)  +  β · H[π(·|s)]
-  ```
-
-  where `q_ψ` is the inverse model.  β is controlled by
-  `--entropy-coef`.
+| Location | Responsibility | Key classes / functions |
+|----------|----------------|-------------------------|
+| `reinforce.py`, `vpg.py`, `ppo.py` | Baseline on-policy agents that implement trajectory storage, GAE, and optimisation logic | `Reinforce`, `VPG`, `PPO` |
+| `ppod.py` | DIAYN-enabled PPO variants, including running-average novelty mixins, discriminator handling, and checkpoint sync | `PPOD`, `PPODRunning`, `SkillEmbedding` |
+| `ppod_novel.py` | Adds novelty rewards on top of PPOD, reuses `PPODRunning` behaviour | `_PPODNovelMixin`, `PPODNovel`, `PPODNovelRunning` |
+| `agent_util.py` | Factory that builds policies/values/discriminators, sets DIAYN-aware hyperparameters, and instantiates the right agent based on CLI flags | `create_agent`, `create_networks` |
+| `sample.py` | Action distribution wrappers decoupled from policies | `DiscreteActionSampler`, `NormalActionSampler` |
+| `pool.py` | Episode buffers with skill bookkeeping for DIAYN | `EpisodesPoolMixin`, `PPODPool` |
+| `clustering.py` | Novelty score computation and clustering utilities | `SmartClusteringNovelty` |
+| `util.py` | Shared helpers for observation extraction and experiment hygiene | `StateExtractor`, `copy_python_sources` |
+| `log.py` | Thin TensorBoard/console logger with episode tracking | `Logger` |
+| `on_policy_train.py`, `reinforce_main_is.py` | IsaacLab/Hydra entrypoint, trainer loop, checkpointing, and experiment orchestration | `OnPolicyTrainer`, `main()` |
+| `envs/`, `mine/`, `grab/` | Task registrations and gym-style environments | e.g. IsaacLab manager configs |
 
 
-## 3. Extending the code-base
-
-1. **New environment**  
-   Add a Gym-style env file (e.g. `envs/my_env.py`).  Ensure it exposes
-   `observation_space` and `action_space`.
-
-2. **New algorithm**  
-   Derive from `ReinforceBase` (for Monte-Carlo policy-gradient family)
-   or `PPOBase`.  Implement:
-   * `learn_from_episodes()` – create batches, call `_prepare_batches` …
-   * Optionally override `get_action` if you need special handling.
-
-3. **Custom trainer / experiment script**  
-   Copy `mine/train_comm_empower.py`, wire up env, networks, agent,
-   `CommTrainer` (or your own), add CLI flags.
-
-
-## 4. Directory overview
+## 2. Training and Data Flow
 
 ```
-./envs/            IsaacGym & gymnasium environments
-./mine/            Communication / empowerment toy tasks
-./grab/            Object-manipulation task variants
-./config/          Yaml / python hyper-parameter configs
-./logs/            TensorBoard & checkpoints (git-ignored)
+┌────────┐   obs    ┌────────┐  skill idx/vector ┌────────────┐
+│  Env   │ ───────▶ │ Agent  │ ◀─────────────────│ Skill pool │
+│        │ ◀────────│ Policy │─── action ───────▶│  sampler   │
+└────────┘    r     └──┬─────┘                   └────┬───────┘
+                       │ episodes + descriptors      │
+                       ▼                             ▼
+                  Episodes buffer             DIAYN discriminator
+                       │                             │
+                       ▼                             ▼
+               Trainer & optimiser ⟹ policy/value updates
+                                        │
+                                        ▼
+                          Novelty clustering & diagnostics
+```
+
+Highlights:
+
+- **State extraction** – `StateExtractor` flattens IsaacLab dict observations
+  and appends the current skill embedding before hitting the policy.
+- **Skill management** – `SkillEmbedding` handles discrete embeddings or
+  continuous projections. Samplers in `PPOD` draw skills per environment
+  rollout and store them alongside transitions.
+- **DIAYN discriminator** – Receives descriptor slices (e.g. cube poses,
+  end-effector state) and predicts the skill, providing intrinsic rewards
+  and accuracy diagnostics. Target/online networks stay synchronised when
+  checkpoints resume.
+- **Novelty branch** – `PPODNovel*` variants blend clustering-based novelty
+  scores (from `SmartClusteringNovelty`) with DIAYN rewards and log rich
+  descriptor statistics.
+
+
+## 3. Extending the Code-Base
+
+1. **Add a new environment** – Create a Gym/IsaacLab definition under
+   `envs/` (or an experiment-specific subfolder) and ensure it exposes
+   observation/action spaces compatible with `StateExtractor`.
+2. **Create a new algorithm** – Derive from `PPOBase`/`Reinforce` or reuse
+   `PPOD` mixins. Implement `learn_from_episodes()` and wire any auxiliary
+   modules (e.g. new intrinsic rewards) inside `agent_util.create_agent`.
+3. **Experiment entrypoint** – Update `reinforce_main_is.py` or add a new
+   CLI wrapper. Use `copy_python_sources()` so each run captures source
+   snapshots alongside checkpoints and logs.
+
+
+## 4. Directory Overview
+
+```
+agent*.py, ppod*.py     Core agents and DIAYN extensions
+clustering/             Novelty-based reward helpers
+config/                 IsaacLab/Hydra experiment presets
+envs/, grab/, mine/     Environment implementations and task suites
+logs/, runs/            TensorBoard and checkpoints (git-ignored)
+utils/                  Ancillary tooling (e.g. visualisation)
 ```
 
 
-## 5. Important design choices
+## 5. Design Principles
 
-* **No global state** – agent has its own `Logger`, episode buffer and
-  RNG seed.  Trainers just orchestrate.
-* **Pure PyTorch** – no dependency on RL libraries (stable-baselines,
-  RLlib), making the code easy to hack.
-* **Explicit checkpoint dicts** – `get_state_dict` / `load_state_dict`
-  implemented for every agent so that new fields can be added without
-  breaking backward compatibility.
+- **Modular agents** – Policies, value functions, discriminators, and
+  samplers remain interchangeable via `create_agent`.
+- **Skill flexibility** – Discrete and continuous skills share the same
+  embedding interface and logging/diagnostic pathways.
+- **Experiment reproducibility** – CLI arguments are snapshotted and
+  relevant sources are copied into each run directory.
+- **Checkpoint robustness** – Novelty and discriminator networks sync their
+  target/online weights during save/load to avoid divergence after resume.
+
+This summary should help new contributors locate the right extension points
+and understand how DIAYN novelty augments the underlying on-policy baselines.
