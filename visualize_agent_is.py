@@ -83,6 +83,9 @@ app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app  # noqa: F841 – keep handle alive
 
 
+import grab
+import envs
+
 # -----------------------------------------------------------------------------
 # Regular python imports that rely on IsaacSim being initialised
 # -----------------------------------------------------------------------------
