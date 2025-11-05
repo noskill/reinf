@@ -7,8 +7,8 @@ class _PPODNovelMixin:
         super().__init__(*args, **kwargs)
         self.novelty = novelty
         self.use_novelty = True
-        self.novelty_velocity_threshold = kwargs.get('novelty_velocity_threshold', 0.02)
-        self.novelty_xy_limit = kwargs.get('novelty_xy_limit', 0.7)
+        self.novelty_velocity_threshold = kwargs.get('novelty_velocity_threshold', 0.03)
+        self.novelty_xy_limit = kwargs.get('novelty_xy_limit', 1.7)
 
     def compute_additional_reward(self, states, skill, discriminator=None, episode_lengths=None, **kwargs):
         rew_desc_per_episode = []

@@ -163,20 +163,21 @@ def create_agent(args_cli, env_cfg, env, logger):
             **common_args
         )
     elif args_cli.algorithm in ('ppodr', "ppod", "ppod_novel", "ppodr_novel"):
+        reward_scale = 0.1
+        continious = args_cli.continious_skills
         if args_cli.algorithm == 'ppodr':
             from ppod import PPODRunning as PPOD
         elif args_cli.algorithm == 'ppod_novel':
             from ppod_novel import PPODNovel as PPOD
             from clustering import SmartClusteringNovelty
-            common_args['novelty'] = SmartClusteringNovelty()
+            common_args['novelty'] = SmartClusteringNovelty(reward_scale=reward_scale)
         elif args_cli.algorithm == 'ppodr_novel':
             from ppod_novel import PPODNovelRunning as PPOD
             from clustering import SmartClusteringNovelty
-            common_args['novelty'] = SmartClusteringNovelty()
+            common_args['novelty'] = SmartClusteringNovelty(reward_scale=reward_scale)
         else:
             from ppod import PPOD
         embedding_dim = args_cli.embedding_dim
-        continious = args_cli.continious_skills
         skill_dim = args_cli.skill_dim
         embedding_dim = max(embedding_dim * 2, 64)
         args_cli.embedding_dim = embedding_dim

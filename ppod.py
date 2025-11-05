@@ -28,6 +28,7 @@ class SkillEmbedding(nn.Module):
         self.continuous = continuous
         self.device = device
 
+        print('continuous = ' + str(continuous))
         if continuous:
             # For continuous skills: use a linear projection
             self.model = nn.Linear(skill_dim, embedding_dim).to(device)
@@ -461,8 +462,17 @@ class PPOD(PPOBase, PPODPool):
             else:
                 mask = (torch.rand_like(result) >= p_drop).to(result.dtype)
                 result = result * mask
+
         # raw features are not normalised
         # there were some instabilities in training with normalisation
+        if result.dim() == 1:
+            return result
+        if result.shape[0] == 1:
+            return result
+   #     else:
+   #         mean = result.mean(dim=0, keepdim=True)
+   #         std = result.std(dim=0, keepdim=True, unbiased=False).clamp_min(1e-6)
+   #         result = (result - mean) / std
         return result
 
     def train_discriminator(self, states, skills, episode_lengths):
@@ -471,7 +481,7 @@ class PPOD(PPOBase, PPODPool):
         states batch_size x M
         skills batch_size x N or batch_size
         """
-        train_epochs = 4
+        train_epochs = 4 
         mini_batch_size = 128
         desc_input = self.get_descriminator_input(states, p_drop=self.p_drop)
 
@@ -488,7 +498,7 @@ class PPOD(PPOBase, PPODPool):
         sum_holdout = sum(episode_lengths[:holdout_size])
         train_inputs = desc_input[sum_holdout:]
         train_skills = skills[sum_holdout:]
-
+        
         holdout_inputs = desc_input[:sum_holdout]
         holdout_skills = skills[:sum_holdout]
 
@@ -533,12 +543,12 @@ class PPOD(PPOBase, PPODPool):
                 predictions = self.discriminator(holdout_inputs, softmax=False)
                 if self.continious:
                     holdout_mse = F.mse_loss(predictions, holdout_skills)
+                    self.logger.log_scalar("discriminator_holdout_mse", holdout_mse.item())
                 else:
-                    probs = predictions.softmax(dim=-1)
                     target_indices = holdout_skills.view(-1).to(torch.long)
-                    target = F.one_hot(target_indices, num_classes=probs.shape[-1]).to(probs.dtype)
-                    holdout_mse = F.mse_loss(probs, target)
-                self.logger.log_scalar("discriminator_holdout_mse", holdout_mse.item())
+                    predicted_indices = predictions.argmax(dim=-1)
+                    accuracy = (predicted_indices == target_indices).float().mean()
+                    self.logger.log_scalar("discriminator_holdout_accuracy", accuracy.item())
 
     # checkpointing support
     def get_state_dict(self):
