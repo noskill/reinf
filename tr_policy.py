@@ -3,16 +3,17 @@ import torch.nn as nn
 from typing import Dict, Optional
 
 from transformer import LlamaConfig, LlamaModel
-from tr_cache import PositionBasedDynamicCache
+from tr_cache import PositionBasedDynamicCache, WindowedPositionBasedDynamicCache
 
 
 class IsaacLabEncoders(nn.Module):
     """Shared spatial and proprio encoders used by policy and value."""
 
-    def __init__(self, config, n_cubes=3):
+    def __init__(self, config, n_cubes=3, use_cube_id_emb: bool = False):
         super().__init__()
         self.config = config
         self.n_cubes = n_cubes
+        self.use_cube_id_emb = bool(use_cube_id_emb)
 
         # Spatial encoder (set-like; no RoPE)
         self.spatial_config = LlamaConfig(
@@ -44,7 +45,8 @@ class IsaacLabEncoders(nn.Module):
         pos = obs['cube_positions'].view(batch_size, self.n_cubes, 3)
         orient = obs['cube_orientations'].view(batch_size, self.n_cubes, 4)
         cubes = self.cube_proj(torch.cat([pos, orient], dim=-1))
-        cubes = cubes + self.cube_id_emb(torch.arange(self.n_cubes, device=cubes.device))
+        if self.use_cube_id_emb:
+            cubes = cubes + self.cube_id_emb(torch.arange(self.n_cubes, device=cubes.device))
         cls_token = self.spatial_cls_token.expand(batch_size, -1, -1)
         transformer_input = torch.cat([cls_token, cubes], dim=1)
         out = self.spatial_encoder(transformer_input)
@@ -73,12 +75,13 @@ class IsaacLabEncoders(nn.Module):
 
 
 class IsaacLabPolicy(IsaacLabEncoders):
-    def __init__(self, config, n_cubes=3, action_dim=8):
-        super().__init__(config, n_cubes)
+    def __init__(self, config, n_cubes=3, action_dim=8, use_cube_id_emb: bool = False, attention_window: Optional[int] = 10):
+        super().__init__(config, n_cubes, use_cube_id_emb=use_cube_id_emb)
         self.action_dim = action_dim
         self._num_envs: Optional[int] = None
         self._cache_position: Optional[torch.Tensor] = None  # [num_envs]
         self._cache = None
+        self.attention_window = attention_window
 
 
         # --- 3. TEMPORAL DECODER (Sequence Transformer) ---
@@ -86,7 +89,8 @@ class IsaacLabPolicy(IsaacLabEncoders):
         self.temporal_config = LlamaConfig(
             input_size=config.hidden_size * 2, # Concatenated features
             hidden_size=config.hidden_size,
-            use_rope=True # Sequential history matters
+            use_rope=True, # Sequential history matters
+            attention_window=attention_window,
         )
         self.temporal_decoder = LlamaModel(self.temporal_config)
         
@@ -171,7 +175,10 @@ class IsaacLabPolicy(IsaacLabEncoders):
     # --- Cache management helpers ---
     def init_cache(self, num_envs: int, device: torch.device):
         self._num_envs = int(num_envs)
-        self._cache = PositionBasedDynamicCache().to(device=device)
+        if self.attention_window is not None and self.attention_window > 0:
+            self._cache = WindowedPositionBasedDynamicCache(self.attention_window).to(device=device)
+        else:
+            self._cache = PositionBasedDynamicCache().to(device=device)
         self._cache_position = torch.zeros(self._num_envs, dtype=torch.long, device=device)
 
     def reset_cache(self, reset_mask: torch.Tensor):
@@ -194,8 +201,14 @@ class IsaacLabSkillPolicy(IsaacLabPolicy):
       with spatial-proprio concat into temporal decoder.
     """
 
-    def __init__(self, config, n_cubes=3, action_dim=8, *, skill_dim: int, discrete: bool = True):
-        super().__init__(config, n_cubes=n_cubes, action_dim=action_dim)
+    def __init__(self, config, n_cubes=3, action_dim=8, *, skill_dim: int, discrete: bool = True, use_cube_id_emb: bool = False, attention_window: Optional[int] = 10):
+        super().__init__(
+            config,
+            n_cubes=n_cubes,
+            action_dim=action_dim,
+            use_cube_id_emb=use_cube_id_emb,
+            attention_window=attention_window,
+        )
         H = config.hidden_size
         self.skill_dim = skill_dim
         self.discrete = discrete
@@ -285,10 +298,10 @@ class IsaacLabValue(nn.Module):
     predicts a scalar value.
     """
 
-    def __init__(self, config, n_cubes=3):
+    def __init__(self, config, n_cubes=3, use_cube_id_emb: bool = False):
         super().__init__()
         # Share encoder structure via composition
-        self.enc = IsaacLabEncoders(config, n_cubes)
+        self.enc = IsaacLabEncoders(config, n_cubes, use_cube_id_emb=use_cube_id_emb)
 
         # Fusion and value head
         self.fuse = nn.Linear(2 * config.hidden_size, config.hidden_size)
@@ -320,9 +333,9 @@ class IsaacLabDiscriminator(nn.Module):
         "joint_vel",
     ))
 
-    def __init__(self, config, n_cubes=3, *, skill_dim: int, fields=None):
+    def __init__(self, config, n_cubes=3, *, skill_dim: int, fields=None, use_cube_id_emb: bool = False):
         super().__init__()
-        self.enc = IsaacLabEncoders(config, n_cubes)
+        self.enc = IsaacLabEncoders(config, n_cubes, use_cube_id_emb=use_cube_id_emb)
         if fields is None:
             fields = ("cube_positions", "cube_orientations")
         self.fields = tuple(fields)

@@ -23,6 +23,7 @@ class LlamaConfig:
     max_position_embeddings: int = 2048
     rope_theta: float = 10000.0
     use_rope: bool = True
+    attention_window: Optional[int] = None
     _attn_implementation: str = "eager"
 
 # --- Helper Functions ---
@@ -115,6 +116,16 @@ class LlamaAttention(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
+        if config.hidden_size != config.num_attention_heads * config.head_dim:
+            raise ValueError(
+                "hidden_size must equal num_attention_heads * head_dim "
+                f"(got {config.hidden_size} vs {config.num_attention_heads} * {config.head_dim})"
+            )
+        if config.num_attention_heads % config.num_key_value_heads != 0:
+            raise ValueError(
+                "num_attention_heads must be divisible by num_key_value_heads "
+                f"(got {config.num_attention_heads} vs {config.num_key_value_heads})"
+            )
         self.head_dim = config.head_dim
         self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
         self.scaling = self.head_dim**-0.5
@@ -222,7 +233,7 @@ class LlamaModel(nn.Module):
         else:
             self.rotary_emb = None
 
-    def forward(self, data, position_ids=None, past_key_values=None, cache_position=None, key_padding_mask=None):
+    def forward(self, data, position_ids=None, past_key_values=None, cache_position=None, key_padding_mask=None, attention_window=None):
         # data: [batch, seq_len, input_size]
         hidden_states = self.embed_tokens(data)
 
@@ -251,6 +262,13 @@ class LlamaModel(nn.Module):
             # 0 on and below diagonal, -inf above
             causal = torch.full((T, T), float('-inf'), device=hidden_states.device, dtype=hidden_states.dtype)
             causal = torch.triu(causal, diagonal=1)
+            window = attention_window if attention_window is not None else self.config.attention_window
+            if window is not None and window > 0:
+                i = torch.arange(T, device=hidden_states.device).view(T, 1)
+                j = torch.arange(T, device=hidden_states.device).view(1, T)
+                too_old = (i - j) >= window
+                window_mask = torch.where(too_old, torch.full_like(causal, float('-inf')), torch.zeros_like(causal))
+                causal = causal + window_mask
             # Shape to [1, 1, T, T] so it broadcasts over batch and heads
             attn_mask = causal.view(1, 1, T, T)
             # Add optional key padding mask: [B, T] where True means PADDED

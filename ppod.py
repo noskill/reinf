@@ -166,27 +166,33 @@ class PPOD(PPOBase, PPODPool):
         self.reset_episodes()
         # Sample fresh skills per environment
         self._skills = self.skill_sampler.sample(self.num_envs)
+        import pdb;pdb.set_trace()
 
-    def process_states(self, state, done):
-        """Attach current skills to obs dict for active envs.
+    def process_states(self, state, episode_start):
+        """Attach current skills to obs dict for all envs.
 
-        Expects 'state' as dict of tensors [N,...]. Returns a dict filtered
-        to active envs with added key 'skills'.
+        Expects 'state' as dict of tensors [N,...]. Resamples skills where
+        episode_start is True.
         """
-        active_mask = ~done
-        if not any(active_mask):
-            return {k: torch.empty((0,) + v.shape[1:], device=self.device, dtype=v.dtype) for k, v in state.items()}
+        if self._skills is None or self._skills.shape[0] != self.num_envs:
+            self._skills = self.skill_sampler.sample(self.num_envs)
 
-        # Filter obs per key
+        if episode_start is not None:
+            reset_mask = episode_start
+            if not isinstance(reset_mask, torch.Tensor):
+                reset_mask = torch.as_tensor(reset_mask, device=self.device)
+            reset_mask = reset_mask.to(torch.bool).view(-1)
+            if reset_mask.any():
+                new_skills = self.skill_sampler.sample(int(reset_mask.sum().item()))
+                self._skills[reset_mask] = new_skills
+
         obs_active = {}
         for k, v in state.items():
             if isinstance(v, torch.Tensor):
-                obs_active[k] = v[active_mask].to(self.device)
+                obs_active[k] = v.to(self.device)
             else:
-                obs_active[k] = torch.as_tensor(v, device=self.device)[active_mask]
-
-        skills_active = self._skills[active_mask]
-        obs_active['skills'] = skills_active
+                obs_active[k] = torch.as_tensor(v, device=self.device)
+        obs_active['skills'] = self._skills.to(self.device)
         return obs_active
 
     def compute_additional_reward(self, states_list, skills_list, discriminator=None, **kwargs):

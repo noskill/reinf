@@ -103,6 +103,7 @@ class LayerCache(CacheLayerMixin):
         key_states: torch.Tensor,   # [B, H, T_new, D]
         value_states: torch.Tensor, # [B, H, T_new, D]
         cache_position: Optional[torch.Tensor] = None,
+        window_size: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Update per-row cache using provided positions and return padded batch K,V.
 
@@ -159,6 +160,9 @@ class LayerCache(CacheLayerMixin):
                 k_row = torch.cat([k_row, k_new], dim=1)
                 v_row = torch.cat([v_row, v_new], dim=1)
 
+            if window_size is not None and window_size > 0 and k_row.shape[1] > window_size:
+                k_row = k_row[:, -window_size:, :]
+                v_row = v_row[:, -window_size:, :]
             self._k_rows[b] = k_row
             self._v_rows[b] = v_row
             max_len = max(max_len, k_row.shape[1])
@@ -192,6 +196,31 @@ class LayerCache(CacheLayerMixin):
             mask = torch.where(valid, mask, mask.new_full(mask.shape, neg_inf))
 
         return K, V, mask
+
+    def lazy_initialization(self, key_states: torch.Tensor):
+       # No preallocation; rows grow dynamically.
+       return None
+
+    def get_mask_sizes(self, cache_position: torch.Tensor) -> tuple[int, int]:
+        # kv_length = current max row length or fall back to q_length
+        max_len = 0
+        for k in self._k_rows:
+            if k is not None:
+                max_len = max(max_len, int(k.shape[1]))
+        if max_len == 0:
+            max_len = int(cache_position.shape[0])
+        return max_len, 0  # (kv_length, kv_offset)
+
+    def get_seq_length(self) -> int:
+        max_len = 0
+        for k in self._k_rows:
+            if k is not None:
+                max_len = max(max_len, int(k.shape[1]))
+        return max_len
+
+    def get_max_cache_shape(self) -> int:
+        # Dynamic cache: no fixed maximum
+        return -1
 
 
 class PositionBasedDynamicCache(Cache):
@@ -234,7 +263,37 @@ class PositionBasedDynamicCache(Cache):
         return layer.update(key_states, value_states, cache_position=cache_position)
 
 
+class WindowedPositionBasedDynamicCache(PositionBasedDynamicCache):
+    """Position-based cache with a fixed-size sliding window."""
+
+    def __init__(self, window_size: int) -> None:
+        super().__init__()
+        if window_size is None or window_size <= 0:
+            raise ValueError("window_size must be a positive integer")
+        self.window_size = int(window_size)
+
+    @torch.no_grad()
+    def update(
+        self,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        layer_idx: int,
+        cache_kwargs: Optional[Dict] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        cache_position = None
+        if cache_kwargs is not None:
+            cache_position = cache_kwargs.get("cache_position", None)
+        layer = self._get_layer(layer_idx)
+        return layer.update(
+            key_states,
+            value_states,
+            cache_position=cache_position,
+            window_size=self.window_size,
+        )
+
+
 __all__ = [
     "LayerCache",
     "PositionBasedDynamicCache",
+    "WindowedPositionBasedDynamicCache",
 ]

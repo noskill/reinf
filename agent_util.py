@@ -10,6 +10,7 @@ from sample import DiscreteActionSampler, NormalActionSampler
 
 from agent import Agent
 from networks import PolicyNetwork, ValueNetwork as Value
+from transformer import LlamaConfig
 
 
 def create_networks_with_transformer(
@@ -26,7 +27,6 @@ def create_networks_with_transformer(
     - Policy: IsaacLabPolicy or IsaacLabSkillPolicy (DIAYN) outputs 2 * base_action_dim.
     - Value: IsaacLabValue mirrors the encoder stack without temporal decoding.
     """
-    from types import SimpleNamespace
     from tr_policy import IsaacLabPolicy, IsaacLabSkillPolicy, IsaacLabValue
 
     # Derive base action dimension for continuous actions (policy outputs 2*base)
@@ -42,8 +42,26 @@ def create_networks_with_transformer(
     except Exception:
         pass
 
-    # Build a lightweight config namespace for the transformer blocks
-    cfg = SimpleNamespace(hidden_size=hidden_dim)
+    attention_window = 10
+    head_dim = hidden_dim // 4
+    cfg = LlamaConfig(
+        input_size=hidden_dim,
+        hidden_size=hidden_dim,
+        intermediate_size=hidden_dim * 4,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        rms_norm_eps=1e-5,
+        attention_bias=False,
+        attention_dropout=0.0,
+        mlp_bias=True,
+        head_dim=head_dim,
+        max_position_embeddings=2048,
+        rope_theta=10000.0,
+        use_rope=True,
+        attention_window=attention_window,
+        _attn_implementation="eager",
+    )
     if skill_dim is not None:
         policy = IsaacLabSkillPolicy(
             cfg,
@@ -51,12 +69,20 @@ def create_networks_with_transformer(
             action_dim=base_action_dim,
             skill_dim=skill_dim,
             discrete=discrete_skills,
+            use_cube_id_emb=False,
+            attention_window=attention_window,
         ).to(device)
     else:
-        policy = IsaacLabPolicy(cfg, n_cubes=n_cubes, action_dim=base_action_dim).to(device)
+        policy = IsaacLabPolicy(
+            cfg,
+            n_cubes=n_cubes,
+            action_dim=base_action_dim,
+            use_cube_id_emb=False,
+            attention_window=attention_window,
+        ).to(device)
 
     # Transformer-based value network without temporal decoding
-    value = IsaacLabValue(cfg, n_cubes=n_cubes).to(device)
+    value = IsaacLabValue(cfg, n_cubes=n_cubes, use_cube_id_emb=False).to(device)
 
     return policy, value
 
@@ -244,6 +270,7 @@ def create_agent(args_cli, env_cfg, env, logger):
             n_cubes=n_cubes,
             skill_dim=skill_dim,
             fields=desc_fields,
+            use_cube_id_emb=False,
         ).to(device)
         agent = PPOD(
             policy=policy,

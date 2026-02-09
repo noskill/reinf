@@ -18,10 +18,10 @@ path inside the agent.
 
 | Location | Responsibility | Key classes / functions |
 |----------|----------------|-------------------------|
-| `reinforce.py`, `vpg.py`, `ppo.py` | Baseline on-policy agents that implement trajectory storage, GAE, and optimisation logic | `Reinforce`, `VPG`, `PPO` |
-| `ppod.py` | DIAYN-enabled PPO variants, including running-average novelty mixins, discriminator handling, and checkpoint sync | `PPOD`, `PPODRunning`, `SkillEmbedding` |
-| `ppod_novel.py` | Adds novelty rewards on top of PPOD, reuses `PPODRunning` behaviour | `_PPODNovelMixin`, `PPODNovel`, `PPODNovelRunning` |
-| `agent_util.py` | Factory that builds policies/values/discriminators, sets DIAYN-aware hyperparameters, and instantiates the right agent based on CLI flags | `create_agent`, `create_networks` |
+| `reinforce.py`, `vpg.py`, `ppo.py` | Baseline on-policy agents with EpisodeBatch padding/flattening and sequence-aware PPO updates | `Reinforce`, `VPG`, `PPO` |
+| `ppod.py` | DIAYN-enabled PPO variants with skill sampling, dict-obs passthrough, and discriminator training | `PPOD`, `PPODRunning` |
+| `ppod_novel.py` | Adds novelty rewards on top of PPOD via a reusable reward provider interface | `NoveltyReward`, `AdditionalRewardMixin`, `PPODNovel`, `PPODNovelRunning` |
+| `agent_util.py` | Factory that builds transformer policies/values/discriminators and instantiates the right agent based on CLI flags | `create_agent`, `create_networks_with_transformer` |
 | `sample.py` | Action distribution wrappers decoupled from policies | `DiscreteActionSampler`, `NormalActionSampler` |
 | `pool.py` | Episode buffers with skill bookkeeping for DIAYN | `EpisodesPoolMixin`, `PPODPool` |
 | `clustering.py` | Novelty score computation and clustering utilities | `SmartClusteringNovelty` |
@@ -51,25 +51,29 @@ path inside the agent.
 
 Highlights:
 
-- **State extraction** – `StateExtractor` flattens IsaacLab dict observations
-  and appends the current skill embedding before hitting the policy.
-- **Skill management** – `SkillEmbedding` handles discrete embeddings or
-  continuous projections. Samplers in `PPOD` draw skills per environment
-  rollout and store them alongside transitions.
-- **DIAYN discriminator** – Receives descriptor slices (e.g. cube poses,
-  end-effector state) and predicts the skill, providing intrinsic rewards
-  and accuracy diagnostics. Target/online networks stay synchronised when
-  checkpoints resume.
-- **Novelty branch** – `PPODNovel*` variants blend clustering-based novelty
-  scores (from `SmartClusteringNovelty`) with DIAYN rewards and log rich
-  descriptor statistics.
+- **Observation flow** – Dict observations are passed through as-is to
+  policy/value/discriminator. Episode boundaries are preserved via
+  `EpisodeBatch` padding + `key_padding_mask` for sequence models.
+- **Skill management** – `PPOD` samples skills per environment and attaches
+  them under the `skills` key during rollout; skill-aware transformer
+  policies embed them internally.
+- **DIAYN discriminator** – Receives dict observation fields (configurable
+  via `discriminator_fields`) and predicts the skill, providing intrinsic
+  rewards and accuracy diagnostics. Target/online networks stay synchronised
+  when checkpoints resume.
+- **Novelty branch** – `PPODNovel*` variants use `NoveltyReward` as an
+  additional reward provider layered on top of DIAYN and update novelty
+  state after training.
+- **Transformer history window** – Transformer models support a tunable
+  attention window for training masks and inference cache, keeping only the
+  most recent steps when enabled.
 
 
 ## 3. Extending the Code-Base
 
 1. **Add a new environment** – Create a Gym/IsaacLab definition under
    `envs/` (or an experiment-specific subfolder) and ensure it exposes
-   observation/action spaces compatible with `StateExtractor`.
+   dict observations compatible with transformer policies.
 2. **Create a new algorithm** – Derive from `PPOBase`/`Reinforce` or reuse
    `PPOD` mixins. Implement `learn_from_episodes()` and wire any auxiliary
    modules (e.g. new intrinsic rewards) inside `agent_util.create_agent`.
@@ -94,8 +98,8 @@ utils/                  Ancillary tooling (e.g. visualisation)
 
 - **Modular agents** – Policies, value functions, discriminators, and
   samplers remain interchangeable via `create_agent`.
-- **Skill flexibility** – Discrete and continuous skills share the same
-  embedding interface and logging/diagnostic pathways.
+- **Skill flexibility** – Discrete and continuous skills are supported via
+  `IsaacLabSkillPolicy` embedding and DIAYN reward computation.
 - **Experiment reproducibility** – CLI arguments are snapshotted and
   relevant sources are copied into each run directory.
 - **Checkpoint robustness** – Novelty and discriminator networks sync their
