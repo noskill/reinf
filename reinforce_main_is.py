@@ -6,6 +6,7 @@ Simplified training script for REINFORCE, VPG, and PPO agents using IsaacLab.
 import os
 import sys
 import argparse
+import shlex
 
 # IsaacLab imports
 from isaaclab.app import AppLauncher
@@ -37,6 +38,7 @@ parser.set_defaults(flatten_obs=True)
 # Let AppLauncher add its own CLI args.
 AppLauncher.add_app_launcher_args(parser)
 
+original_argv = sys.argv.copy()
 # Parse known args so that later Hydra reads its own args correctly.
 args_cli, hydra_args = parser.parse_known_args()
 if args_cli.video:
@@ -62,8 +64,8 @@ from agent_util import create_agent
 from util import copy_python_sources
 
 
-def save_args_to_log(args, log_dir):
-    """Save command-line arguments to a log directory"""
+def save_args_to_log(args, log_dir, argv=None, python_exec=None):
+    """Save command-line arguments to a log directory."""
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, f'args.json')
     
@@ -72,7 +74,20 @@ def save_args_to_log(args, log_dir):
     with open(log_file, 'w') as f:
         import json
         json.dump(args_dict, f, indent=4)
-    
+
+    cmd_file = os.path.join(log_dir, "command.sh")
+    argv = list(argv) if argv is not None else []
+    python_exec = python_exec or sys.executable
+    cmd_parts = [python_exec] + argv if argv else [python_exec]
+    try:
+        cmd_line = shlex.join(cmd_parts)
+    except AttributeError:
+        cmd_line = " ".join(shlex.quote(part) for part in cmd_parts)
+    with open(cmd_file, "w") as f:
+        f.write("#!/usr/bin/env bash\n")
+        f.write("set -euo pipefail\n")
+        f.write(f"{cmd_line}\n")
+
     return log_file
 
 
@@ -120,7 +135,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent = create_agent(args_cli, env_cfg, env, logger)
     n_episodes = args_cli.n_episodes
     
-    save_args_to_log(args_cli, experiment_dir)
+    save_args_to_log(args_cli, experiment_dir, argv=original_argv, python_exec=sys.executable)
     # Create trainer
     trainer = OnPolicyTrainer(
         env=env, 

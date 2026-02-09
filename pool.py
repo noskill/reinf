@@ -14,6 +14,41 @@ class EpisodesPoolMixin:
 
     def add_transition(self, env_idx, state, action, log_prob, entropy):
         self.episodes[env_idx].append((state, action, log_prob, entropy))
+        
+    def add_transition_batch(self, states, actions, log_probs, entropies, env_ids=None):
+        # Expect tensors only; determine batch size from actions
+        B = actions.shape[0]
+
+        # Shape assertions for log_probs and entropies
+        assert log_probs.shape[0] == B, (
+            f"log_probs batch size {log_probs.shape[0]} does not match actions batch size {B}"
+        )
+        assert entropies.shape[0] == B, (
+            f"entropies batch size {entropies.shape[0]} does not match actions batch size {B}"
+        )
+
+        # Validate env_ids when provided
+        if env_ids is not None:
+            assert env_ids.shape[0] == B, f"env_ids length {env_ids.shape[0]} must match batch size {B}"
+
+        if isinstance(states, dict):
+            # Ensure all dict tensors share the same batch dimension
+            for key, tensor in states.items():
+                assert tensor.shape[0] == B, f"states['{key}'] batch size {tensor.shape[0]} must match {B}"
+
+            for idx in range(B):
+                obs = {key: states[key][idx] for key in states}
+                env_idx = idx if env_ids is None else int(env_ids[idx].item())
+                assert 0 <= env_idx < self.num_envs, f"env_idx {env_idx} out of range [0, {self.num_envs})"
+                self.add_transition(env_idx, obs, actions[idx], log_probs[idx], entropies[idx])
+        else:
+            # Validate states batch dimension
+            assert states.shape[0] == B, f"states batch size {states.shape[0]} must match {B}"
+
+            for idx in range(B):
+                env_idx = idx if env_ids is None else int(env_ids[idx].item())
+                assert 0 <= env_idx < self.num_envs, f"env_idx {env_idx} out of range [0, {self.num_envs})"
+                self.add_transition(env_idx, states[idx], actions[idx], log_probs[idx], entropies[idx])
 
     def add_reward(self, env_idx, reward):
         if self.episodes[env_idx] and len(self.episodes[env_idx]) > 0:

@@ -17,7 +17,7 @@ from isaaclab.sensors import ContactSensor, ContactSensorCfg
 class CustomFrankaStackEnv(ManagerBasedRLEnv):
     # Reward weights as class attributes
     grasp_reward_weight = 2.0
-    stack_reward_weight = 10.0
+    stack_reward_weight = 100.0
     distance_reward_weight = 0.5
 
     def __init__(self, cfg: ManagerBasedRLEnvCfg = None, render_mode=None, env_cfg_entry_point=None,

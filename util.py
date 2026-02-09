@@ -3,6 +3,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from torch.nn.utils.rnn import pad_sequence, pack_sequence, pad_packed_sequence
 
 
 def copy_python_sources(script_dir: str, experiment_dir: str) -> None:
@@ -321,3 +323,299 @@ class RunningNorm:
         normalized = (x - self.mean) / (self.std + self.epsilon)
 
         return normalized
+
+
+# =========================
+# Episode/Sequence Utilities
+# =========================
+
+TensorLike = Union[torch.Tensor, Dict[str, torch.Tensor]]
+
+
+def _is_mapping(x: Any) -> bool:
+    return isinstance(x, dict)
+
+
+def tree_map(x: Any, fn):
+    if isinstance(x, torch.Tensor):
+        return fn(x)
+    if isinstance(x, dict):
+        return {k: tree_map(v, fn) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        t = [tree_map(v, fn) for v in x]
+        return type(x)(t)
+    return x
+
+
+def to_device(x: Any, device: torch.device):
+    return tree_map(x, lambda t: t.to(device) if isinstance(t, torch.Tensor) else t)
+
+
+def detach(x: Any):
+    return tree_map(x, lambda t: t.detach() if isinstance(t, torch.Tensor) else t)
+
+
+def pad_sequence_list(seq_list: List[torch.Tensor], pad_value: float = 0.0, batch_first: bool = True) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Pad a list of 2D/3D tensors with time in dim=0 into [B, T, ...].
+    Returns: (padded, key_padding_mask[B,T], lengths[B]).
+    key_padding_mask: True for padded positions.
+    """
+    if len(seq_list) == 0:
+        raise ValueError("pad_sequence_list requires at least one sequence")
+    lengths = torch.tensor([s.shape[0] for s in seq_list], dtype=torch.long)
+    padded = pad_sequence(seq_list, batch_first=batch_first, padding_value=pad_value)
+    max_len = int(lengths.max().item()) if lengths.numel() > 0 else 0
+    arange = torch.arange(max_len, device=lengths.device)
+    mask = arange.unsqueeze(0) >= lengths.unsqueeze(1)
+    return padded, mask, lengths
+
+
+def pad_dict_sequence_list(dict_list: List[Dict[str, torch.Tensor]], pad_value: float = 0.0, batch_first: bool = True) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
+    """
+    Pad a list of dict sequences where each value is a time-major tensor [T, ...].
+    Returns: (padded_dict with [B,T,...] per key, key_padding_mask[B,T], lengths[B]).
+    Assumes all dicts have identical keys.
+    """
+    if len(dict_list) == 0:
+        raise ValueError("pad_dict_sequence_list requires at least one sequence")
+    keys = list(dict_list[0].keys())
+    # Compute lengths from any one key
+    lengths = torch.tensor([dict_list[i][keys[0]].shape[0] for i in range(len(dict_list))], dtype=torch.long)
+    max_len = int(lengths.max().item()) if lengths.numel() > 0 else 0
+    arange = torch.arange(max_len, device=lengths.device)
+    mask = arange.unsqueeze(0) >= lengths.unsqueeze(1)
+    padded: Dict[str, torch.Tensor] = {}
+    for k in keys:
+        seqs = [d[k] for d in dict_list]
+        padded[k] = pad_sequence(seqs, batch_first=batch_first, padding_value=pad_value)
+    return padded, mask, lengths
+
+
+def pack_dict_sequence_list(dict_list: List[Dict[str, torch.Tensor]], enforce_sorted: bool = False) -> Dict[str, torch.nn.utils.rnn.PackedSequence]:
+    """
+    Pack a list of dict sequences into a dict of PackedSequence, one per key.
+    Assumes each value tensor is time-major [T, ...].
+    """
+    if len(dict_list) == 0:
+        raise ValueError("pack_dict_sequence_list requires at least one sequence")
+    keys = list(dict_list[0].keys())
+    packed: Dict[str, torch.nn.utils.rnn.PackedSequence] = {}
+    for k in keys:
+        seqs = [d[k] for d in dict_list]
+        packed[k] = pack_sequence(seqs, enforce_sorted=enforce_sorted)
+    return packed
+
+
+def flatten_padded(x: torch.Tensor, key_padding_mask: torch.Tensor) -> torch.Tensor:
+    """
+    Flatten [B,T,...] into [N,...] by removing padded steps (mask=True).
+    """
+    if x.dim() < 2:
+        raise ValueError("flatten_padded expects a tensor with at least 2 dims [B,T,...]")
+    B, T = x.shape[:2]
+    valid = (~key_padding_mask).reshape(B * T)
+    return x.reshape(B * T, *x.shape[2:])[valid]
+
+
+def compute_returns_list(rewards_list: List[torch.Tensor], gamma: float, bootstrap: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
+    """
+    Compute discounted returns per episode. Each rewards tensor is [T].
+    Optional bootstrap value per-episode (Tensor[B]) to use as V_{T}.
+    """
+    out: List[torch.Tensor] = []
+    for i, r in enumerate(rewards_list):
+        T = r.shape[0]
+        G = torch.zeros(T, dtype=r.dtype, device=r.device)
+        next_ret = bootstrap[i].item() if (bootstrap is not None) else 0.0
+        for t in range(T - 1, -1, -1):
+            next_ret = r[t] + gamma * next_ret
+            G[t] = next_ret
+        out.append(G)
+    return out
+
+
+def compute_gae_list(
+    rewards_list: List[torch.Tensor],
+    values_list: List[torch.Tensor],
+    gamma: float,
+    lam: float,
+    bootstrap: Optional[torch.Tensor] = None,
+) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    """
+    Compute per-episode GAE advantages and returns.
+    Each rewards/values tensor is [T]; returns = advantages + values.
+    Optional per-episode bootstrap value V_T for last step (0 if None).
+    """
+    adv_list: List[torch.Tensor] = []
+    ret_list: List[torch.Tensor] = []
+    for i, (r, v) in enumerate(zip(rewards_list, values_list)):
+        T = r.shape[0]
+        assert v.shape[0] == T, "values and rewards must have same time length per episode"
+        adv = torch.zeros(T, dtype=r.dtype, device=r.device)
+        gae = 0.0
+        v_next = bootstrap[i] if (bootstrap is not None) else torch.tensor(0.0, dtype=v.dtype, device=v.device)
+        for t in range(T - 1, -1, -1):
+            delta = r[t] + gamma * (v_next if t == T - 1 else v[t + 1]) - v[t]
+            gae = delta + gamma * lam * gae
+            adv[t] = gae
+        ret = adv + v
+        adv_list.append(adv)
+        ret_list.append(ret)
+    return adv_list, ret_list
+
+
+class EpisodeBatch:
+    """
+    Container for per-episode tensors that keeps boundaries by default.
+
+    Expected structure for data lists (per episode):
+      - 'states': Tensor [T, ...] or Dict[str, Tensor[T, ...]]
+      - 'actions': Tensor [T, A]
+      - 'rewards': Tensor [T]
+      - Optional: 'log_probs' [T], 'entropy' [T], 'values' [T]
+    """
+
+    def __init__(self, data_lists: Dict[str, List[TensorLike]]):
+        if not data_lists:
+            raise ValueError("EpisodeBatch requires non-empty data_lists")
+        # Validate consistent episode counts
+        lens = None
+        ref_key = None
+        for k, lst in data_lists.items():
+            if not isinstance(lst, list):
+                raise TypeError(f"Field '{k}' must be a list of per-episode tensors")
+            if len(lst) == 0:
+                continue
+            if lens is None:
+                ref_key = k
+                lens = [self._length_of_episode_item(lst[0])]
+                for item in lst[1:]:
+                    lens.append(self._length_of_episode_item(item))
+            else:
+                other_lens = [self._length_of_episode_item(item) for item in lst]
+                if len(other_lens) != len(lens):
+                    raise ValueError("All fields must have same number of episodes")
+        self.data: Dict[str, List[TensorLike]] = data_lists
+        self.lengths = torch.tensor(lens or [], dtype=torch.long)
+
+    @staticmethod
+    def _length_of_episode_item(x: TensorLike) -> int:
+        if isinstance(x, dict):
+            any_key = next(iter(x))
+            return int(x[any_key].shape[0])
+        return int(x.shape[0])
+
+    @property
+    def num_episodes(self) -> int:
+        return int(self.lengths.numel())
+
+    def to(self, device: torch.device):
+        self.data = to_device(self.data, device)
+        self.lengths = self.lengths.to(device)
+        return self
+
+    def detach(self):
+        self.data = detach(self.data)
+        return self
+
+    def compute_returns(self, gamma: float, gae_lambda: Optional[float] = None) -> "EpisodeBatch":
+        if 'rewards' not in self.data:
+            raise KeyError("'rewards' field is required to compute returns")
+        rewards_list: List[torch.Tensor] = self.data['rewards']  # type: ignore
+
+        if gae_lambda is None:
+            returns = compute_returns_list(rewards_list, gamma)
+            self.data['returns'] = returns
+        else:
+            if 'values' not in self.data:
+                raise KeyError("'values' field is required for GAE computation")
+            values_list: List[torch.Tensor] = self.data['values']  # type: ignore
+            adv, ret = compute_gae_list(rewards_list, values_list, gamma, gae_lambda)
+            self.data['advantages'] = adv
+            self.data['returns'] = ret
+        return self
+
+    def pad(self, pad_value: float = 0.0, fields: Optional[Sequence[str]] = None) -> Tuple[Dict[str, Any], torch.Tensor, torch.Tensor]:
+        """
+        Pad specified fields into [B,T,...]. Returns: (padded_data, key_padding_mask[B,T], lengths[B]).
+        If fields is None, pad all present fields.
+        For 'states' which can be dicts, returns a dict of padded tensors.
+        key_padding_mask is shared across fields based on episode lengths.
+        """
+        if fields is None:
+            fields = list(self.data.keys())
+
+        # Derive mask from lengths once
+        lengths = self.lengths
+        max_len = int(lengths.max().item()) if lengths.numel() > 0 else 0
+        device = lengths.device
+        arange = torch.arange(max_len, device=device)
+        key_padding_mask = arange.unsqueeze(0) >= lengths.unsqueeze(1)
+
+        padded: Dict[str, Any] = {}
+        for k in fields:
+            if k not in self.data:
+                continue
+            lst = self.data[k]
+            if isinstance(lst[0], dict):
+                padded[k], _, _ = pad_dict_sequence_list(lst, pad_value=pad_value, batch_first=True)
+            elif isinstance(lst[0], torch.Tensor):
+                padded[k], _, _ = pad_sequence_list(lst, pad_value=pad_value, batch_first=True)
+            else:
+                raise TypeError(f"Unsupported episode item type for field '{k}'")
+        return padded, key_padding_mask, lengths
+
+    def flatten(self, fields: Optional[Sequence[str]] = None) -> Dict[str, Any]:
+          if fields is None:
+              fields = list(self.data.keys())
+          flat: Dict[str, Any] = {}
+          for k in fields:
+              if k not in self.data:
+                  continue
+              lst = self.data[k]
+              if isinstance(lst[0], dict):
+                  keys = list(lst[0].keys())
+                  flat[k] = {kk: torch.cat([ep[kk] for ep in lst], dim=0) for kk in keys} 
+              else:
+                  flat[k] = torch.cat(lst, dim=0)
+          return flat
+
+    def pack(self, fields: Optional[Sequence[str]] = None, enforce_sorted: bool = False) -> Tuple[Dict[str, Any], torch.Tensor]:
+        """
+        Create PackedSequence objects per requested field for RNN/GRU/LSTM consumption.
+        - For tensor fields: returns PackedSequence
+        - For dict fields: returns dict[str -> PackedSequence]
+        PackedSequence preserves per-episode boundaries and avoids padding.
+        Note: Not suitable for transformer models; use pad() for those.
+
+        Returns: (packed_data, lengths[B])
+        """
+        if fields is None:
+            fields = list(self.data.keys())
+        packed: Dict[str, Any] = {}
+        for k in fields:
+            if k not in self.data:
+                continue
+            lst = self.data[k]
+            if isinstance(lst[0], dict):
+                packed[k] = pack_dict_sequence_list(lst, enforce_sorted=enforce_sorted)
+            elif isinstance(lst[0], torch.Tensor):
+                packed[k] = pack_sequence(lst, enforce_sorted=enforce_sorted)
+            else:
+                raise TypeError(f"Unsupported episode item type for field '{k}'")
+        return packed, self.lengths
+
+
+def normalize_padded_returns(returns, key_padding_mask):
+    valid = ~key_padding_mask
+    if valid.sum() == 0:
+        import logging
+        logging.warning("no valid value to normalize in normalized_padded")
+        return
+    r_valid = returns[valid]
+    r_mean = r_valid.mean()
+    r_std = r_valid.std() + 1e-7
+    normalized_returns = torch.zeros_like(returns)
+    normalized_returns[valid] = (r_valid - r_mean) / r_std
+    return normalized_returns

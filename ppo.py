@@ -8,12 +8,22 @@ import torch.nn.functional as F
 from sample import NormalActionSampler
 np = numpy
 from pool import EpisodesPoolMixin
-from util import RunningNorm
+from util import RunningNorm, EpisodeBatch, normalize_padded_returns, flatten_padded, to_device
 import copy
 
 
 class PPOBase(VPGBase):
-    def __init__(self, policy, value, sampler, policy_lr=0.0001, value_lr=0.001, num_envs=8, discount=0.99, device=torch.device('cpu'), logger=None, num_learning_epochs=4, clip_param=None, **kwargs):
+    """PPO-Clip baseline with sequence support.
+
+    - Supports transformer policies and dict observations using EpisodeBatch
+      padding + key_padding_mask; keeps episode boundaries for log-prob eval.
+    - Follows valid PPO semantics: fixes old_log_probs and advantages for the
+      whole update; recomputes new log_probs/entropy each minibatch/epoch.
+    - Uses a single train_policy interface that takes precomputed
+      log_probs_new (and optional mu for Normal policies) to avoid re-forward
+      duplication and ease maintenance.
+    """
+    def __init__(self, policy, value, sampler, policy_lr=0.0001, value_lr=0.001, num_envs=8, discount=0.99, device=torch.device('cpu'), logger=None, num_learning_epochs=4, clip_param=None, sequence_pad_fields=None, **kwargs):
         super().__init__(policy, value, sampler, policy_lr=policy_lr,
                     num_envs=num_envs, discount=discount,
                     device=device, logger=logger, **kwargs)
@@ -22,181 +32,302 @@ class PPOBase(VPGBase):
         self.hparams.update({'eps': self.eps})
         self.state_normalizer = RunningNorm()
         self.num_learning_epochs = num_learning_epochs
+        self.sequence_pad_fields = sequence_pad_fields or ['states', 'actions', 'returns', 'log_probs']
 
     def learn_from_episodes(self, episodes, num_minibatches=4):
-        # Extract per-episode tensors/lists
-        data_dict = self._extract_episode_data(episodes)
-        states_list = data_dict['states']
-        log_probs_list = data_dict['log_probs']
-        actions_list = data_dict['actions']
-        rewards_list = data_dict['rewards']
-        entropy_list = data_dict['entropy']
-        if not states_list:
+        """
+        Split orchestration similar to ReinforceBase: decide sequence vs flat
+        and delegate to dedicated methods.
+        """
+        if isinstance(episodes, EpisodeBatch):
+            batch = episodes
+        else:
+            data = self._extract_episode_data(episodes)
+            batch = data if isinstance(data, EpisodeBatch) else EpisodeBatch(data)
+
+        if batch.num_episodes == 0:
             return
+        batch = batch.to(self.device)
+        batch.compute_returns(self.discount)
 
-        # Prepare batches: compute discounted returns, aggregate states, returns, etc.
-        states_batch, returns_batch, log_probs_batch, actions_batch, entropy_batch = \
-            self._prepare_batches(states_list, log_probs_list, rewards_list, actions_list, entropy_list)
+        is_sequence_model = hasattr(self.policy, 'temporal_decoder')
+        if is_sequence_model:
+            self.train_sequence_policy(batch, num_minibatches)
+        else:
+            self.train_flat_policy(batch, num_minibatches)
 
-        # Normalize returns
+    def _sequence_pad_batch(self, episode_batch: EpisodeBatch):
+        padded, key_padding_mask, _ = episode_batch.pad(fields=self.sequence_pad_fields)
+        return padded, key_padding_mask
+
+    def _sequence_flatten_states(self, states_padded, key_padding_mask):
+        if isinstance(states_padded, dict):
+            return {k: flatten_padded(v, key_padding_mask) for k, v in states_padded.items()}
+        return flatten_padded(states_padded, key_padding_mask)
+
+    def _sequence_build_policy_obs(self, states_padded, key_padding_mask, padded):
+        if isinstance(states_padded, dict):
+            obs_for_policy = dict(states_padded)
+            obs_for_policy['key_padding_mask'] = key_padding_mask
+            return obs_for_policy
+        return states_padded
+
+    def _sequence_compute_advantages(self, states_flat, returns_flat):
+        with torch.no_grad():
+            values_flat = self.value(states_flat).squeeze(-1)
+        advantages_flat = returns_flat - values_flat
+        adv_mean, adv_std = advantages_flat.mean(), advantages_flat.std() + 1e-8
+        advantages_flat = (advantages_flat - adv_mean) / adv_std
+        return advantages_flat
+
+    def _sequence_update_value(self, states_flat, returns_flat, num_minibatches):
+        value_epochs = 2
+        N = returns_flat.shape[0]
+        if N == 0:
+            return None
+        mini = max(1, N // max(1, num_minibatches))
+        for _ in range(value_epochs):
+            perm = torch.randperm(N, device=self.device)
+            for mb in torch.split(perm, mini):
+                self.optimizer_value.zero_grad()
+                if isinstance(states_flat, dict):
+                    v_pred = self.value({k: v[mb] for k, v in states_flat.items()}).squeeze(-1)
+                else:
+                    v_pred = self.value(states_flat[mb]).squeeze(-1)
+                v_loss = F.mse_loss(v_pred, returns_flat[mb])
+                v_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.value.parameters(), 0.4)
+                self.optimizer_value.step()
+        return v_loss
+
+    def _sequence_update_policy(self, obs_for_policy, actions_padded, key_padding_mask,
+                                old_logp_flat, advantages_flat, num_minibatches):
+        N = old_logp_flat.shape[0]
+        for _ in range(self.num_learning_epochs):
+            perm = torch.randperm(N, device=self.device)
+            for mb in torch.split(perm, max(1, N // max(1, num_minibatches))):
+                _, logp_new_padded, dist = self.sampler(
+                    self.policy,
+                    obs_for_policy,
+                    policy_kwargs=dict(episode_start=None),
+                    actions=actions_padded,
+                    return_distribution=True,
+                )
+                try:
+                    entropy_padded = dist.entropy()
+                except NotImplementedError:
+                    entropy_padded = dist.base_dist.entropy()
+
+                logp_new_flat = flatten_padded(logp_new_padded.unsqueeze(-1), key_padding_mask).squeeze(-1)
+                entropy_flat = flatten_padded(entropy_padded.unsqueeze(-1), key_padding_mask).squeeze(-1)
+
+                mu_mb = None
+                if isinstance(self.sampler, NormalActionSampler):
+                    base = dist.base_dist if isinstance(dist, TransformedDistribution) else dist
+                    base_normal = base.base_dist if isinstance(base, Independent) else base
+                    if hasattr(base_normal, 'loc'):
+                        mu_padded = base_normal.loc  # [B,T,A]
+                        mu_flat = flatten_padded(mu_padded, key_padding_mask)
+                        mu_mb = mu_flat[mb]
+
+                self.train_policy(
+                    log_probs_old=old_logp_flat[mb],
+                    advantages=advantages_flat[mb],
+                    entropy=entropy_flat[mb],
+                    log_probs_new=logp_new_flat[mb],
+                    mu=mu_mb,
+                )
+
+    def train_sequence_policy(self, episode_batch: EpisodeBatch, num_minibatches: int = 4):
+        padded, key_padding_mask = self._sequence_pad_batch(episode_batch)
+        states_padded = padded['states']
+        actions_padded = padded['actions'].to(self.device)
+        returns_padded = padded['returns'].to(self.device)
+        old_logp_padded = padded['log_probs'].to(self.device)
+
+        normalized_returns = normalize_padded_returns(returns_padded, key_padding_mask)
+        states_flat = self._sequence_flatten_states(states_padded, key_padding_mask)
+        returns_flat = flatten_padded(normalized_returns.unsqueeze(-1), key_padding_mask).squeeze(-1)
+        old_logp_flat = flatten_padded(old_logp_padded.unsqueeze(-1), key_padding_mask).squeeze(-1)
+
+        advantages_flat = self._sequence_compute_advantages(states_flat, returns_flat)
+        self._log_training_stats(flatten_padded(actions_padded, key_padding_mask))
+
+        obs_for_policy = self._sequence_build_policy_obs(states_padded, key_padding_mask, padded)
+
+        v_loss = self._sequence_update_value(states_flat, returns_flat, num_minibatches)
+        if v_loss is None:
+            return
+        self.logger.log_scalar("value loss", v_loss)
+
+        self.policy.load_state_dict(self.policy_old.state_dict())
+        self._sequence_update_policy(
+            obs_for_policy,
+            actions_padded,
+            key_padding_mask,
+            old_logp_flat,
+            advantages_flat,
+            num_minibatches,
+        )
+        self.policy_old.load_state_dict(self.policy.state_dict())
+
+    def train_flat_policy(self, episode_batch: EpisodeBatch, num_minibatches: int = 4):
+        flat = episode_batch.flatten(fields=['states', 'actions', 'returns', 'log_probs', 'entropy'])
+        states_batch = to_device(flat['states'], self.device)
+        actions_batch = flat['actions'].to(self.device)
+        returns_batch = flat['returns'].to(self.device)
+        old_logp_batch = flat['log_probs'].to(self.device)
+
         normalized_returns = self._normalize_returns(returns_batch)
-
-        # Log statistics
         self._log_training_stats(actions_batch)
 
-        # Train value network before policy update begins
-        self.train_value(normalized_returns, states_batch)
+        if isinstance(states_batch, dict):
+            value_epochs = 2
+            N = returns_batch.shape[0]
+            mini = max(1, N // max(1, num_minibatches))
+            for _ in range(value_epochs):
+                perm = torch.randperm(N, device=self.device)
+                for mb in torch.split(perm, mini):
+                    self.optimizer_value.zero_grad()
+                    v_pred = self.value({k: v[mb] for k, v in states_batch.items()}).squeeze(-1)
+                    v_loss = F.mse_loss(v_pred, normalized_returns[mb])
+                    v_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.value.parameters(), 0.4)
+                    self.optimizer_value.step()
+            self.logger.log_scalar("value loss", v_loss)
+        else:
+            self.train_value(normalized_returns, states_batch)
 
-        # Sync policies
+        # Compute fixed advantages once (freeze value for policy updates)
+        with torch.no_grad():
+            v_all = self.value(states_batch).squeeze(-1) if not isinstance(states_batch, dict) else self.value(states_batch).squeeze(-1)
+        adv_all = normalized_returns - v_all
+        adv_all = (adv_all - adv_all.mean()) / (adv_all.std() + 1e-8)
+
+        # Initialize current policy from old before PPO updates
         self.policy.load_state_dict(self.policy_old.state_dict())
 
-        # Loop through epochs and call separated method
-        for i in range(self.num_learning_epochs):
-            self._learn_epoch(
-                states_batch, log_probs_batch, normalized_returns,
-                actions_batch, entropy_batch, num_minibatches
-            )
+        N = old_logp_batch.shape[0]
+        batch_size = max(1, N // max(1, num_minibatches))
+        for _ in range(self.num_learning_epochs):
+            perm = torch.randperm(N, device=self.device)
+            for mb_idx in torch.split(perm, batch_size):
+                if isinstance(states_batch, dict):
+                    states_mb = {k: v[mb_idx] for k, v in states_batch.items()}
+                else:
+                    states_mb = states_batch[mb_idx]
+                actions_mb = actions_batch[mb_idx]
+                old_logp_mb = old_logp_batch[mb_idx]
+                adv_mb = adv_all[mb_idx]
 
-        # Update old policy to match newly optimized policy
+                _, logp_new_mb, dist = self.sampler(self.policy, states_mb, actions=actions_mb, return_distribution=True)
+                try:
+                    entropy_new_mb = dist.entropy()
+                except NotImplementedError:
+                    # Handle TransformedDistribution or base distributions
+                    entropy_new_mb = dist.base_dist.entropy() if hasattr(dist, 'base_dist') else entropy_new_mb
+
+                mu_mb = None
+                if isinstance(self.sampler, NormalActionSampler):
+                    base = dist.base_dist if isinstance(dist, TransformedDistribution) else dist
+                    base_normal = base.base_dist if isinstance(base, Independent) else base
+                    if hasattr(base_normal, 'loc'):
+                        mu_mb = base_normal.loc  # [B,A]
+
+                self.train_policy(
+                    log_probs_old=old_logp_mb,
+                    advantages=adv_mb,
+                    entropy=entropy_new_mb,
+                    log_probs_new=logp_new_mb,
+                    mu=mu_mb,
+                )
+
         self.policy_old.load_state_dict(self.policy.state_dict())
 
     def _learn_epoch(self, states_batch, log_probs_batch, normalized_returns,
                     actions_batch, entropy_batch, num_minibatches):
+        """
+        Flat-path epoch learner retained for compatibility.
+        Computes log_probs_new per minibatch and passes into train_policy.
+        """
         dataset = torch.utils.data.TensorDataset(
             states_batch, log_probs_batch, normalized_returns, actions_batch, entropy_batch
         )
 
-        # Ensure non-zero batch size (can happen for very small datasets).
-        batch_size = max(1, len(states_batch) // num_minibatches)
-        data_loader = torch.utils.data.DataLoader(
-            dataset, batch_size=batch_size, shuffle=True
-        )
+        batch_size = max(1, len(states_batch) // max(1, num_minibatches))
+        data_loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
         for (states_minibatch, log_probs_minibatch, returns_minibatch,
             actions_minibatch, entropy_minibatch) in data_loader:
 
-            if len(states_minibatch) < max(batch_size // 2, 2):  # safer minimum size check
+            if len(states_minibatch) < max(batch_size // 2, 2):
                 continue
 
-            # Policy Update: compute advantages from current value estimates
+            # Advantages from current value network
             with torch.no_grad():
                 updated_values = self.value(states_minibatch).squeeze(-1)
-
             advantages = returns_minibatch - updated_values
-            advantage_std = advantages.std()
-            advantage_mean = advantages.mean()
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
+            # New log-probs and entropy for this minibatch
+            _, logp_new_mb, dist = self.sampler(self.policy, states_minibatch, actions=actions_minibatch, return_distribution=True)
+            try:
+                entropy_new_mb = dist.entropy()
+            except NotImplementedError:
+                entropy_new_mb = dist.base_dist.entropy()
 
-            if torch.isnan(advantage_std).any():
-                import pdb; pdb.set_trace()
+            # Optional mu regularization
+            mu_mb = None
+            if isinstance(self.sampler, NormalActionSampler):
+                base = dist.base_dist if isinstance(dist, TransformedDistribution) else dist
+                base_normal = base.base_dist if isinstance(base, Independent) else base
+                if hasattr(base_normal, 'loc'):
+                    mu_mb = base_normal.loc
 
-            self.logger.log_scalar("Raw advantage mean:", advantages.mean().item())
-            self.logger.log_scalar("Raw advantage std:", advantage_std.item())
-
-            # Log action statistics (mean & std) for the current minibatch
-            self.logger.log_scalar(
-                "actions mean",
-                actions_minibatch.to(torch.float32).mean().item(),
-            )
-            self.logger.log_scalar(
-                "actions std",
-                actions_minibatch.to(torch.float32).std().item(),
-            )
-            advantages = (advantages - advantage_mean) / advantage_std
-            # Ensure proper entropy shape
-            if len(entropy_minibatch.shape) == 2 and entropy_minibatch.shape[1] == 1:
-                entropy_minibatch = entropy_minibatch.flatten()
-
-            # Call policy training step
+            # Train policy
             self.train_policy(
-                log_probs_minibatch, advantages, entropy_minibatch, states_minibatch, actions_minibatch
+                log_probs_old=log_probs_minibatch,
+                advantages=advantages,
+                entropy=entropy_new_mb,
+                log_probs_new=logp_new_mb,
+                mu=mu_mb,
             )
 
-    def train_policy(self, log_probs, advantages, entropy=torch.zeros(1), states_batch=None, actions_batch=None):
+    def train_policy(self, log_probs_old, advantages, entropy, log_probs_new, mu=None):
+        """
+        Compute PPO loss given precomputed log_probs_new (current policy)
+        and log_probs_old (behavior policy) along with advantages and entropy.
+        Optionally apply a small mu regularization term for Normal policies.
+        """
         self.optimizer_policy.zero_grad()
 
-        # First, ensure log_probs, advantages, and entropy have the same shape (1D or 2D).
-        # This is already in your code:
-        assert log_probs.shape == advantages.shape, f"Expected same shape for log_probs ({log_probs.shape}) and advantages ({advantages.shape})!"
-        assert log_probs.shape == entropy.shape, f"Expected same shape for log_probs ({log_probs.shape}) and entropy ({entropy.shape})!"
-
-        # Optionally squeeze them to 1D if they are shaped [B,1].
-        # E.g. if you prefer 1D vectors for the ratio calculation, do something like:
-        if log_probs.dim() == 2 and log_probs.shape[1] == 1:
-            log_probs = log_probs.squeeze(-1)
+        # Shape alignment and checks
+        for name, t in (('log_probs_old', log_probs_old), ('advantages', advantages), ('entropy', entropy), ('log_probs_new', log_probs_new)):
+            assert t.dim() in (1, 2), f"{name} must be 1D or 2D, got {t.shape}"
+        if log_probs_old.dim() == 2 and log_probs_old.shape[1] == 1:
+            log_probs_old = log_probs_old.squeeze(-1)
+        if advantages.dim() == 2 and advantages.shape[1] == 1:
             advantages = advantages.squeeze(-1)
+        if entropy.dim() == 2 and entropy.shape[1] == 1:
             entropy = entropy.squeeze(-1)
+        if log_probs_new.dim() == 2 and log_probs_new.shape[1] == 1:
+            log_probs_new = log_probs_new.squeeze(-1)
 
-        # mu loss for normal distribution (continuous action space)
+        assert log_probs_old.shape == advantages.shape == log_probs_new.shape, (
+            f"Shape mismatch: old {log_probs_old.shape}, new {log_probs_new.shape}, adv {advantages.shape}")
+
+        # Entropy loss (thresholded)
+        m = (entropy < self.entropy_thresh)
+        e_loss = -(self.entropy_coef * entropy * m).to(log_probs_old).mean()
+
+        # Optional mu regularizer
         mu_loss = torch.tensor(0.0, device=self.device)
-        if states_batch is not None and isinstance(self.sampler, NormalActionSampler):
-            out = self.policy(states_batch)
-            mu, _ = self.sampler.split_out(out)
+        if mu is not None:
             mu = torch.clamp(mu, -1e6, 1e6)
             mu_loss = 0.01 * torch.mean(mu**2 * (mu.abs() > 2))
             self.logger.log_scalar("mu loss:", mu_loss.item())
 
-        # Sample from new and old policy
-        _, _, dist = self.sampler(self.policy, states_batch)
-        # with torch.no_grad():
-        #     _, _, dist_old = self.sampler(self.policy_old, states_batch)
-
-        # ------------------------------------------------------------------
-        # Correct computation of joint log-probability
-        # ------------------------------------------------------------------
-        #  1. Categorical (discrete) distributions already return a scalar.
-        #  2. Distributions wrapped in `torch.distributions.Independent` (or
-        #     any other multivariate distribution) likewise return a scalar.
-        #  3. Product of independent 1-D Normals (or when a Transform is
-        #     applied) returns a vector of per-dimension log-probs; we **sum**
-        #     these to obtain the joint log-probability.
-        if isinstance(dist, torch.distributions.Categorical):
-            act = actions_batch.squeeze(-1) if actions_batch.dim() == 2 else actions_batch
-            logp = dist.log_prob(act)
-        else:
-            logp = dist.log_prob(actions_batch)
-
-        # If logp already has shape (B,) we keep it; otherwise sum.
-        if logp.dim() == 1:
-            log_probs_new = logp.unsqueeze(-1)
-        else:
-            import warnings
-            warnings.warn(
-                "PPO: summing per-dimension log-probs to obtain joint log-probability.")
-            log_probs_new = logp.sum(-1, keepdim=True)
-        log_probs_old = log_probs.detach()
-        # log_probs_old = dist_old.log_prob(actions_batch)
-
-        # If these are shape [B,1], you might likewise squeeze them:
-        if log_probs_new.dim() == 2 and log_probs_new.shape[1] == 1:
-            log_probs_new = log_probs_new.squeeze(-1)
-        if log_probs_old.dim() == 2 and log_probs_old.shape[1] == 1:
-            log_probs_old = log_probs_old.squeeze(-1)
-
-        # Now assert that they are the same shape as log_probs (which is advantage-size).
-        assert log_probs_new.shape == log_probs.shape, (
-            f"log_probs_new ({log_probs_new.shape}) does not match log_probs ({log_probs.shape})."
-        )
-        assert log_probs_old.shape == log_probs.shape, (
-            f"log_probs_old ({log_probs_old.shape}) does not match log_probs ({log_probs.shape})."
-        )
-
-        # If dist is a TransformedDistribution, use base_dist for entropy
-        if isinstance(dist, TransformedDistribution):
-            entropy_dist = dist.base_dist.entropy()
-        else:
-            entropy_dist = dist.entropy()
-
-        # Possibly squeeze it as well:
-        if entropy_dist.dim() == 2 and entropy_dist.shape[-1] == 1:
-            entropy_dist = entropy_dist.squeeze(-1)
-
-        # Entropy loss
-        m = (entropy_dist < self.entropy_thresh)
-        e_loss = -(self.entropy_coef * entropy_dist * m).to(log_probs).mean()
-
-        # they should be the same shape
-        assert log_probs_new.shape == log_probs_old.shape
+        # PPO clipped objective
         log_ratio = log_probs_new - log_probs_old
         # Clamp log ratio BEFORE exponentiating
         log_ratio_clamped = log_ratio.clamp(-10, 10)
@@ -205,8 +336,8 @@ class PPOBase(VPGBase):
         ratio = torch.exp(log_ratio_clamped).clamp(-18, 18)
 
         # Double‐check ratio shape
-        assert ratio.shape == log_probs.shape, (
-            f"ratio ({ratio.shape}) does not match log_probs ({log_probs.shape}); possible broadcasting!"
+        assert ratio.shape == advantages.shape, (
+            f"ratio ({ratio.shape}) does not match advantages ({advantages.shape}); possible broadcasting!"
         )
 
         # Clip ratio
@@ -244,7 +375,7 @@ class PPOBase(VPGBase):
                 "policy_first_layer_grad_norm",
                 first_layer.weight.grad.norm().item()
             )
-        self.logger.log_scalar("entropy mean:", entropy_dist.mean())
+        self.logger.log_scalar("entropy mean:", entropy.mean())
         self.logger.log_scalar("entropy loss:", e_loss)
 
         self.optimizer_policy.step()
@@ -307,11 +438,27 @@ class PPOMI(PPO):
                 self.logger.log_scalar("Raw advantage mean:", advantages.mean().item())
                 self.logger.log_scalar("Raw advantage std:", std.item())
 
-                # Finally, train the policy (using log probs computed from current policy)
-                if len(entropy_minibatch.shape) == 2 and entropy_minibatch.shape[1] == 1:
-                    entropy_minibatch = entropy_minibatch.flatten()
+                # Recompute new log-probs and entropy under current policy
+                _, logp_new_mb, dist = self.sampler(self.policy, states_minibatch, actions=actions_minibatch, return_distribution=True)
+                try:
+                    entropy_new_mb = dist.entropy()
+                except NotImplementedError:
+                    entropy_new_mb = dist.base_dist.entropy()
 
-                self.train_policy(log_probs_minibatch, advantages, entropy_minibatch, states_minibatch, actions_minibatch)
+                # Optional mu
+                mu_mb = None
+                if isinstance(self.sampler, NormalActionSampler):
+                    out = self.policy(states_minibatch)
+                    mu_mb, _ = self.sampler.split_out(out)
+
+                # Train the policy using precomputed log_probs_new
+                self.train_policy(
+                    log_probs_old=log_probs_minibatch,
+                    advantages=advantages,
+                    entropy=entropy_new_mb,
+                    log_probs_new=logp_new_mb,
+                    mu=mu_mb,
+                )
         self.policy_old.load_state_dict(self.policy.state_dict())
 
     def _prepare_batches(self, states_list, log_probs_list, rewards_list, actions_list, entropy_list):

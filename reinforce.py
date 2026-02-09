@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.distributions import TransformedDistribution
+from util import RunningNorm, EpisodeBatch, to_device
 from sample import *
 np = numpy
 
@@ -59,20 +60,14 @@ class ReinforceBase(Agent):
         self.reset_episodes()
         self.active_envs = np.ones(self.num_envs, dtype=bool)
 
-    def process_states(self, state, done):
-        active_mask = ~done
-        if not any(active_mask):
-            return np.zeros((self.num_envs,) + self.policy.action_shape)
+    def process_states(self, state, episode_start):
+        return state
 
-        active_states = state[active_mask]
-        if not isinstance(active_states, torch.Tensor):
-            active_states = torch.FloatTensor(active_states)
-        return active_states
-
-    def get_action(self, state, done):
+    def get_action(self, state, episode_start):
         policy = self.get_policy_for_action()
-        active_states = self.process_states(state, done)
-        actions, log_probs, dist = self.sampler(policy, active_states)
+        active_states = self.process_states(state, episode_start)
+        policy_kwargs = dict(episode_start=episode_start)
+        actions, log_probs, dist = self.sampler(policy, active_states, policy_kwargs)
 
         # ------------------------------------------------------------------
         # Obtain entropy safely. Some `TransformedDistribution` instances do
@@ -98,19 +93,11 @@ class ReinforceBase(Agent):
         # handling, **without** accidentally reducing across the batch.
         if entropy.dim() == 1:
             entropy = entropy.unsqueeze(-1)
-        active_mask = ~done
-        full_actions = torch.zeros(
-            (active_mask.shape[0], actions.shape[1] if len(actions.shape) > 1 else 1)
-        ).to(actions)
-        full_actions[active_mask] = actions.reshape(full_actions[active_mask].shape)
 
-        active_env_indices = torch.where(active_mask)[0]
-        for idx, env_idx in enumerate(active_env_indices):
-            self.add_transition(env_idx, active_states[idx], actions[idx], log_probs[idx], entropy[idx])
+        self.add_transition_batch(active_states, actions, log_probs, entropy)
+        return actions
 
-        return full_actions
-
-    def update(self, obs, actions, rewards, dones, next_obs, info=None):
+    def update(self, rewards, dones, info=None, **kwargs):
         for env_idx in range(self.num_envs):
             self.add_reward(env_idx, rewards[env_idx])
 
@@ -142,39 +129,108 @@ class ReinforceBase(Agent):
         # Calculate statistics
         mean_length = np.mean(episode_lengths)
         mean_return = torch.mean(torch.stack(episode_returns))
-        std_return = torch.mean(torch.stack(episode_returns))
+        std_return = torch.std(torch.stack(episode_returns))
         self.logger.log_scalar(f"Average episode length",  mean_length)
         self.logger.log_scalar(f"Average return",  mean_return)
         self.logger.log_scalar(f"return std",  std_return)
         self.logger.log_scalar(f"min return",  min(episode_returns))
         self.logger.log_scalar(f"max return",  max(episode_returns))
 
-    def learn_from_episodes(self, episodes):
-        # Extract per-episode tensors/lists
-        data_dict = self._extract_episode_data(episodes)
-        states_list = data_dict['states']
-        log_probs_list = data_dict['log_probs']
-        actions_list = data_dict['actions']
-        rewards_list = data_dict['rewards']
-        entropy_list = data_dict['entropy']
-        if not states_list:
-            return
+    def train_sequence_policy(self, episode_batch: EpisodeBatch):
+        # Prepare padded tensors [B,T,...] and key padding mask
+        # we will pass padded states to sequence policy model
+        fields = ['states', 'actions', 'returns']
+        padded, key_padding_mask, lengths = episode_batch.pad(fields=fields)
 
-        # Prepare batches: compute discounted returns, and then aggregate states, returns, etc.
-        states_batch, returns_batch, log_probs_batch, actions_batch, entropy_batch = self._prepare_batches(
-            states_list, log_probs_list, rewards_list, actions_list, entropy_list
+        # Move to device (EpisodeBatch.to already moved lists; pad produces new tensors)
+        states_padded = to_device(padded['states'], self.device)
+        actions_padded = padded['actions'].to(self.device)
+        returns_padded = padded['returns'].to(self.device)
+        key_padding_mask = key_padding_mask.to(self.device)
+
+        # Normalize returns over valid (non-padded) steps
+        normalized_returns = normalize_padded_returns(returns_padded, key_padding_mask)
+        self.logger.log_scalar("adv normalized max", normalized_returns[valid].max())
+
+        # Log action stats over valid steps
+        self._log_training_stats(actions_padded[valid])
+
+        # Policy forward via sampler to construct distribution; evaluate on recorded actions
+        obs_for_policy = states_padded
+        assert isinstance(obs_for_policy, dict)
+        obs_for_policy['key_padding_mask'] = key_padding_mask
+        _, _, dist = self.sampler(
+            self.policy,
+            obs_for_policy,
+                policy_kwargs=dict(episode_start=None),
+            actions=actions_padded,
+            return_distribution=True,
         )
 
-        # Normalize the returns
-        normalized_returns = self._normalize_returns(returns_batch)
-        self.logger.log_scalar("adv normalized max", normalized_returns.max())
+        # Per-step log-probs and entropy, masked
+        log_probs_seq = dist.log_prob(actions_padded)
+        try:
+            entropy_seq = dist.entropy()
+        except NotImplementedError:
+            entropy_seq = dist.base_dist.entropy()
 
-        # Log statistics
+        # Flatten valid steps to 1D for existing train_policy API
+        from util import flatten_padded
+        log_probs_flat = flatten_padded(log_probs_seq.unsqueeze(-1), key_padding_mask).squeeze(-1)
+        returns_flat = flatten_padded(normalized_returns.unsqueeze(-1), key_padding_mask).squeeze(-1)
+        entropy_flat = flatten_padded(entropy_seq.unsqueeze(-1), key_padding_mask).squeeze(-1)
+
+        # Train with flattened tensors; avoid mu regularizer re-forward by not passing states
+        self.train_policy(log_probs_flat, returns_flat, entropy_flat, states_batch=None, actions=actions_padded)
+
+    def learn_from_episodes(self, episodes):
+        """
+        Accept either a raw list of episodes (legacy) or an EpisodeBatch.
+        For transformer policies, keep episode boundaries via padding + mask and
+        compute per-step log-probs/entropy from current policy before flattening
+        valid steps for the REINFORCE loss.
+        """
+        # Normalize input into EpisodeBatch with returns
+        if isinstance(episodes, EpisodeBatch):
+            episode_batch = episodes
+        else:
+            episode_batch = self._extract_episode_data(episodes)
+        if episode_batch.num_episodes == 0:
+            return
+        episode_batch = episode_batch.to(self.device)
+        episode_batch.compute_returns(self.discount)
+
+        # Heuristic: treat policies with a temporal decoder attribute as sequence models
+        is_sequence_model = hasattr(self.policy, 'temporal_decoder')
+
+        if is_sequence_model:
+            self.train_sequence_policy(episode_batch)
+        else:
+            self.train_flat_policy(episode_batch)
+
+    def train_flat_policy(self, episode_batch):
+        # Non-sequence fallback: flatten all steps across episodes
+        flat = episode_batch.flatten(fields=['states', 'actions', 'returns'])
+        states_batch = to_device(flat['states'], self.device)
+        actions_batch = flat['actions'].to(self.device)
+        returns_batch = flat['returns'].to(self.device)
+
+        normalized_returns = self._normalize_returns_running(returns_batch)
+        self.logger.log_scalar("adv normalized max", normalized_returns.max())
         self._log_training_stats(actions_batch)
-        if len(entropy_batch.shape) == 2 and entropy_batch.shape[1] == 1:
-            entropy_batch = entropy_batch.flatten()
-        # Finally, train the policy (using log probs computed from current policy)
-        self.train_policy(log_probs_batch, normalized_returns, entropy_batch, states_batch, actions_batch)
+
+        # Recompute log-probs and entropy from current policy for consistency
+        _, log_probs, dist = self.sampler(self.policy, states_batch)
+        if isinstance(dist, TransformedDistribution):
+            entropy = dist.base_dist.entropy()
+        else:
+            entropy = dist.entropy()
+        if log_probs.shape != normalized_returns.shape:
+            log_probs = log_probs.reshape(normalized_returns.shape)
+        if entropy.shape != normalized_returns.shape:
+            entropy = entropy.reshape(normalized_returns.shape)
+
+        self.train_policy(log_probs, normalized_returns, entropy, states_batch, actions_batch)
 
     def _extract_episode_data2(self, episodes):
         """
@@ -205,16 +261,18 @@ class ReinforceBase(Agent):
             entropy_list.append(torch.stack(entropy))
         return states_list, log_probs_list, rewards_list, actions_list, entropy_list
 
-    def _extract_episode_data(self, episodes):
+    def _extract_episode_data(self, episodes) -> EpisodeBatch:
         """
         From a list of episodes, each consisting of a sequence of tuples with various data elements,
         extract and organize the data by type across all episodes.
+
+        converts list of episodes to a dictionary where keys are data types and values are lists of tensors (one tensor per episode)
 
         Args:
             episodes: List of episodes, where each episode is a list of data tuples
 
         Returns:
-            Dictionary where keys are data types and values are lists of tensors (one tensor per episode)
+            EpisodeBatch
         """
         # Define the structure of our data tuple and corresponding empty lists
         data_types = self.data_types
@@ -239,12 +297,26 @@ class ReinforceBase(Agent):
                 if data_type == 'rewards':
                     # Rewards are typically scalar values
                     data_lists[data_type].append(torch.tensor(episode_data[data_type], dtype=torch.float32))
+                elif data_type == 'states':
+                    # Support dict observations by stacking per key
+                    first_state = episode_data[data_type][0]
+                    if isinstance(first_state, dict):
+                        # Validate consistent keys across the episode
+                        keys = set(first_state.keys())
+                        for s in episode_data[data_type]:
+                            assert isinstance(s, dict) and set(s.keys()) == keys, \
+                                "All state dicts in an episode must have identical keys"
+                        stacked = {k: torch.stack([s[k] for s in episode_data[data_type]], dim=0) for k in keys}
+                        data_lists[data_type].append(stacked)
+                    else:
+                        data_lists[data_type].append(torch.stack(episode_data[data_type], dim=0))
                 else:
-                    # Other data are typically already tensors
-                    data_lists[data_type].append(torch.stack(episode_data[data_type]))
+                    # Other data are tensors; stack along time
+                    data_lists[data_type].append(torch.stack(episode_data[data_type], dim=0))
 
         # Return the organized data
-        return data_lists
+        batch = EpisodeBatch(data_lists)
+        return batch
 
     def _compute_discounted_returns(self, rewards):
         """
@@ -267,7 +339,10 @@ class ReinforceBase(Agent):
         returns_list = [self._compute_discounted_returns(rewards) for rewards in rewards_list]
 
         # Concatenate all episodes along dimension 0 (the time dimension)
-        states_batch = torch.cat(states_list, dim=0).to(self.device)
+        if isinstance(states_list[0], dict):
+            states_batch = {k: torch.cat([s[k] for s in states_list], dim=0).to(self.device) for k in states_list[0].keys()}
+        else:
+            states_batch = torch.cat(states_list, dim=0).to(self.device)
         returns_batch = torch.cat(returns_list, dim=0).to(self.device)
         actions_batch = torch.cat(actions_list, dim=0).to(self.device)
         log_probs_batch = torch.cat(log_probs_list, dim=0).to(self.device).reshape(returns_batch.shape)
@@ -275,7 +350,7 @@ class ReinforceBase(Agent):
 
         return states_batch, returns_batch, log_probs_batch, actions_batch, entropy_batch
 
-    def _normalize_returns(self, returns_batch):
+    def _normalize_returns_running(self, returns_batch):
         """
         Normalize returns using a running mean and std.
         """
@@ -308,6 +383,7 @@ class ReinforceBase(Agent):
         )
 
     def train_policy(self, log_probs, returns, entropy=torch.zeros(1), states_batch=None, actions=None):
+        import pdb;pdb.set_trace()
         assert log_probs.shape == returns.shape, "Expected same shape for log_probs and returns!"
         assert log_probs.shape == entropy.shape, "Expected same shape for log_probs and entropy!"
         self.optimizer_policy.zero_grad()
@@ -318,7 +394,7 @@ class ReinforceBase(Agent):
         # mu loss for normal distribution (continuous action space)
         mu_loss = torch.tensor(0.0, device=self.device)
         if states_batch is not None and isinstance(self.sampler, NormalActionSampler):
-            out = self.policy(states_batch)
+            out = self.policy(states_batch, episode_start=None)
             mu, _ = self.sampler.split_out(out)
             mu = torch.clamp(mu, -1e6, 1e6)
             mu_loss = torch.mean(mu**2)
@@ -419,7 +495,7 @@ class ReinforceWithOldEpisodes(ReinforceBase, EpisodesOldPoolMixin):
 
 
         # Normalize the returns
-        normalized_returns = self._normalize_returns(returns_batch)
+        normalized_returns = self._normalize_returns_running(returns_batch)
 
         # Log statistics
         self._log_training_stats(actions_batch)
@@ -580,7 +656,7 @@ class ReinforceWithPrediction(ReinforceBase, EpisodesPoolMixin):
         augmented_returns = returns_batch + prediction_bonus
 
         # Normalize returns
-        normalized_returns = self._normalize_returns(augmented_returns)
+        normalized_returns = self._normalize_returns_running(augmented_returns)
 
         # Train predictor
         prediction_loss = self.train_predictor(states_batch, actions_batch, next_states_batch)

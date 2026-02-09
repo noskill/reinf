@@ -53,7 +53,7 @@ def setup_env(env_cfg: Union['ManagerBasedRLEnvCfg', 'DirectRLEnvCfg', 'DirectMA
     #     env = multi_agent_to_single_agent(env)
 
     # Add the vectorized environment wrapper
-    env = VectorEnvWrapper(env, return_dict_observations=False)
+    env = VectorEnvWrapper(env, return_dict_observations=True)
 
     return env
 
@@ -135,22 +135,22 @@ class OnPolicyTrainer:
 
         for i in range(start_episode, start_episode + self.n_episodes):
             obs = self.env.reset()
-            done = torch.zeros(self.env.num_envs, dtype=bool)
+            episode_start = torch.ones(self.env.num_envs, dtype=bool)
             self.agent.episode_start()
             info = None
-            while not done.all():
-                action = self.agent.get_action(obs, done)
+            while True:
+                action = self.agent.get_action(obs, episode_start)
                 if action.ndim == 1:
                     action = action.unsqueeze(1)
                 next_obs, reward, terminated, info = self.env.step(action)
                 if torch.isnan(reward).any():
                     import pdb;pdb.set_trace()
-                done = terminated
+                episode_start = terminated
                 terminal_reward = self.compute_terminal_reward(terminated, info)
                 if not isinstance(reward, torch.Tensor):
                     reward = torch.tensor(reward, dtype=torch.float32, device=self.env.device)
                 reward = reward + terminal_reward.to(reward.device)
-                changed = self.agent.update(obs, action, reward, done, next_obs, info=info)
+                changed = self.agent.update(rewards=reward, dones=episode_start, info=info)
                 if changed and info is not None and "cube_displacement" in info and self.agent.logger is not None:
                     displacement = info["cube_displacement"]
                     if isinstance(displacement, torch.Tensor):

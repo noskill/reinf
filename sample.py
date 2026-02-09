@@ -11,6 +11,8 @@ class ActionSampler:
         raise NotImplementedError
 
     def _prepare_state(self, state):
+        if isinstance(state, dict):
+            return state
         if not isinstance(state, torch.Tensor):
             state = torch.FloatTensor(state)
         if state.dim() == 1:
@@ -33,11 +35,11 @@ class NormalActionSampler(ActionSampler):
         self.reparameterize = reparameterize
         self.transform = transform
 
-    def __call__(self, policy, state):
+    def __call__(self, policy, state, policy_kwargs=dict(), actions=None, return_distribution=False):
         state = self._prepare_state(state)
 
-        # Forward pass: network outputs [mu, log_sigma] per action dimension
-        out = policy(state)
+        # Forward pass: network outputs [.., 2 * action_dim]
+        out = policy(state, **policy_kwargs)
         assert out.shape[-1] == 2 * self.action_dim, \
             f"Network output dimension {out.shape[-1]} does not match 2 * action_dim ({2 * self.action_dim})"
 
@@ -46,26 +48,14 @@ class NormalActionSampler(ActionSampler):
 
         # Clamp log_sigma for numerical stability
         log_sigma = torch.clamp(log_sigma, -20, 2)
-
-        # Get sigma from log_sigma
         sigma = F.softplus(log_sigma) + 1e-6
 
-        # Base Normal distribution (diagonal covariance)
+        # Base Normal distribution (diagonal covariance), aggregate over event dims
         base_dist = Normal(mu, sigma)
-
-        # Construct the distribution such that `log_prob` already aggregates over
-        # the *event* dimensions, yielding exactly **one** scalar per action
-        # vector in the batch.
-
-        # Prepare an `Independent` wrapper up-front so we can refer to it
-        # regardless of the branch taken below.
         independent_dist = Independent(base_dist, 1)
 
+        # Optional tanh + affine transform to match action bounds
         if self.transform:
-            # 1. First re-interpret the Normal as an `Independent` distribution so
-            #    the event dim (=`action_dim`) gets treated jointly.
-            # 2. Apply non-linear squashing (tanh) followed by affine scaling to
-            #    match the environment action bounds.
             transforms = [
                 TanhTransform(cache_size=1),
                 AffineTransform(
@@ -73,43 +63,38 @@ class NormalActionSampler(ActionSampler):
                     scale=(self.a_max - self.a_min) / 2.0,
                 ),
             ]
-            transformed_dist = TransformedDistribution(independent_dist, transforms)
+            dist = TransformedDistribution(independent_dist, transforms)
         else:
-            transformed_dist = independent_dist
+            dist = independent_dist
 
-        # Sample action (with reparameterization if requested)
-        if self.reparameterize:
-            action = transformed_dist.rsample()
+        # Evaluate provided actions or sample
+        if actions is not None:
+            # Use given actions to compute log-probs; do not sample
+            log_prob = dist.log_prob(actions)
+            action = actions
         else:
-            action = transformed_dist.sample()
+            if self.reparameterize:
+                action = dist.rsample()
+            else:
+                action = dist.sample()
+            action = torch.clamp(action, self.a_min + 1e-4, self.a_max - 1e-4)
+            log_prob = dist.log_prob(action)
 
-        # Clamp action to valid boundaries
-        action = torch.clamp(action, self.a_min + 1e-4, self.a_max - 1e-4)
-
-        # Log probability of selected action. `TransformedDistribution.log_prob` already
-        # aggregates across the event dimensions, so additional averaging is unnecessary
-        # and incorrectly shrinks the tensor. We keep the original shape returned by
-        # `log_prob` to maintain consistency with the action/entropy tensors.
-        log_prob = transformed_dist.log_prob(action)
-
-        # ------------------------------------------------------------------
-        # Shape safety checks
-        # ------------------------------------------------------------------
-        # Expect *exactly* one log-prob scalar per sample (B,) or (B,1)
-        assert log_prob.dim() == 1 or (log_prob.dim() == 2 and log_prob.shape[1] == 1), \
-            f"log_prob has invalid shape {log_prob.shape}; expected (B,) or (B,1)."
-
-        # Likewise, each entropy call on `transformed_dist` must obey this rule
-        # Compute entropy if available; fall back to base distribution otherwise
+        # Entropy: prefer direct computation; fall back to independent (pre-transform)
         try:
-            entropy = transformed_dist.entropy()
+            entropy = dist.entropy()
         except NotImplementedError:
-            entropy = transformed_dist.base_dist.entropy()
+            entropy = independent_dist.entropy()
 
-        assert entropy.dim() == 1 or (entropy.dim() == 2 and entropy.shape[1] == 1), \
-            f"entropy has invalid shape {entropy.shape}; expected (B,) or (B,1)."
+        # Shape safety: allow [B] or [B,T]
+        if log_prob.dim() not in (1, 2):
+            raise AssertionError(f"log_prob has invalid shape {log_prob.shape}; expected (B,) or (B,T)")
+        if entropy.dim() not in (1, 2):
+            raise AssertionError(f"entropy has invalid shape {entropy.shape}; expected (B,) or (B,T)")
 
-        return action, log_prob, transformed_dist
+        if return_distribution:
+            return action, log_prob, dist
+        return action, log_prob, dist
 
     def split_out(self, out):
         return  torch.chunk(out, chunks=2, dim=-1)
@@ -120,36 +105,67 @@ class BetaActionSampler(ActionSampler):
         self.a_min = a_min
         self.a_max = a_max
 
-    def __call__(self, policy, state):
+    def __call__(self, policy, state, policy_kwargs=dict(), actions=None, return_distribution=False):
         state = self._prepare_state(state)
 
-        params = policy(state)
-        alpha = params[..., :1]
-        beta = params[..., 1:]
+        params = policy(state, **policy_kwargs)
+        # Assume 1D action by default; if more dims, split equally
+        half = params.shape[-1] // 2
+        alpha = params[..., :half]
+        beta = params[..., half:]
 
         # Clip parameters
         alpha = F.softplus(alpha) + 1e-6
         beta = F.softplus(beta) + 1e-6
 
         base_dist = Beta(alpha, beta)
+        # Apply affine scaling to match action bounds
         transforms = [AffineTransform(loc=self.a_min, scale=self.a_max - self.a_min)]
-        transformed_dist = TransformedDistribution(base_dist, transforms)
+        dist = TransformedDistribution(base_dist, transforms)
 
-        action = transformed_dist.sample()
-        action = torch.clamp(action, -self.a_min + 1e-6, self.a_max - 1e-6)
+        if actions is not None:
+            action = actions
+            log_prob = dist.log_prob(action)
+        else:
+            action = dist.sample()
+            action = torch.clamp(action, self.a_min + 1e-6, self.a_max - 1e-6)
+            log_prob = dist.log_prob(action)
 
-        log_prob = transformed_dist.log_prob(action)
-        log_prob = log_prob.sum(dim=-1, keepdim=True)
+        # Sum over event dims if multi-dimensional action
+        if log_prob.dim() >= 2 and log_prob.shape[-1] != 0:
+            # If Beta returned elementwise, reduce last dim
+            if action.dim() == log_prob.dim() and log_prob.shape[-1] == action.shape[-1]:
+                log_prob = log_prob.sum(dim=-1)
 
-        return action, log_prob, transformed_dist
+        try:
+            entropy = dist.entropy()
+        except NotImplementedError:
+            entropy = base_dist.entropy()
+
+        if return_distribution:
+            return action, log_prob, dist
+        return action, log_prob, dist
 
 
 class DiscreteActionSampler(ActionSampler):
-    def __call__(self, policy, state):
+    def __call__(self, policy, state, policy_kwargs=dict(), actions=None, return_distribution=False):
         state = self._prepare_state(state)
-        logits = policy(state)
+        logits = policy(state, **policy_kwargs)
         dist = Categorical(logits=logits)
-        action = dist.sample()
-        log_prob = dist.log_prob(action)
 
-        return action.to(torch.int32), log_prob.unsqueeze(-1), dist
+        if actions is not None:
+            action = actions.to(torch.long)
+            log_prob = dist.log_prob(action)
+        else:
+            action = dist.sample()
+            log_prob = dist.log_prob(action)
+
+        # Keep shape as [B] or [B,T]; add last dim only if needed by callers
+        if log_prob.dim() == 1:
+            log_prob_out = log_prob
+        else:
+            log_prob_out = log_prob  # [B,T]
+
+        if return_distribution:
+            return action.to(torch.int32), log_prob_out, dist
+        return action.to(torch.int32), log_prob_out, dist

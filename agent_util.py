@@ -9,9 +9,56 @@ from ppo import PPO
 from sample import DiscreteActionSampler, NormalActionSampler
 
 from agent import Agent
-from networks import PolicyNetwork, ValueNetwork as Value, SkillDiscriminator
-from util import StateExtractor
+from networks import PolicyNetwork, ValueNetwork as Value
 
+
+def create_networks_with_transformer(
+    obs_space,
+    action_dim: int,
+    *,
+    hidden_dim=256,
+    device='cpu',
+    skill_dim: int = None,
+    discrete_skills: bool = True,
+):
+    """Create transformer-based policy and value networks.
+
+    - Policy: IsaacLabPolicy or IsaacLabSkillPolicy (DIAYN) outputs 2 * base_action_dim.
+    - Value: IsaacLabValue mirrors the encoder stack without temporal decoding.
+    """
+    from types import SimpleNamespace
+    from tr_policy import IsaacLabPolicy, IsaacLabSkillPolicy, IsaacLabValue
+
+    # Derive base action dimension for continuous actions (policy outputs 2*base)
+    base_action_dim = action_dim // 2 if (action_dim % 2 == 0 and action_dim > 1) else action_dim
+
+    # Infer n_cubes from observation space when possible
+    n_cubes = 3
+    try:
+        if hasattr(obs_space, 'spaces') and 'cube_positions' in obs_space.spaces:
+            cp = obs_space.spaces['cube_positions']
+            if hasattr(cp, 'shape') and cp.shape[-1] % 3 == 0:
+                n_cubes = cp.shape[-1] // 3
+    except Exception:
+        pass
+
+    # Build a lightweight config namespace for the transformer blocks
+    cfg = SimpleNamespace(hidden_size=hidden_dim)
+    if skill_dim is not None:
+        policy = IsaacLabSkillPolicy(
+            cfg,
+            n_cubes=n_cubes,
+            action_dim=base_action_dim,
+            skill_dim=skill_dim,
+            discrete=discrete_skills,
+        ).to(device)
+    else:
+        policy = IsaacLabPolicy(cfg, n_cubes=n_cubes, action_dim=base_action_dim).to(device)
+
+    # Transformer-based value network without temporal decoding
+    value = IsaacLabValue(cfg, n_cubes=n_cubes).to(device)
+
+    return policy, value
 
 # Utility functions for creating networks and agents
 def create_networks(
@@ -78,7 +125,7 @@ def create_agent(args_cli, env_cfg, env, logger):
     obs_space = env.observation_space
     action_space = env.action_space
     obs_dim = gym.spaces.flatdim(policy_obs_space)
-    state_extractor = StateExtractor.from_dict_observation(policy_obs_space)
+    state_extractor = None
 
     if isinstance(action_space, gym.spaces.Discrete):
         action_dim = action_space.n
@@ -98,19 +145,14 @@ def create_agent(args_cli, env_cfg, env, logger):
     base_dropout = 0.0
     diayn_dropout = 0.1
 
-    def build_networks(input_dim):
-        hidden_dims = diayn_hidden_dims if uses_diayn else base_hidden_dims
-        activation = diayn_activation if uses_diayn else base_activation
-        layer_norm = diayn_layer_norm if uses_diayn else base_layer_norm
-        dropout = diayn_dropout if uses_diayn else base_dropout
-        return create_networks(
-            obs_dim=input_dim,
+    def build_networks(use_skill: bool = False, skill_dim: int = None, discrete_skills: bool = True):
+        return create_networks_with_transformer(
+            obs_space=policy_obs_space,
             action_dim=action_dim,
             device=device,
-            hidden_dims=hidden_dims,
-            activation=activation,
-            layer_norm=layer_norm,
-            dropout=dropout,
+            hidden_dim=diayn_hidden_dims[0] if uses_diayn else base_hidden_dims[0],
+            skill_dim=skill_dim if use_skill else None,
+            discrete_skills=discrete_skills,
         )
 
     # Create sampler
@@ -130,7 +172,7 @@ def create_agent(args_cli, env_cfg, env, logger):
 
     common_args = dict(state_extractor=state_extractor)
     if args_cli.algorithm == "ppo":
-        policy, value = build_networks(obs_dim)
+        policy, value = build_networks()
         num_learning_epochs = 4
         agent = PPO(
             policy=policy,
@@ -148,7 +190,7 @@ def create_agent(args_cli, env_cfg, env, logger):
             **common_args
         )
     elif args_cli.algorithm == "vpg":
-        policy, value = build_networks(obs_dim)
+        policy, value = build_networks()
         agent = VPG(
             policy=policy,
             value=value,
@@ -163,7 +205,7 @@ def create_agent(args_cli, env_cfg, env, logger):
             **common_args
         )
     elif args_cli.algorithm in ('ppodr', "ppod", "ppod_novel", "ppodr_novel"):
-        reward_scale = 0.1
+        reward_scale = 10
         continious = args_cli.continious_skills
         if args_cli.algorithm == 'ppodr':
             from ppod import PPODRunning as PPOD
@@ -181,26 +223,27 @@ def create_agent(args_cli, env_cfg, env, logger):
         skill_dim = args_cli.skill_dim
         embedding_dim = max(embedding_dim * 2, 64)
         args_cli.embedding_dim = embedding_dim
-        policy, value = build_networks(obs_dim + embedding_dim)
+        policy, value = build_networks(
+            use_skill=True,
+            skill_dim=skill_dim,
+            discrete_skills=not continious,
+        )
         num_learning_epochs = 4
-        discard_steps = 50
-        if state_extractor is None:
-            raise RuntimeError("DIAYN requires dict observations to extend with skill field")
-        state_extractor.add_field_at_end("skill", shape=(skill_dim if continious else 1,))
-
-        sk_size = state_extractor.get_fields_size('skill')
-        # desc_fields = ['object', 'cube_positions', 'cube_orientations', 'eef_pos', 'eef_quat', 'gripper_pos']
-        desc_fields = ['cubes_positions_centered', 'cube_orientations']
-        desc_input_size = state_extractor.get_fields_size(desc_fields)
-        # Discriminator supports continuous or discrete
-        discriminator = SkillDiscriminator(
-            desc_input_size,
-            skill_dim,
-            hidden_dims=list(diayn_hidden_dims),
-            continuous=continious,
-            activation=diayn_activation,
-            layer_norm=True,
-            dropout=0.1,
+        discard_steps = 20
+        desc_fields = ['cube_positions', 'cube_orientations']
+        from types import SimpleNamespace
+        from tr_policy import IsaacLabDiscriminator
+        cfg = SimpleNamespace(hidden_size=diayn_hidden_dims[0])
+        n_cubes = 3
+        if hasattr(policy_obs_space, 'spaces') and 'cube_positions' in policy_obs_space.spaces:
+            cp = policy_obs_space.spaces['cube_positions']
+            if hasattr(cp, 'shape') and cp.shape[-1] % 3 == 0:
+                n_cubes = cp.shape[-1] // 3
+        discriminator = IsaacLabDiscriminator(
+            cfg,
+            n_cubes=n_cubes,
+            skill_dim=skill_dim,
+            fields=desc_fields,
         ).to(device)
         agent = PPOD(
             policy=policy,
@@ -232,7 +275,7 @@ def create_agent(args_cli, env_cfg, env, logger):
             action_dim = action_space.shape[0] * 2
         else:
             action_dim = action_space.n
-        policy, _ = build_networks(obs_dim)
+        policy, _ = build_networks()
         agent = Reinforce(
             policy=policy,
             sampler=sampler,

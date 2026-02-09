@@ -13,8 +13,8 @@ class Agent():
     def episode_start(self):
         pass
 
-    def get_action(self, state, done):
+    def get_action(self, state, episode_start):
         pass
 
-    def update(self, obs, actions, rewards, dones, next_obs, info=None):
+    def update(self, rewards, dones, info=None, **kwargs):
         pass
