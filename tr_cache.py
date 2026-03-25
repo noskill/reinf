@@ -60,10 +60,11 @@ class LayerCache(CacheLayerMixin):
     should be written; rows can be truncated (reset) or appended independently.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, detach_on_pop: bool = False) -> None:
         super().__init__()
         self._k_rows: List[Optional[torch.Tensor]] = []
         self._v_rows: List[Optional[torch.Tensor]] = []
+        self.detach_on_pop = bool(detach_on_pop)
 
     def __len__(self) -> int:
         return max(len(self._k_rows), len(self._v_rows))
@@ -97,7 +98,6 @@ class LayerCache(CacheLayerMixin):
                 self._v_rows[i] = self._v_rows[i].to(device=device, dtype=dtype)
         return self
 
-    @torch.no_grad()
     def update(
         self,
         key_states: torch.Tensor,   # [B, H, T_new, D]
@@ -163,6 +163,10 @@ class LayerCache(CacheLayerMixin):
             if window_size is not None and window_size > 0 and k_row.shape[1] > window_size:
                 k_row = k_row[:, -window_size:, :]
                 v_row = v_row[:, -window_size:, :]
+                if self.detach_on_pop:
+                    # Optional truncated-BPTT behavior at window pop boundary.
+                    k_row = k_row.detach()
+                    v_row = v_row.detach()
             self._k_rows[b] = k_row
             self._v_rows[b] = v_row
             max_len = max(max_len, k_row.shape[1])
@@ -230,13 +234,14 @@ class PositionBasedDynamicCache(Cache):
     Also provides `reset(mask)` to clear selected rows across all layers.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, detach_on_pop: bool = False) -> None:
         super().__init__(layer_class_to_replicate=LayerCache)
         self._layers: Dict[int, LayerCache] = {}
+        self.detach_on_pop = bool(detach_on_pop)
 
     def _get_layer(self, layer_idx: int) -> LayerCache:
         if layer_idx not in self._layers:
-            self._layers[layer_idx] = LayerCache()
+            self._layers[layer_idx] = LayerCache(detach_on_pop=self.detach_on_pop)
         return self._layers[layer_idx]
 
     def to(self, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None):
@@ -248,7 +253,6 @@ class PositionBasedDynamicCache(Cache):
         for layer in self._layers.values():
             layer.reset_rows(reset_mask)
 
-    @torch.no_grad()
     def update(
         self,
         key_states: torch.Tensor,
@@ -266,13 +270,12 @@ class PositionBasedDynamicCache(Cache):
 class WindowedPositionBasedDynamicCache(PositionBasedDynamicCache):
     """Position-based cache with a fixed-size sliding window."""
 
-    def __init__(self, window_size: int) -> None:
-        super().__init__()
+    def __init__(self, window_size: int, detach_on_pop: bool = False) -> None:
+        super().__init__(detach_on_pop=detach_on_pop)
         if window_size is None or window_size <= 0:
             raise ValueError("window_size must be a positive integer")
         self.window_size = int(window_size)
 
-    @torch.no_grad()
     def update(
         self,
         key_states: torch.Tensor,
