@@ -34,10 +34,15 @@ from wm_train import (
 )
 
 
-# Reuse maze generation/sensing from Algernon.
-ALGERNON_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../Algernon"))
-if ALGERNON_DIR not in sys.path:
-    sys.path.append(ALGERNON_DIR)
+# Reuse maze generation/sensing from local ./maze symlink.
+MAZE_DEPS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "maze"))
+if not os.path.exists(os.path.join(MAZE_DEPS_DIR, "genmaze.py")):
+    raise ModuleNotFoundError(
+        f"Missing maze dependency path: {MAZE_DEPS_DIR}. "
+        "Expected genmaze.py in ./maze."
+    )
+if MAZE_DEPS_DIR not in sys.path:
+    sys.path.insert(0, MAZE_DEPS_DIR)
 from genmaze import generate_maze, write_maze  # type: ignore  # noqa: E402
 from maze import Maze  # type: ignore  # noqa: E402
 
@@ -198,10 +203,21 @@ def build_model_from_checkpoint(ckpt: dict, sensor_mode: str, device: str):
     sensor_min = np.asarray(stats["sensor_min"], dtype=np.int64)
     sensor_max = np.asarray(stats["sensor_max"], dtype=np.int64)
     sensor_bins = (sensor_max - sensor_min + 1).astype(np.int64)
+    contrastive_dim_cfg = int(cfg.get("contrastive_dim", 0))
+
+    def resolve_probe_layers(model_cfg_section: dict, probe_hidden_dim: int) -> int:
+        raw = model_cfg_section.get("probe_layers", cfg.get("probe_layers", None))
+        if raw is not None:
+            return int(raw)
+        # Backward compatibility for old checkpoints:
+        # hidden_dim <= 0 used linear probes; hidden_dim > 0 used MLP probes.
+        return 1 if int(probe_hidden_dim) <= 0 else 2
 
     if model_type == "tssm":
         mcfg = model_cfg["tssm"]
         probe_hidden_dim = int(mcfg.get("probe_hidden_dim", cfg.get("probe_hidden_dim", 0)))
+        probe_layers = resolve_probe_layers(mcfg, probe_hidden_dim)
+        contrastive_dim = int(mcfg.get("contrastive_dim", contrastive_dim_cfg))
         model = TSSMDiscretePredictor(
             hidden_size=int(mcfg["hidden_size"]),
             layers=int(mcfg["layers"]),
@@ -231,12 +247,19 @@ def build_model_from_checkpoint(ckpt: dict, sensor_mode: str, device: str):
             z_only_weight=float(mcfg.get("z_only_weight", 0.0)),
             h_only_weight=float(mcfg.get("h_only_weight", 0.0)),
             probe_hidden_dim=probe_hidden_dim,
+            probe_layers=probe_layers,
+            contrastive_dim=contrastive_dim,
             recon_beta=float(mcfg["recon_beta"]),
             obs_loss_mode=str(mcfg["obs_loss_mode"]),
         ).to(device)
     elif model_type == "rssm-discrete":
         mcfg = model_cfg["rssm"]
         probe_hidden_dim = int(mcfg.get("probe_hidden_dim", cfg.get("probe_hidden_dim", 0)))
+        probe_layers = resolve_probe_layers(mcfg, probe_hidden_dim)
+        contrastive_dim = int(mcfg.get("contrastive_dim", contrastive_dim_cfg))
+        transition = str(mcfg.get("transition", cfg.get("rssm_transition", "gru")))
+        residual_scale = float(mcfg.get("residual_scale", cfg.get("rssm_residual_scale", 1.0)))
+        state_norm = str(mcfg.get("state_norm", cfg.get("rssm_state_norm", "none")))
         model = RSSMDiscretePredictor(
             hidden_size=int(mcfg["hidden_size"]),
             sensor_mode=sensor_mode,
@@ -261,12 +284,19 @@ def build_model_from_checkpoint(ckpt: dict, sensor_mode: str, device: str):
             z_only_weight=float(mcfg.get("z_only_weight", 0.0)),
             h_only_weight=float(mcfg.get("h_only_weight", 0.0)),
             probe_hidden_dim=probe_hidden_dim,
+            probe_layers=probe_layers,
+            contrastive_dim=contrastive_dim,
+            transition=transition,
+            residual_scale=residual_scale,
+            state_norm=state_norm,
             recon_beta=float(mcfg["recon_beta"]),
             obs_loss_mode=str(mcfg["obs_loss_mode"]),
         ).to(device)
     elif model_type == "transformer":
         llama_cfg = LlamaConfig(**model_cfg["llama"])
         probe_hidden_dim = int(model_cfg.get("probe_hidden_dim", cfg.get("probe_hidden_dim", 0)))
+        probe_layers = resolve_probe_layers(model_cfg, probe_hidden_dim)
+        contrastive_dim = int(model_cfg.get("contrastive_dim", contrastive_dim_cfg))
         model = UnifiedPredictor(
             llama_cfg,
             sensor_mode=sensor_mode,
@@ -280,10 +310,16 @@ def build_model_from_checkpoint(ckpt: dict, sensor_mode: str, device: str):
             obs_dim=obs_dim,
             obs_latent_dim=obs_latent_dim,
             probe_hidden_dim=probe_hidden_dim,
+            probe_layers=probe_layers,
+            contrastive_dim=contrastive_dim,
         ).to(device)
     elif model_type == "rnn":
         rcfg = model_cfg.get("rnn", {})
         probe_hidden_dim = int(rcfg.get("probe_hidden_dim", model_cfg.get("probe_hidden_dim", cfg.get("probe_hidden_dim", 0))))
+        probe_layers = resolve_probe_layers(rcfg, probe_hidden_dim)
+        contrastive_dim = int(rcfg.get("contrastive_dim", model_cfg.get("contrastive_dim", contrastive_dim_cfg)))
+        transition = str(rcfg.get("transition", cfg.get("rnn_transition", "gru")))
+        residual_scale = float(rcfg.get("residual_scale", cfg.get("rnn_residual_scale", 1.0)))
         default_input_size = sensor_dim + 2
         rnn_cfg = LlamaConfig(
             input_size=int(rcfg.get("input_size", default_input_size)),
@@ -303,6 +339,10 @@ def build_model_from_checkpoint(ckpt: dict, sensor_mode: str, device: str):
             obs_dim=obs_dim,
             obs_latent_dim=obs_latent_dim,
             probe_hidden_dim=probe_hidden_dim,
+            probe_layers=probe_layers,
+            transition=transition,
+            residual_scale=residual_scale,
+            contrastive_dim=contrastive_dim,
         ).to(device)
     else:
         raise ValueError(f"Unsupported model_type: {model_type}")
@@ -313,6 +353,8 @@ def build_model_from_checkpoint(ckpt: dict, sensor_mode: str, device: str):
         "z_obs_head.bias",
         "h_obs_head.weight",
         "h_obs_head.bias",
+        "contrastive_head.weight",
+        "contrastive_head.bias",
     }
     bad_missing = [k for k in missing if k not in allowed_missing]
     if bad_missing:

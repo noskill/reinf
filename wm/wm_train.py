@@ -23,7 +23,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 
-from transformer import LlamaConfig, LlamaModel
+from transformer import LlamaConfig, LlamaModel, LlamaRMSNorm
 from tr_cache import PositionBasedDynamicCache, WindowedPositionBasedDynamicCache
 
 
@@ -32,16 +32,19 @@ sg = lambda x: x.detach()
 HEADING_CANON = {"up": "u"}
 
 
-def make_probe_head(in_dim: int, out_dim: int, hidden_dim: int) -> nn.Module:
-    """Build a linear probe or a 2-layer MLP probe."""
-    if int(hidden_dim) <= 0:
+def make_probe_head(in_dim: int, out_dim: int, hidden_dim: int, num_layers: int) -> nn.Module:
+    """Build probe head with configurable depth (number of Linear layers)."""
+    layers = int(num_layers)
+    if layers <= 1:
         return nn.Linear(in_dim, out_dim)
     h = int(hidden_dim)
-    return nn.Sequential(
-        nn.Linear(in_dim, h),
-        nn.ReLU(),
-        nn.Linear(h, out_dim),
-    )
+    if h <= 0:
+        raise ValueError("probe_hidden_dim must be > 0 when probe_layers > 1")
+    blocks: List[nn.Module] = [nn.Linear(in_dim, h), nn.ReLU()]
+    for _ in range(layers - 2):
+        blocks.extend([nn.Linear(h, h), nn.ReLU()])
+    blocks.append(nn.Linear(h, out_dim))
+    return nn.Sequential(*blocks)
 
 
 def set_seed(seed: int) -> None:
@@ -304,7 +307,18 @@ class WindowedDataset(Dataset):
 
 
 def collate_batch(batch):
-    obs_sensors, obs_locs, obs_heads, obs_actions, ys_sensor, ys_sensor_idx, ys_loc_xy, ys_head, ys_turn, ys_step = zip(*batch)
+    (
+        obs_sensors,
+        obs_locs,
+        obs_heads,
+        obs_actions,
+        ys_sensor,
+        ys_sensor_idx,
+        ys_loc_xy,
+        ys_head,
+        ys_turn,
+        ys_step,
+    ) = zip(*batch)
     lengths = [x.shape[0] for x in obs_sensors]
     max_len = max(lengths)
 
@@ -629,7 +643,9 @@ class UnifiedPredictor(PredictionLossMixin, nn.Module):
         step_bins: int,
         obs_dim: int,
         obs_latent_dim: int,
-        probe_hidden_dim: int = 0,
+        probe_hidden_dim: int = 256,
+        probe_layers: int = 2,
+        contrastive_dim: int = 0,
     ):
         super().__init__()
         self.backbone = LlamaModel(config)
@@ -639,8 +655,14 @@ class UnifiedPredictor(PredictionLossMixin, nn.Module):
         self.step_bins = step_bins
         self.input_size = config.input_size
         self.probe_hidden_dim = int(probe_hidden_dim)
+        self.probe_layers = int(probe_layers)
+        self.contrastive_dim = int(contrastive_dim)
         if self.probe_hidden_dim < 0:
             raise ValueError("probe_hidden_dim must be >= 0")
+        if self.probe_layers < 1:
+            raise ValueError("probe_layers must be >= 1")
+        if self.contrastive_dim < 0:
+            raise ValueError("contrastive_dim must be >= 0")
         if sensor_mode == "categorical":
             assert sensor_bins is not None and len(sensor_bins) == 3
             self.sensor_head_l = nn.Linear(config.hidden_size, int(sensor_bins[0]))
@@ -648,9 +670,9 @@ class UnifiedPredictor(PredictionLossMixin, nn.Module):
             self.sensor_head_r = nn.Linear(config.hidden_size, int(sensor_bins[2]))
         else:
             self.sensor_head = nn.Linear(config.hidden_size, sensor_dim)
-        self.loc_x_head = make_probe_head(config.hidden_size, loc_x_bins, self.probe_hidden_dim)
-        self.loc_y_head = make_probe_head(config.hidden_size, loc_y_bins, self.probe_hidden_dim)
-        self.heading_head = make_probe_head(config.hidden_size, heading_dim, self.probe_hidden_dim)
+        self.loc_x_head = make_probe_head(config.hidden_size, loc_x_bins, self.probe_hidden_dim, self.probe_layers)
+        self.loc_y_head = make_probe_head(config.hidden_size, loc_y_bins, self.probe_hidden_dim, self.probe_layers)
+        self.heading_head = make_probe_head(config.hidden_size, heading_dim, self.probe_hidden_dim, self.probe_layers)
         self.obs_encoder = nn.Sequential(
             nn.Linear(obs_dim, obs_latent_dim),
             nn.ReLU(),
@@ -659,6 +681,9 @@ class UnifiedPredictor(PredictionLossMixin, nn.Module):
         self.fuse = nn.Linear(config.hidden_size + obs_latent_dim, config.hidden_size)
         self.turn_head = nn.Linear(config.hidden_size, turn_bins)
         self.step_head = nn.Linear(config.hidden_size, step_bins)
+        self.contrastive_head: Optional[nn.Module] = None
+        if self.contrastive_dim > 0:
+            self.contrastive_head = nn.Linear(config.hidden_size, self.contrastive_dim)
 
     def forward(
         self,
@@ -668,6 +693,7 @@ class UnifiedPredictor(PredictionLossMixin, nn.Module):
         cache_position=None,
         prev_hidden=None,
         return_state=False,
+        return_aux=False,
     ):
         sensor = obs["sensor"]
         actions = obs["actions"]
@@ -703,11 +729,21 @@ class UnifiedPredictor(PredictionLossMixin, nn.Module):
         elif prev_hidden.dim() == 2:
             prev_hidden = prev_hidden.unsqueeze(1)
         h_prev = torch.cat([prev_hidden, h[:, :-1, :]], dim=1)
-        fused = torch.tanh(self.fuse(torch.cat([h_prev, z], dim=-1)))
+        # Action heads are probes: detach inputs so they do not shape backbone dynamics.
+        fused = torch.tanh(self.fuse(torch.cat([h_prev.detach(), z.detach()], dim=-1)))
         turn = self.turn_head(fused)
         step = self.step_head(fused)
+        aux_inputs = None
+        if return_aux:
+            aux_inputs = {}
+            if self.contrastive_head is not None:
+                aux_inputs["contrastive_emb"] = self.contrastive_head(h)
         if return_state:
+            if return_aux:
+                return pred_sensor, loc_x, loc_y, heading, turn, step, h[:, -1, :], aux_inputs
             return pred_sensor, loc_x, loc_y, heading, turn, step, h[:, -1, :]
+        if return_aux:
+            return pred_sensor, loc_x, loc_y, heading, turn, step, aux_inputs
         return pred_sensor, loc_x, loc_y, heading, turn, step
 
     def compute_all_losses(self, **kwargs) -> Dict[str, torch.Tensor]:
@@ -729,7 +765,11 @@ class RNNPredictor(UnifiedPredictor):
         step_bins: int,
         obs_dim: int,
         obs_latent_dim: int,
-        probe_hidden_dim: int = 0,
+        probe_hidden_dim: int = 256,
+        probe_layers: int = 2,
+        transition: str = "gru",
+        residual_scale: float = 1.0,
+        contrastive_dim: int = 0,
     ):
         super().__init__(
             config,
@@ -744,7 +784,13 @@ class RNNPredictor(UnifiedPredictor):
             obs_dim=obs_dim,
             obs_latent_dim=obs_latent_dim,
             probe_hidden_dim=probe_hidden_dim,
+            probe_layers=probe_layers,
+            contrastive_dim=contrastive_dim,
         )
+        self.transition = str(transition)
+        self.residual_scale = float(residual_scale)
+        if self.transition not in {"gru", "residual"}:
+            raise ValueError("transition must be one of {'gru', 'residual'}")
         self.backbone = nn.GRU(
             input_size=config.input_size,
             hidden_size=config.hidden_size,
@@ -760,6 +806,7 @@ class RNNPredictor(UnifiedPredictor):
         cache_position=None,
         prev_hidden=None,
         return_state=False,
+        return_aux=False,
     ):
         del attention_window, past_key_values, cache_position
         sensor = obs["sensor"]
@@ -769,7 +816,12 @@ class RNNPredictor(UnifiedPredictor):
         if x.shape[-1] != self.input_size:
             raise ValueError(f"Expected input_size {self.input_size}, got {x.shape[-1]}")
 
-        h, _ = self.backbone(x)
+        h_raw, _ = self.backbone(x)
+        if self.transition == "residual":
+            # Fast residual check: apply h_t = h_{t-1} + scale * g_t using fused GRU outputs g_t.
+            h = torch.cumsum(h_raw * self.residual_scale, dim=1)
+        else:
+            h = h_raw
         if self.sensor_mode != "categorical":
             raise ValueError("RNNPredictor currently supports sensor_mode='categorical' only.")
         pred_sensor = (
@@ -788,11 +840,21 @@ class RNNPredictor(UnifiedPredictor):
         elif prev_hidden.dim() == 2:
             prev_hidden = prev_hidden.unsqueeze(1)
         h_prev = torch.cat([prev_hidden, h[:, :-1, :]], dim=1)
-        fused = torch.tanh(self.fuse(torch.cat([h_prev, z], dim=-1)))
+        # Action heads are probes: detach inputs so they do not shape backbone dynamics.
+        fused = torch.tanh(self.fuse(torch.cat([h_prev.detach(), z.detach()], dim=-1)))
         turn = self.turn_head(fused)
         step = self.step_head(fused)
+        aux_inputs = None
+        if return_aux:
+            aux_inputs = {}
+            if self.contrastive_head is not None:
+                aux_inputs["contrastive_emb"] = self.contrastive_head(h)
         if return_state:
+            if return_aux:
+                return pred_sensor, loc_x, loc_y, heading, turn, step, h[:, -1, :], aux_inputs
             return pred_sensor, loc_x, loc_y, heading, turn, step, h[:, -1, :]
+        if return_aux:
+            return pred_sensor, loc_x, loc_y, heading, turn, step, aux_inputs
         return pred_sensor, loc_x, loc_y, heading, turn, step
 
 
@@ -825,7 +887,9 @@ class DiscreteLatentPredictorBase(PredictionLossMixin, nn.Module):
         z_only_weight: float,
         h_only_weight: float,
         prior_rollout_steps: int = 0,
-        probe_hidden_dim: int = 0,
+        probe_hidden_dim: int = 256,
+        probe_layers: int = 2,
+        contrastive_dim: int = 0,
     ):
         super().__init__()
         self.sensor_mode = sensor_mode
@@ -848,10 +912,16 @@ class DiscreteLatentPredictorBase(PredictionLossMixin, nn.Module):
         self.h_only_weight = float(h_only_weight)
         self.prior_rollout_steps = int(prior_rollout_steps)
         self.probe_hidden_dim = int(probe_hidden_dim)
+        self.probe_layers = int(probe_layers)
+        self.contrastive_dim = int(contrastive_dim)
         if self.prior_rollout_steps < 0:
             raise ValueError("prior_rollout_steps must be >= 0")
         if self.probe_hidden_dim < 0:
             raise ValueError("probe_hidden_dim must be >= 0")
+        if self.probe_layers < 1:
+            raise ValueError("probe_layers must be >= 1")
+        if self.contrastive_dim < 0:
+            raise ValueError("contrastive_dim must be >= 0")
         if obs_loss_mode not in {"soft", "recon"}:
             raise ValueError(f"obs_loss_mode must be 'soft' or 'recon', got {obs_loss_mode}")
         self.obs_loss_mode = obs_loss_mode
@@ -890,11 +960,14 @@ class DiscreteLatentPredictorBase(PredictionLossMixin, nn.Module):
                 nn.Linear(obs_latent_dim, obs_dim),
             )
         # Probe heads for location/heading: trained from detached state so they don't shape dynamics.
-        self.loc_probe_x = make_probe_head(feat_dim, self.loc_x_bins, self.probe_hidden_dim)
-        self.loc_probe_y = make_probe_head(feat_dim, self.loc_y_bins, self.probe_hidden_dim)
-        self.head_probe = make_probe_head(feat_dim, self.heading_dim, self.probe_hidden_dim)
+        self.loc_probe_x = make_probe_head(feat_dim, self.loc_x_bins, self.probe_hidden_dim, self.probe_layers)
+        self.loc_probe_y = make_probe_head(feat_dim, self.loc_y_bins, self.probe_hidden_dim, self.probe_layers)
+        self.head_probe = make_probe_head(feat_dim, self.heading_dim, self.probe_hidden_dim, self.probe_layers)
         self.turn_head = nn.Linear(feat_dim, turn_bins)
         self.step_head = nn.Linear(feat_dim, step_bins)
+        self.contrastive_head: Optional[nn.Module] = None
+        if self.contrastive_dim > 0:
+            self.contrastive_head = nn.Linear(feat_dim, self.contrastive_dim)
 
     def _sample_stoch(self, logits: torch.Tensor, training: bool) -> torch.Tensor:
         # logits: [B, T, S, C]
@@ -1288,10 +1361,10 @@ class DiscreteLatentPredictorBase(PredictionLossMixin, nn.Module):
         return self._split_sensor_logits(self.h_obs_head(h_flat.detach()))
 
     def _decode_feat(self, feat: torch.Tensor):
-        """Decode sensors/actions from full feature; probes use detached features."""
-        turn = self.turn_head(feat)
-        step = self.step_head(feat)
+        """Decode sensors/actions from full feature; probe heads use detached features."""
         feat_detached = feat.detach()
+        turn = self.turn_head(feat_detached)
+        step = self.step_head(feat_detached)
         loc_x = self.loc_probe_x(feat_detached)
         loc_y = self.loc_probe_y(feat_detached)
         heading_out = self.head_probe(feat_detached)
@@ -1382,7 +1455,12 @@ class RSSMDiscretePredictor(DiscreteLatentPredictorBase):
         z_only_weight: float,
         h_only_weight: float,
         prior_rollout_steps: int = 0,
-        probe_hidden_dim: int = 0,
+        probe_hidden_dim: int = 256,
+        probe_layers: int = 2,
+        contrastive_dim: int = 0,
+        transition: str = "gru",
+        residual_scale: float = 1.0,
+        state_norm: str = "none",
     ):
         super().__init__(
             hidden_size=hidden_size,
@@ -1411,8 +1489,33 @@ class RSSMDiscretePredictor(DiscreteLatentPredictorBase):
             h_only_weight=h_only_weight,
             prior_rollout_steps=prior_rollout_steps,
             probe_hidden_dim=probe_hidden_dim,
+            probe_layers=probe_layers,
+            contrastive_dim=contrastive_dim,
         )
         self.rnn = nn.GRUCell(self.stoch_flat + self.action_dim, self.hidden_size)
+        self.transition = str(transition)
+        self.residual_scale = float(residual_scale)
+        if self.transition not in {"gru", "residual"}:
+            raise ValueError("RSSM transition must be one of {'gru', 'residual'}")
+        self.state_norm = str(state_norm)
+        if self.state_norm not in {"none", "layernorm", "rmsnorm"}:
+            raise ValueError("RSSM state_norm must be one of {'none', 'layernorm', 'rmsnorm'}")
+        if self.state_norm == "layernorm":
+            self.state_pre_norm = nn.LayerNorm(self.hidden_size)
+        elif self.state_norm == "rmsnorm":
+            self.state_pre_norm = LlamaRMSNorm(self.hidden_size)
+        else:
+            self.state_pre_norm = nn.Identity()
+
+    def _rssm_step(self, x_t: torch.Tensor, h_prev: torch.Tensor) -> torch.Tensor:
+        # Pre-norm transition (LLaMA-style): normalize previous state before sublayer.
+        h_in = self.state_pre_norm(h_prev)
+        h_raw = self.rnn(x_t, h_in)
+        if self.transition == "residual":
+            h_t = h_prev + self.residual_scale * h_raw
+        else:
+            h_t = h_raw
+        return h_t
 
     def forward(
         self,
@@ -1438,7 +1541,7 @@ class RSSMDiscretePredictor(DiscreteLatentPredictorBase):
             if self.bptt_horizon > 0 and t > 0 and (t % self.bptt_horizon) == 0:
                 h_prev = h_prev.detach()
                 z_prev_flat = z_prev_flat.detach()
-            h_t = self.rnn(torch.cat([z_prev_flat, a_prev[:, t, :]], dim=-1), h_prev)
+            h_t = self._rssm_step(torch.cat([z_prev_flat, a_prev[:, t, :]], dim=-1), h_prev)
             prior_logits_t = self.prior_head(h_t).view(B, self.stoch_size, self.stoch_classes)
             z_prior_t = self._sample_stoch(prior_logits_t.unsqueeze(1), self.training).squeeze(1)
             z_prior_flat = z_prior_t.reshape(B, self.stoch_flat)
@@ -1482,7 +1585,7 @@ class RSSMDiscretePredictor(DiscreteLatentPredictorBase):
                 if self.bptt_horizon > 0 and t > 0 and (t % self.bptt_horizon) == 0:
                     h_roll = h_roll.detach()
                     z_roll_flat = z_roll_flat.detach()
-                h_roll = self.rnn(torch.cat([z_roll_flat, a_prev[:, t, :]], dim=-1), h_roll)
+                h_roll = self._rssm_step(torch.cat([z_roll_flat, a_prev[:, t, :]], dim=-1), h_roll)
                 prior_logits_roll_t = self.prior_head(h_roll).view(B, self.stoch_size, self.stoch_classes)
                 z_roll_t = self._sample_stoch(prior_logits_roll_t.unsqueeze(1), self.training).squeeze(1)
                 z_roll_flat = z_roll_t.reshape(B, self.stoch_flat)
@@ -1503,6 +1606,8 @@ class RSSMDiscretePredictor(DiscreteLatentPredictorBase):
             "z_only_pred": z_only_pred,
             "h_only_pred": h_only_pred,
         }
+        if self.contrastive_head is not None:
+            aux_inputs["contrastive_emb"] = self.contrastive_head(feat)
         if obs_hat is not None:
             aux_inputs["obs_hat"] = obs_hat
         if return_state:
@@ -1552,7 +1657,9 @@ class TSSMDiscretePredictor(DiscreteLatentPredictorBase):
         z_only_weight: float,
         h_only_weight: float,
         prior_rollout_steps: int = 0,
-        probe_hidden_dim: int = 0,
+        probe_hidden_dim: int = 256,
+        probe_layers: int = 2,
+        contrastive_dim: int = 0,
     ):
         if int(hidden_size) != int(heads) * int(head_dim):
             raise ValueError("For tssm, hidden_size must equal heads * head_dim")
@@ -1583,6 +1690,8 @@ class TSSMDiscretePredictor(DiscreteLatentPredictorBase):
             h_only_weight=h_only_weight,
             prior_rollout_steps=prior_rollout_steps,
             probe_hidden_dim=probe_hidden_dim,
+            probe_layers=probe_layers,
+            contrastive_dim=contrastive_dim,
         )
         self.attention_window = attention_window
 
@@ -1721,6 +1830,8 @@ class TSSMDiscretePredictor(DiscreteLatentPredictorBase):
             "z_only_pred": z_only_pred,
             "h_only_pred": h_only_pred,
         }
+        if self.contrastive_head is not None:
+            aux_inputs["contrastive_emb"] = self.contrastive_head(feat)
         if obs_hat is not None:
             aux_inputs["obs_hat"] = obs_hat
         if return_state:
@@ -1897,6 +2008,57 @@ def masked_action_acc(logits: torch.Tensor, target_idx: torch.Tensor, mask: torc
     return correct
 
 
+def batch_row_next_step_contrastive_loss(
+    emb: Optional[torch.Tensor],
+    key_padding_mask: torch.Tensor,
+    temperature: float,
+) -> torch.Tensor:
+    """InfoNCE with one-step positives and negatives from other rows in the batch.
+
+    Positive pair: (e_t, e_{t+1}) from the same row.
+    Negative pool: all valid e_{t+1} from other rows.
+    Assumption: rows in a batch come from different episodes.
+    """
+    if emb is None:
+        return torch.tensor(0.0, device=key_padding_mask.device)
+    if emb.ndim != 3:
+        raise ValueError(f"Expected emb [B, T, D], got {tuple(emb.shape)}")
+    if temperature <= 0:
+        raise ValueError("contrastive temperature must be > 0")
+
+    B, T, D = emb.shape
+    if B < 2 or T < 2:
+        return torch.tensor(0.0, device=emb.device, dtype=emb.dtype)
+
+    anchor = emb[:, :-1, :]  # [B, T-1, D]
+    key = emb[:, 1:, :]      # [B, T-1, D]
+    valid = (~key_padding_mask[:, :-1]) & (~key_padding_mask[:, 1:])  # [B, T-1]
+    if valid.sum() == 0:
+        return torch.tensor(0.0, device=emb.device, dtype=emb.dtype)
+
+    K = B * (T - 1)
+    anchor_flat = anchor.reshape(K, D)
+    key_flat = key.reshape(K, D)
+    valid_flat = valid.reshape(K)
+    row_ids = torch.arange(B, device=emb.device).view(B, 1).expand(B, T - 1).reshape(K)
+
+    sel = torch.nonzero(valid_flat, as_tuple=False).squeeze(1)
+    anchor_sel = F.normalize(anchor_flat[sel], dim=-1)
+    key_norm = F.normalize(key_flat, dim=-1)
+    logits = torch.matmul(anchor_sel, key_norm.transpose(0, 1)) / temperature  # [N, K]
+
+    pos_idx = sel
+    anchor_rows = row_ids[sel]
+    # Keep only valid keys from other rows; always include own positive key.
+    allowed = valid_flat.unsqueeze(0) & (row_ids.unsqueeze(0) != anchor_rows.unsqueeze(1))
+    allowed.scatter_(1, pos_idx.unsqueeze(1), True)
+    logits = logits.masked_fill(~allowed, -1e9)
+
+    # Future improvement: add negatives from virtual rollouts (model-generated embeddings).
+    # Future improvement: add hard negatives from the same episode but temporally distant steps.
+    return F.cross_entropy(logits, pos_idx)
+
+
 def run_epoch_joint(
     model,
     loader,
@@ -1915,6 +2077,8 @@ def run_epoch_joint(
     loc_x_table=None,
     loc_y_table=None,
     heading_table=None,
+    contrastive_weight=0.0,
+    contrastive_temp=0.1,
 ):
     is_train = optimizer is not None
     model.train(is_train)
@@ -1938,6 +2102,7 @@ def run_epoch_joint(
     total_z_only = 0.0
     total_h_only = 0.0
     total_recon = 0.0
+    total_contrastive = 0.0
 
     for item in loader:
         obs, y_sensor, y_sensor_idx, y_loc_xy, y_head, y_turn, y_step, _ = item
@@ -1951,15 +2116,21 @@ def run_epoch_joint(
         y_step = y_step.to(device)
         kpm = obs["key_padding_mask"]
 
+        need_aux = bool(contrastive_weight > 0)
         if isinstance(model, DiscreteLatentPredictorBase):
             pred_sensor, pred_loc_x, pred_loc_y, pred_head, pred_turn, pred_step, aux_inputs = model(
                 obs, attention_window=attention_window
             )
         else:
-            pred_sensor, pred_loc_x, pred_loc_y, pred_head, pred_turn, pred_step = model(
-                obs, attention_window=attention_window
-            )
-            aux_inputs = None
+            if need_aux:
+                pred_sensor, pred_loc_x, pred_loc_y, pred_head, pred_turn, pred_step, aux_inputs = model(
+                    obs, attention_window=attention_window, return_aux=True
+                )
+            else:
+                pred_sensor, pred_loc_x, pred_loc_y, pred_head, pred_turn, pred_step = model(
+                    obs, attention_window=attention_window
+                )
+                aux_inputs = None
         loss_dict = model.compute_all_losses(
             pred_sensor=pred_sensor,
             pred_loc_x=pred_loc_x,
@@ -2004,6 +2175,15 @@ def run_epoch_joint(
             aux_inputs=aux_inputs,
         )
         loss = loss_dict["total"]
+        contrastive_loss = torch.tensor(0.0, device=device)
+        if contrastive_weight > 0:
+            emb = aux_inputs.get("contrastive_emb") if aux_inputs is not None else None
+            contrastive_loss = batch_row_next_step_contrastive_loss(
+                emb=emb,
+                key_padding_mask=kpm,
+                temperature=contrastive_temp,
+            )
+            loss = loss + contrastive_weight * contrastive_loss
 
         if is_train:
             optimizer.zero_grad(set_to_none=True)
@@ -2029,6 +2209,7 @@ def run_epoch_joint(
             loss_dict.get("h_only_sensor", torch.tensor(0.0, device=device)).detach().cpu()
         )
         total_recon += float(loss_dict.get("recon", torch.tensor(0.0, device=device)).detach().cpu())
+        total_contrastive += float(contrastive_loss.detach().cpu())
         total_loc_x_rmse += float(metrics["loc_x_rmse"].detach().cpu())
         total_loc_y_rmse += float(metrics["loc_y_rmse"].detach().cpu())
         total_loc_x_acc += float(metrics["loc_x_acc"].detach().cpu())
@@ -2036,7 +2217,7 @@ def run_epoch_joint(
         total_batches += 1
 
     if total_batches == 0:
-        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
     return (
         total_loss / total_batches,
         total_mse / total_batches,
@@ -2055,6 +2236,7 @@ def run_epoch_joint(
         total_z_only / total_batches,
         total_h_only / total_batches,
         total_recon / total_batches,
+        total_contrastive / total_batches,
     )
 
 def main():
@@ -2087,6 +2269,39 @@ def main():
         default="transformer",
         help="Model architecture to train.",
     )
+    parser.add_argument(
+        "--rnn-transition",
+        type=str,
+        choices=["gru", "residual"],
+        default="gru",
+        help="RNN deterministic transition: original GRU or residual update h_t=h_{t-1}+g(x_t,h_{t-1}).",
+    )
+    parser.add_argument(
+        "--rnn-residual-scale",
+        type=float,
+        default=1.0,
+        help="Scale for residual RNN update when --rnn-transition=residual.",
+    )
+    parser.add_argument(
+        "--rssm-transition",
+        type=str,
+        choices=["gru", "residual"],
+        default="gru",
+        help="RSSM deterministic transition: GRUCell or residual update h_t=h_{t-1}+g_t.",
+    )
+    parser.add_argument(
+        "--rssm-residual-scale",
+        type=float,
+        default=1.0,
+        help="Scale for RSSM residual update when --rssm-transition=residual.",
+    )
+    parser.add_argument(
+        "--rssm-state-norm",
+        type=str,
+        choices=["none", "layernorm", "rmsnorm"],
+        default="none",
+        help="Pre-normalization on RSSM h_{t-1} before transition step.",
+    )
     parser.add_argument("--stoch-size", type=int, default=32, help="Number of categorical latent groups.")
     parser.add_argument("--stoch-classes", type=int, default=32, help="Number of classes per latent group.")
     parser.add_argument("--stoch-temp", type=float, default=1.0, help="Gumbel-softmax temperature.")
@@ -2110,6 +2325,24 @@ def main():
         type=float,
         default=0.0,
         help="Auxiliary weight for h-only sensor prediction.",
+    )
+    parser.add_argument(
+        "--contrastive-weight",
+        type=float,
+        default=0.0,
+        help="Weight for next-step embedding contrastive (InfoNCE) loss.",
+    )
+    parser.add_argument(
+        "--contrastive-dim",
+        type=int,
+        default=0,
+        help="Embedding dimension for contrastive head (0 disables contrastive head).",
+    )
+    parser.add_argument(
+        "--contrastive-temp",
+        type=float,
+        default=0.1,
+        help="Temperature for next-step contrastive loss.",
     )
     parser.add_argument(
         "--bptt-horizon",
@@ -2144,8 +2377,14 @@ def main():
     parser.add_argument(
         "--probe-hidden-dim",
         type=int,
-        default=0,
-        help="Hidden size for probe MLPs (0 keeps linear probes).",
+        default=256,
+        help="Hidden size for probe MLPs (set 0 to keep linear probes).",
+    )
+    parser.add_argument(
+        "--probe-layers",
+        type=int,
+        default=2,
+        help="Number of linear layers in probe heads (1=linear probe).",
     )
     parser.add_argument("--max-episodes", type=int, default=None)
     parser.add_argument(
@@ -2183,6 +2422,14 @@ def main():
         raise ValueError("--context-len must be >= 0")
     if args.probe_hidden_dim < 0:
         raise ValueError("--probe-hidden-dim must be >= 0")
+    if args.probe_layers < 1:
+        raise ValueError("--probe-layers must be >= 1")
+    if args.contrastive_dim < 0:
+        raise ValueError("--contrastive-dim must be >= 0")
+    if args.contrastive_temp <= 0:
+        raise ValueError("--contrastive-temp must be > 0")
+    if args.contrastive_weight > 0 and args.contrastive_dim <= 0:
+        raise ValueError("--contrastive-dim must be > 0 when --contrastive-weight > 0")
     try:
         sys.stdout.reconfigure(line_buffering=True)
     except Exception:
@@ -2230,7 +2477,12 @@ def main():
     print(
         f"run config | model={args.model_type} train_batches={len(train_loader)} val_batches={len(val_loader)} "
         f"batch_size={args.batch_size} epochs={args.epochs} attention_window={args.attention_window} "
-        f"context_len={args.context_len} probe_hidden_dim={args.probe_hidden_dim} "
+        f"context_len={args.context_len} probe_hidden_dim={args.probe_hidden_dim} probe_layers={args.probe_layers} "
+        f"rnn_transition={args.rnn_transition} rnn_residual_scale={args.rnn_residual_scale} "
+        f"rssm_transition={args.rssm_transition} rssm_residual_scale={args.rssm_residual_scale} "
+        f"rssm_state_norm={args.rssm_state_norm} "
+        f"contrastive_w={args.contrastive_weight} contrastive_dim={args.contrastive_dim} "
+        f"contrastive_temp={args.contrastive_temp} "
         f"attn_dropout={args.attention_dropout} weight_decay={args.weight_decay} "
         f"prior_roll_w={args.prior_rollout_weight} z_only_w={args.z_only_weight} "
         f"h_only_w={args.h_only_weight} "
@@ -2284,9 +2536,13 @@ def main():
             obs_dim=obs_dim,
             obs_latent_dim=args.obs_latent_dim,
             probe_hidden_dim=args.probe_hidden_dim,
+            probe_layers=args.probe_layers,
+            contrastive_dim=args.contrastive_dim,
         ).to(args.device)
         model_config_extra["llama"] = asdict(cfg)
         model_config_extra["probe_hidden_dim"] = args.probe_hidden_dim
+        model_config_extra["probe_layers"] = args.probe_layers
+        model_config_extra["contrastive_dim"] = args.contrastive_dim
     elif args.model_type == "rnn":
         if args.sensor_mode != "categorical":
             raise ValueError("model-type=rnn currently supports --sensor-mode categorical only")
@@ -2314,12 +2570,20 @@ def main():
             obs_dim=obs_dim,
             obs_latent_dim=args.obs_latent_dim,
             probe_hidden_dim=args.probe_hidden_dim,
+            probe_layers=args.probe_layers,
+            transition=args.rnn_transition,
+            residual_scale=args.rnn_residual_scale,
+            contrastive_dim=args.contrastive_dim,
         ).to(args.device)
         model_config_extra["rnn"] = {
             "input_size": input_dim,
             "hidden_size": args.hidden_size,
             "layers": args.layers,
             "probe_hidden_dim": args.probe_hidden_dim,
+            "probe_layers": args.probe_layers,
+            "transition": args.rnn_transition,
+            "residual_scale": args.rnn_residual_scale,
+            "contrastive_dim": args.contrastive_dim,
         }
     elif args.model_type == "rssm-discrete":
         model = RSSMDiscretePredictor(
@@ -2347,6 +2611,11 @@ def main():
             h_only_weight=args.h_only_weight,
             prior_rollout_steps=args.prior_rollout_steps,
             probe_hidden_dim=args.probe_hidden_dim,
+            probe_layers=args.probe_layers,
+            contrastive_dim=args.contrastive_dim,
+            transition=args.rssm_transition,
+            residual_scale=args.rssm_residual_scale,
+            state_norm=args.rssm_state_norm,
             recon_beta=args.recon_beta,
             obs_loss_mode=args.obs_loss_mode,
         ).to(args.device)
@@ -2364,6 +2633,11 @@ def main():
             "z_only_weight": args.z_only_weight,
             "h_only_weight": args.h_only_weight,
             "probe_hidden_dim": args.probe_hidden_dim,
+            "probe_layers": args.probe_layers,
+            "contrastive_dim": args.contrastive_dim,
+            "transition": args.rssm_transition,
+            "residual_scale": args.rssm_residual_scale,
+            "state_norm": args.rssm_state_norm,
             "recon_beta": args.recon_beta,
             "action_dim": action_dim,
             "obs_loss_mode": args.obs_loss_mode,
@@ -2399,6 +2673,8 @@ def main():
             h_only_weight=args.h_only_weight,
             prior_rollout_steps=args.prior_rollout_steps,
             probe_hidden_dim=args.probe_hidden_dim,
+            probe_layers=args.probe_layers,
+            contrastive_dim=args.contrastive_dim,
             recon_beta=args.recon_beta,
             obs_loss_mode=args.obs_loss_mode,
         ).to(args.device)
@@ -2421,6 +2697,8 @@ def main():
             "z_only_weight": args.z_only_weight,
             "h_only_weight": args.h_only_weight,
             "probe_hidden_dim": args.probe_hidden_dim,
+            "probe_layers": args.probe_layers,
+            "contrastive_dim": args.contrastive_dim,
             "recon_beta": args.recon_beta,
             "action_dim": action_dim,
             "obs_loss_mode": args.obs_loss_mode,
@@ -2496,7 +2774,7 @@ def main():
     for epoch in range(1, args.epochs + 1):
         print(f"starting epoch {epoch:03d}", flush=True)
 
-        val_loss, val_mse, val_rmse, val_lr_rmse, val_lr_acc, val_loc_x_rmse, val_loc_y_rmse, val_loc_x_acc, val_loc_y_acc, val_turn_acc, val_step_acc, val_kl_dyn, val_kl_rep, val_prior_roll, val_z_only, val_h_only, val_recon = run_epoch_joint(
+        val_loss, val_mse, val_rmse, val_lr_rmse, val_lr_acc, val_loc_x_rmse, val_loc_y_rmse, val_loc_x_acc, val_loc_y_acc, val_turn_acc, val_step_acc, val_kl_dyn, val_kl_rep, val_prior_roll, val_z_only, val_h_only, val_recon, val_contrastive = run_epoch_joint(
             model,
             val_loader,
             optimizer=None,
@@ -2514,9 +2792,11 @@ def main():
             loc_x_table=loc_x_table,
             loc_y_table=loc_y_table,
             heading_table=heading_table,
+            contrastive_weight=args.contrastive_weight,
+            contrastive_temp=args.contrastive_temp,
         )
 
-        train_loss, train_mse, train_rmse, train_lr_rmse, train_lr_acc, train_loc_x_rmse, train_loc_y_rmse, train_loc_x_acc, train_loc_y_acc, train_turn_acc, train_step_acc, train_kl_dyn, train_kl_rep, train_prior_roll, train_z_only, train_h_only, train_recon = run_epoch_joint(
+        train_loss, train_mse, train_rmse, train_lr_rmse, train_lr_acc, train_loc_x_rmse, train_loc_y_rmse, train_loc_x_acc, train_loc_y_acc, train_turn_acc, train_step_acc, train_kl_dyn, train_kl_rep, train_prior_roll, train_z_only, train_h_only, train_recon, train_contrastive = run_epoch_joint(
             model,
             train_loader,
             optimizer,
@@ -2534,6 +2814,8 @@ def main():
             loc_x_table=loc_x_table,
             loc_y_table=loc_y_table,
             heading_table=heading_table,
+            contrastive_weight=args.contrastive_weight,
+            contrastive_temp=args.contrastive_temp,
         )
 
         print(
@@ -2543,13 +2825,13 @@ def main():
             f"loc_x_rmse {train_loc_x_rmse:.3f} loc_y_rmse {train_loc_y_rmse:.3f} "
             f"loc_x_acc {train_loc_x_acc:.3f} loc_y_acc {train_loc_y_acc:.3f} "
             f"turn_acc {train_turn_acc:.3f} step_acc {train_step_acc:.3f} "
-            f"kl_dyn {train_kl_dyn:.4f} kl_rep {train_kl_rep:.4f} prior_roll {train_prior_roll:.4f} z_only {train_z_only:.4f} h_only {train_h_only:.4f} recon {train_recon:.4f} | "
+            f"kl_dyn {train_kl_dyn:.4f} kl_rep {train_kl_rep:.4f} prior_roll {train_prior_roll:.4f} z_only {train_z_only:.4f} h_only {train_h_only:.4f} recon {train_recon:.4f} cpc {train_contrastive:.4f} | "
             f"val loss {val_loss:.4f} mse {val_mse:.4f} rmse {val_rmse:.4f} "
             f"lr_rmse {val_lr_rmse:.3f} lr_acc {val_lr_acc:.3f} "
             f"loc_x_rmse {val_loc_x_rmse:.3f} loc_y_rmse {val_loc_y_rmse:.3f} "
             f"loc_x_acc {val_loc_x_acc:.3f} loc_y_acc {val_loc_y_acc:.3f} "
             f"turn_acc {val_turn_acc:.3f} step_acc {val_step_acc:.3f} "
-            f"kl_dyn {val_kl_dyn:.4f} kl_rep {val_kl_rep:.4f} prior_roll {val_prior_roll:.4f} z_only {val_z_only:.4f} h_only {val_h_only:.4f} recon {val_recon:.4f}"
+            f"kl_dyn {val_kl_dyn:.4f} kl_rep {val_kl_rep:.4f} prior_roll {val_prior_roll:.4f} z_only {val_z_only:.4f} h_only {val_h_only:.4f} recon {val_recon:.4f} cpc {val_contrastive:.4f}"
             ,
             flush=True,
         )
@@ -2576,6 +2858,15 @@ def main():
                 "model_config": model_config_extra,
                 "context_len": args.context_len,
                 "probe_hidden_dim": args.probe_hidden_dim,
+                "probe_layers": args.probe_layers,
+                "rnn_transition": args.rnn_transition,
+                "rnn_residual_scale": args.rnn_residual_scale,
+                "rssm_transition": args.rssm_transition,
+                "rssm_residual_scale": args.rssm_residual_scale,
+                "rssm_state_norm": args.rssm_state_norm,
+                "contrastive_weight": args.contrastive_weight,
+                "contrastive_dim": args.contrastive_dim,
+                "contrastive_temp": args.contrastive_temp,
                 "pos_sigma": args.pos_sigma,
                 "heading_smoothing": args.heading_smoothing,
             },
