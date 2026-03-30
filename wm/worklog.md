@@ -127,8 +127,96 @@ Takeaway:
 - One-step val LR can be moderate/good while reverse open-loop performance remains poor.
 - `context_len=5` improved short-horizon (`n=5`) reverse metrics vs other non-latent baselines, despite lower one-step val LR.
 
+### Residual RNN Follow-up (2026-03-25)
+
+Status:
+- Residual RNN (`h_t = h_{t-1} + g_t`) is now a valid option to explore further.
+
+Reverse-path `n=5` quick comparison:
+- `outputs/wm_rnn_next_300e.pt` (GRU): `lr_acc=0.1360`, `loc_acc=0.0160`, `final_start_lr_acc=0.0600`
+- `outputs/wm_rnn_residual_next_300e.pt` (Residual): `lr_acc=0.3400`, `loc_acc=0.0200`, `final_start_lr_acc=0.5200`
+
+Interpretation:
+- Residual transition substantially improves reverse-path LR prediction vs GRU in this setup.
+- Location accuracy remains low for both, so this should be treated as a promising but incomplete direction.
+
+### Objective Consistency Check (2026-03-25)
+
+- Non-latent next-sensor baselines (`transformer`, `rnn`, `rnn-residual`) were already consistent: `--turn-weight 0.0 --step-weight 0.0`.
+- Older TSSM scripts (`base/prior_next/prior_rollout/prior_rollout_steps10/tuned`) did not explicitly zero turn/step, so they used default action-loss weights.
+- Training code is now aligned to probe-style auxiliaries: location/heading and turn/step heads use detached state inputs (do not update backbone dynamics).
+- For strict cross-regime comparison, rerun key TSSM checkpoints under the new consistent objective settings.
+
+### New Runs Started (2026-03-25)
+
+Started long runs:
+- `wm_train_tssm_tuned_130e.sh` -> `outputs/wm_tssm_tuned_600e.pt` (`wm_tssm_tuned_600e.log`)
+- `wm_train_rssm_next_300e.sh` -> `outputs/wm_rssm_next_600e.pt` (`wm_rssm_next_600e.log`)
+- `wm_train_rssm_residual_next_600e.sh` -> `outputs/wm_rssm_residual_next_600e.pt` (`wm_rssm_residual_next_600e.log`)
+
+Next diagnostic requirement:
+- We need controlled reconstruction/probe evaluation from `z_t`, `h_t`, and `s_t=[z_t,h_t]` to verify whether latent state carries useful information.
+- This should be compared under identical probe capacity/training budget and the same evaluation splits/horizons.
 
 
-i think perhaps rnn is undertrained and transformer simply don't expose these info in cls token; otherwise lr is impossible to predict without location, esp location would be usefull on later stages of
+
+i think perhaps rnn is undertrained and transformer simply don't expose these info in cls token; otherwise lr sensor is impossible to predict without location, esp location would be usefull on later stages of
   trajectory
 
+## Update (2026-03-26)
+
+### New Results
+
+1. RSSM baseline (`wm_train_rssm_next_300e.sh`, now 600 epochs) completed:
+- Checkpoint: `outputs/wm_rssm_next_600e.pt`
+- Final log line (`wm_rssm_next_600e.log`):
+  - train: `lr_acc=0.412`, `kl_dyn=2.8145`, `kl_rep=0.0938`
+  - val: `lr_acc=0.484`, `loc_x_rmse=3.842`, `loc_y_rmse=4.408`, `kl_dyn=3.9731`, `kl_rep=0.1324`
+
+2. Reverse-path test for `outputs/wm_rssm_next_600e.pt`:
+- `n=5`, `max_rollout_steps=5`: `lr_acc=0.3920`, `loc_acc=0.1200`, `final_start_lr_acc=0.4000`
+- `n=10`, `max_rollout_steps=10`: `lr_acc=0.3420`, `loc_acc=0.0180`, `final_start_lr_acc=0.3200`
+
+3. Speed benchmark (`wm_bench_rssm_tssm_speed.py`) on GPU:
+- Batch `8`, seq `64`, mode `both`: TSSM is ~`8.03x` slower (eval), ~`7.86x` slower (train) than RSSM.
+- Batch `8`, seq `128`, mode `train`: TSSM is ~`7.69x` slower than RSSM.
+
+4. modifications with skip-connection are much worse, requires additional tuning.
+
+4. TSSM tuned long run status:
+- `wm_tssm_tuned_600e.log` still running; latest observed around epoch `352`.
+- Pattern remains high train/val gap and large val `kl_dyn`, suggesting current no-rollout regime is likely near plateau for open-loop goals.
+
+### Theory / Direction Update
+
+- Current maze dataset has partial observability/aliasing; exact multi-step observation prediction is often ambiguous.
+- Multi-step rollout loss likely acts partly as regularization/consistency pressure, not strict deterministic future prediction.
+- Twister-style embedding rollout with contrastive objective (AC-CPC-like) remains a higher-priority direction.
+- HMM-style smoothing idea (trajectory-level latent smoothing / forward-backward style inference) is also promising, but lower priority than AC-CPC-style objective for now.
+- other option to try is cls token in transformer vs current token output
+
+### Implementation Update (2026-03-26, contrastive heads)
+
+- Added optional next-step contrastive objective (`InfoNCE`) to all model paths:
+  - Transformer / RNN: embedding head on `h_t`
+  - RSSM / TSSM: embedding head on `s_t=[h_t,z_t]`
+- Contrastive positives: `(e_t, e_{t+1})` from the same batch row.
+- Negatives: valid `e_{t+1}` from other rows in the same batch.
+- Simplifying assumption now used in code: each batch row is from a different episode.
+- Added TODO notes for future improvements:
+  - negatives from virtual rollouts
+  - hard negatives from same episode but temporally distant timesteps
+- Safety/default behavior:
+  - contrastive is **disabled by default** now (`--contrastive-weight 0.0`, `--contrastive-dim 0`)
+  - enable explicitly in runs when desired (to avoid silently changing legacy baselines).
+
+## Update (2026-03-30)
+
+- RNN residual mode implementation detail:
+  - current code uses a fast proxy residual update `h = cumsum(h_raw * scale)` after GRU forward.
+  - this is not a true per-step residual recurrent cell update (`h_t = h_{t-1} + g(x_t, h_{t-1})`).
+- Transformer baseline sanity:
+  - overfit check confirms the baseline can memorize under low-regularization settings.
+- Sensor smoothing note:
+  - large `--sensor-sigma` hurts exact LR-bin fit in this setup and can make training look worse on `lr_acc`.
+  - for strict overfit diagnostics, prefer `--sensor-sigma 0.0`.
