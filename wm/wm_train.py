@@ -23,7 +23,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 
-from transformer import LlamaConfig, LlamaModel, LlamaRMSNorm
+from transformer import LlamaConfig, LlamaModel, LlamaRMSNorm, LlamaMLP
 from tr_cache import PositionBasedDynamicCache, WindowedPositionBasedDynamicCache
 
 
@@ -769,6 +769,7 @@ class RNNPredictor(UnifiedPredictor):
         probe_layers: int = 2,
         transition: str = "gru",
         residual_scale: float = 1.0,
+        state_norm: str = "none",
         contrastive_dim: int = 0,
     ):
         super().__init__(
@@ -789,14 +790,32 @@ class RNNPredictor(UnifiedPredictor):
         )
         self.transition = str(transition)
         self.residual_scale = float(residual_scale)
-        if self.transition not in {"gru", "residual"}:
-            raise ValueError("transition must be one of {'gru', 'residual'}")
+        self.state_norm = str(state_norm)
+        if self.transition not in {"gru", "residual", "residual_mlp"}:
+            raise ValueError("transition must be one of {'gru', 'residual', 'residual_mlp'}")
+        if self.state_norm not in {"none", "layernorm", "rmsnorm"}:
+            raise ValueError("state_norm must be one of {'none', 'layernorm', 'rmsnorm'}")
+        if self.state_norm == "layernorm":
+            self.state_out_norm = nn.LayerNorm(config.hidden_size)
+        elif self.state_norm == "rmsnorm":
+            self.state_out_norm = LlamaRMSNorm(config.hidden_size)
+        else:
+            self.state_out_norm = nn.Identity()
         self.backbone = nn.GRU(
             input_size=config.input_size,
             hidden_size=config.hidden_size,
             num_layers=config.num_hidden_layers,
             batch_first=True,
         )
+        self.residual_mlp_pre_norm: Optional[nn.Module] = None
+        self.residual_mlp_post_norm: Optional[nn.Module] = None
+        self.residual_mlp: Optional[nn.Module] = None
+        if self.transition == "residual_mlp":
+            # LLaMA-style FFN residual block on recurrent state with extra post norm:
+            # h <- RMSNorm(h), h <- h + MLP(h), h <- RMSNorm(h).
+            self.residual_mlp_pre_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.residual_mlp_post_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.residual_mlp = LlamaMLP(config)
 
     def forward(
         self,
@@ -816,12 +835,31 @@ class RNNPredictor(UnifiedPredictor):
         if x.shape[-1] != self.input_size:
             raise ValueError(f"Expected input_size {self.input_size}, got {x.shape[-1]}")
 
-        h_raw, _ = self.backbone(x)
-        if self.transition == "residual":
-            # Fast residual check: apply h_t = h_{t-1} + scale * g_t using fused GRU outputs g_t.
-            h = torch.cumsum(h_raw * self.residual_scale, dim=1)
+        if self.transition in {"residual", "residual_mlp"}:
+            # True recurrent residual update on top-layer state:
+            # g_t = GRU(x_t, h_{t-1}), h_t = h_{t-1} + a * g_t.
+            B, T, _ = x.shape
+            nl = int(self.backbone.num_layers)
+            hs = int(self.backbone.hidden_size)
+            h_layers = x.new_zeros((nl, B, hs))
+            h_steps: List[torch.Tensor] = []
+            for t in range(T):
+                g_seq, g_layers = self.backbone(x[:, t : t + 1, :], h_layers)
+                g_t = g_seq[:, 0, :]
+                h_prev_top = h_layers[-1]
+                h_top = h_prev_top + self.residual_scale * g_t
+                if self.transition == "residual_mlp":
+                    h_mlp_in = self.residual_mlp_pre_norm(h_top)
+                    mlp_delta = self.residual_mlp(h_mlp_in)
+                    h_top = h_top + mlp_delta
+                    h_top = self.residual_mlp_post_norm(h_top)
+                h_layers = g_layers
+                h_layers[-1] = h_top
+                h_steps.append(h_top)
+            h = torch.stack(h_steps, dim=1) if h_steps else x.new_zeros((B, 0, hs))
         else:
-            h = h_raw
+            h, _ = self.backbone(x)
+        h = self.state_out_norm(h)
         if self.sensor_mode != "categorical":
             raise ValueError("RNNPredictor currently supports sensor_mode='categorical' only.")
         pred_sensor = (
@@ -2250,11 +2288,11 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--val-split", type=float, default=0.1)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--hidden-size", type=int, default=128)
-    parser.add_argument("--layers", type=int, default=2)
+    parser.add_argument("--hidden-size", type=int, default=176)
+    parser.add_argument("--layers", type=int, default=3)
     parser.add_argument("--heads", type=int, default=4)
-    parser.add_argument("--head-dim", type=int, default=32)
-    parser.add_argument("--intermediate", type=int, default=512)
+    parser.add_argument("--head-dim", type=int, default=44)
+    parser.add_argument("--intermediate", type=int, default=704)
     parser.add_argument("--attention-window", type=int, default=None)
     parser.add_argument(
         "--attention-dropout",
@@ -2272,15 +2310,22 @@ def main():
     parser.add_argument(
         "--rnn-transition",
         type=str,
-        choices=["gru", "residual"],
+        choices=["gru", "residual", "residual_mlp"],
         default="gru",
-        help="RNN deterministic transition: original GRU or residual update h_t=h_{t-1}+g(x_t,h_{t-1}).",
+        help="RNN deterministic transition: GRU, residual add, or residual add + LLaMA MLP block.",
     )
     parser.add_argument(
         "--rnn-residual-scale",
         type=float,
         default=1.0,
-        help="Scale for residual RNN update when --rnn-transition=residual.",
+        help="Scale a for residual RNN update when --rnn-transition is residual or residual_mlp: h_t=h_{t-1}+a*g_t.",
+    )
+    parser.add_argument(
+        "--rnn-state-norm",
+        type=str,
+        choices=["none", "layernorm", "rmsnorm"],
+        default="none",
+        help="Normalization on RNN hidden sequence before prediction heads.",
     )
     parser.add_argument(
         "--rssm-transition",
@@ -2479,6 +2524,7 @@ def main():
         f"batch_size={args.batch_size} epochs={args.epochs} attention_window={args.attention_window} "
         f"context_len={args.context_len} probe_hidden_dim={args.probe_hidden_dim} probe_layers={args.probe_layers} "
         f"rnn_transition={args.rnn_transition} rnn_residual_scale={args.rnn_residual_scale} "
+        f"rnn_state_norm={args.rnn_state_norm} "
         f"rssm_transition={args.rssm_transition} rssm_residual_scale={args.rssm_residual_scale} "
         f"rssm_state_norm={args.rssm_state_norm} "
         f"contrastive_w={args.contrastive_weight} contrastive_dim={args.contrastive_dim} "
@@ -2573,6 +2619,7 @@ def main():
             probe_layers=args.probe_layers,
             transition=args.rnn_transition,
             residual_scale=args.rnn_residual_scale,
+            state_norm=args.rnn_state_norm,
             contrastive_dim=args.contrastive_dim,
         ).to(args.device)
         model_config_extra["rnn"] = {
@@ -2583,6 +2630,7 @@ def main():
             "probe_layers": args.probe_layers,
             "transition": args.rnn_transition,
             "residual_scale": args.rnn_residual_scale,
+            "state_norm": args.rnn_state_norm,
             "contrastive_dim": args.contrastive_dim,
         }
     elif args.model_type == "rssm-discrete":
@@ -2861,6 +2909,7 @@ def main():
                 "probe_layers": args.probe_layers,
                 "rnn_transition": args.rnn_transition,
                 "rnn_residual_scale": args.rnn_residual_scale,
+                "rnn_state_norm": args.rnn_state_norm,
                 "rssm_transition": args.rssm_transition,
                 "rssm_residual_scale": args.rssm_residual_scale,
                 "rssm_state_norm": args.rssm_state_norm,

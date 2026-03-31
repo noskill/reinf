@@ -320,6 +320,7 @@ def build_model_from_checkpoint(ckpt: dict, sensor_mode: str, device: str):
         contrastive_dim = int(rcfg.get("contrastive_dim", model_cfg.get("contrastive_dim", contrastive_dim_cfg)))
         transition = str(rcfg.get("transition", cfg.get("rnn_transition", "gru")))
         residual_scale = float(rcfg.get("residual_scale", cfg.get("rnn_residual_scale", 1.0)))
+        state_norm = str(rcfg.get("state_norm", cfg.get("rnn_state_norm", "none")))
         default_input_size = sensor_dim + 2
         rnn_cfg = LlamaConfig(
             input_size=int(rcfg.get("input_size", default_input_size)),
@@ -342,6 +343,7 @@ def build_model_from_checkpoint(ckpt: dict, sensor_mode: str, device: str):
             probe_layers=probe_layers,
             transition=transition,
             residual_scale=residual_scale,
+            state_norm=state_norm,
             contrastive_dim=contrastive_dim,
         ).to(device)
     else:

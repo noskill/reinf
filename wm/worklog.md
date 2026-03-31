@@ -220,3 +220,63 @@ i think perhaps rnn is undertrained and transformer simply don't expose these in
 - Sensor smoothing note:
   - large `--sensor-sigma` hurts exact LR-bin fit in this setup and can make training look worse on `lr_acc`.
   - for strict overfit diagnostics, prefer `--sensor-sigma 0.0`.
+
+## Update (2026-03-31)
+
+### GRU OFAT Sweep (train/val summary)
+
+Settings:
+- `model_type=rnn`, `rnn_transition=gru`, sensor-only objective (`loc/head/turn/step=0`), categorical sensors.
+- OFAT phases in `wm_sweep_rnn_gru_tune.sh`: norm, lr, wd, sigma, capacity.
+
+Best per phase (final logged epoch):
+
+| Phase | Best run | Train `lr_acc` | Val `lr_acc` | Val `lr_rmse` |
+|---|---|---:|---:|---:|
+| norm | `wm_rnn_gru_ofat_norm_nlayernorm_lr3em4_wd0p0_ss0p0_h128_l2_200e.log` | 0.592 | 0.555 | 1.099 |
+| lr | `wm_rnn_gru_ofat_lr_nrmsnorm_lr3em4_wd0p0_ss0p0_h128_l2_200e.log` | 0.589 | 0.552 | 1.099 |
+| wd | `wm_rnn_gru_ofat_wd_nrmsnorm_lr3em4_wd1em2_ss0p0_h128_l2_200e.log` | 0.588 | 0.554 | 1.097 |
+| sigma | `wm_rnn_gru_ofat_sigma_nrmsnorm_lr3em4_wd0p0_ss1p0_h128_l2_200e.log` | 0.580 | 0.560 | 1.129 |
+| capacity* | `wm_rnn_gru_ofat_capacity_nrmsnorm_lr3em4_wd0p0_ss0p0_h128_l2_200e.log` | 0.589 | 0.552 | 1.099 |
+
+\*In the first OFAT capacity phase, several width/depth runs failed due fixed `head_dim=32` constraint (`hidden_size != heads * head_dim`). Sweep scripts were patched to set `head_dim = hidden_size / 4`.
+
+Notes:
+- `lr=1e-3` strongly overfit (`train lr_acc=0.960`, `val lr_acc=0.456`).
+- Smoother sensor targets improved val `lr_acc` in this metric set (`sigma=0.5/1.0`), with `sigma=1.0` trading worse `val lr_rmse`.
+
+### GRU Capacity Re-run (fixed head_dim)
+
+Settings:
+- `lr=3e-4`, `wd=0.0`, `sensor_sigma=0.0`, `rnn_state_norm=rmsnorm`, `epochs=200`.
+- Logs: `wm_rnn_gru_capacity_*_200e.log`.
+
+| Hidden/Layers | Train `lr_acc` | Val `lr_acc` | Val `lr_rmse` |
+|---|---:|---:|---:|
+| `128 / 2` | 0.589 | 0.552 | 1.099 |
+| `128 / 6` | 0.818 | 0.504 | 1.321 |
+| `136 / 5` | 0.860 | 0.510 | 1.321 |
+| `152 / 4` | 0.886 | 0.495 | 1.389 |
+| `176 / 3` | 0.889 | 0.476 | 1.350 |
+| `216 / 2` | 0.748 | 0.506 | 1.232 |
+
+Interpretation:
+- Increasing capacity significantly improves train fit but hurts validation in this current regime.
+- Best val result in this re-run remains `128/2`.
+
+### Additional Targeted Runs
+
+| Run | Train `lr_acc` | Val `lr_acc` | Val `lr_rmse` |
+|---|---:|---:|---:|
+| `wm_rnn_gru_h128_l3_200e.log` | 0.639 | 0.551 | 1.124 |
+| `wm_rnn_gru_h256_l3_200e.log` | 0.974 | 0.478 | 1.420 |
+
+Takeaway:
+- `h128,l3` is close to baseline val accuracy but not better.
+- `h256,l3` heavily overfits with clear train/val gap.
+
+
+
+next plan:
+
+pretrain transformer/rnn; use smaller number of epochs for word modelling losses
