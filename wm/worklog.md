@@ -280,3 +280,46 @@ Takeaway:
 next plan:
 
 pretrain transformer/rnn; use smaller number of epochs for word modelling losses
+
+## Update (2026-03-31, Pretraining Baselines)
+
+### RNN Completed
+
+- Transformer pretraining completed.
+- Script: `wm_pretrain_transformer_h176l3.sh`
+- Log: `wm_transformer_pretrain_h176l3.log`
+- Checkpoint: `outputs/wm_transformer_pretrain_h176l3.pt`
+- Final (epoch 300): train `lr_acc=0.968`, val `lr_acc=0.527`, val `lr_rmse=1.305`.
+
+### Completed
+
+- RNN pretraining run A (RMSNorm variant) completed.
+  - Script: `wm_pretrain_rnn_h176l3.sh`
+  - Log: `wm_rnn_pretrain_h176l3.log`
+  - Checkpoint: `outputs/wm_rnn_pretrain_h176l3.pt`
+  - Config note: `rnn_state_norm=rmsnorm`
+  - Final (epoch 300): train `lr_acc=0.806`, val `lr_acc=0.506`, val `lr_rmse=1.260`.
+
+- RNN pretraining run B (no norm variant) completed.
+  - Script: `wm_pretrain_rnn_h176l3.sh` with `RNN_NORM=none` variant naming.
+  - Log: `wm_rnn_pretrain_no_norm_h176l3.log`
+  - Checkpoint: `outputs/wm_rnn_pretrain_no_norm_h176l3.pt`
+  - Config note: `rnn_state_norm=none`
+  - Final (epoch 300): train `lr_acc=0.645`, val `lr_acc=0.538`, val `lr_rmse=1.125`.
+
+### Twister Direction Note
+
+- We need to move towards a Twister-like model.
+- Add continuous embedding heads:
+  - baselines: `h_t -> e_t`
+  - world models: use a predictor over prior features and future actions.
+- Corrected formulation from code reading:
+  - `f(prior_feat_t, a_t, ..., a_{t+k-1})`
+  - where `prior_feat_t = get_feat(prior_t)` and includes prior `\hat{z}_t` plus deterministic state `h_t`.
+- Contrastive target branch:
+  - in our implementation target is explicitly `z_t -> e_t` projection (posterior stochastic latent from augmented observations).
+- Contrastive optimization detail:
+  - for the contrastive term, gradients should flow through both branches.
+- In the Twister paper they mention virtual rollout with 10 future actions; code behavior should be interpreted via the `prior_feat_t` + action-sequence function above.
+- We need to investigate this discrepancy in detail.
+- For now, implement a similar setup in our codebase and test it.
