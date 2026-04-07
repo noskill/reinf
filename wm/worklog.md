@@ -323,3 +323,98 @@ pretrain transformer/rnn; use smaller number of epochs for word modelling losses
 - In the Twister paper they mention virtual rollout with 10 future actions; code behavior should be interpreted via the `prior_feat_t` + action-sequence function above.
 - We need to investigate this discrepancy in detail.
 - For now, implement a similar setup in our codebase and test it.
+
+## Update (2026-04-02, AC-CPC Implementation + Run Started)
+
+### Implemented (code)
+
+- Added Twister-style action-conditioned contrastive branches for world models:
+  - `f_t([prior_feat_t, a_t, ..., a_{t+h-1}]) -> e_{t+h}` for horizons `h=1..K`.
+  - Implemented in RSSM/TSSM paths via `contrastive_pred_emb_steps`.
+- Kept temperature scaling + feature normalization in InfoNCE.
+- Updated horizon weighting to Twister-style normalized exponential:
+  - branch index `t` weight = `lambda^t / sum_j lambda^j`.
+- Updated negatives to include same-row valid keys (full-matrix style), excluding only the matched positive.
+- Added optional sampled negatives for speed:
+  - new arg: `--contrastive-negatives` (`0` = full matrix, `>0` = sample N negatives per anchor).
+- Added contrastive accuracy metric similar to Twister:
+  - `cpc_acc` = fraction of rows where positive index is top-1 logit.
+- Made both projection branches nonlinear (2-layer MLP):
+  - predictor branch (`prior/action -> e`) now MLP per horizon.
+  - target branch (`z_t -> e_t`) now MLP.
+
+### New/Updated Training Interface
+
+- New args in `wm_train.py`:
+  - `--contrastive-steps`
+  - `--contrastive-horizon-discount`
+  - `--contrastive-negatives`
+- Epoch logs now include `cpc_acc`.
+
+### Script Added/Updated
+
+- Script: `wm_train_rssm_from_rnn_accpc.sh`
+- Default warm start:
+  - `outputs/wm_rnn_pretrain_h176l3.pt`
+- Current defaults:
+  - `EPOCHS=600`
+  - `CPC_WEIGHT=0.2`
+  - `CPC_DIM=128`
+  - `CPC_STEPS=10`
+  - `CPC_DISCOUNT=0.75`
+  - `CPC_NEGATIVES=128`
+  - `CONTEXT_LEN=32` (set `CONTEXT_LEN=0` for full-episode context)
+
+### Current Progress
+
+- Started new RSSM run from pretrained RNN checkpoint with AC-CPC configuration.
+- Smoke checks passed for:
+  - multi-step CPC
+  - weighted CPC
+  - sampled negatives mode
+  - `cpc_acc` logging
+
+## Update (2026-04-03, RSSM from RNN Pretrain + AC-CPC)
+
+Checkpoint:
+- `outputs/wm_rssm_from_rnn_pretrain_h176l3_accpc_600e.pt`
+
+Final training log (epoch 600):
+- train: `loss=9.8778`, `lr_acc=0.460`, `loc_x_rmse=3.897`, `loc_y_rmse=3.927`, `kl_dyn=2.7275`, `kl_rep=0.0909`, `cpc=2.9663`, `cpc_acc=0.252`
+- val: `loss=11.1011`, `lr_acc=0.484`, `loc_x_rmse=3.847`, `loc_y_rmse=4.268`, `kl_dyn=3.4961`, `kl_rep=0.1165`, `cpc=3.2241`, `cpc_acc=0.200`
+
+Reverse-path evaluation (categorical, `sensor_head=zh`, `max_val_episodes=50`, cpu):
+
+| Checkpoint | n-step | steps | lr_acc | loc_acc | after_turn_step_lr_acc | final_start_lr_acc |
+|---|---:|---:|---:|---:|---:|---:|
+| `outputs/wm_rssm_from_rnn_pretrain_h176l3_accpc_600e.pt` | 5 | 250 | 0.4120 | 0.0840 | 0.2000 | 0.4400 |
+| `outputs/wm_rssm_from_rnn_pretrain_h176l3_accpc_600e.pt` | 10 | 500 | 0.2800 | 0.0160 | 0.2200 | 0.2400 |
+
+Notes:
+- This run was trained with full context (`CONTEXT_LEN=0`).
+- AC-CPC objective is clearly active (`cpc_acc` well above random), but one-step validation `lr_acc` remains close to prior RSSM baseline range.
+
+
+from now we experiment with:
+wm_pretrain_rnn_h176l3.sh
+wm_pretrain_transformer_h128l3.sh
+then train full world model:
+
+1. Pretrain baseline backbone (h features) with sensor + AC-CPC.
+2. Initialize world model from that checkpoint (partial load as available).
+3. Train RSSM/TSSM with CPC enabled (contrastive_weight > 0) so:
+    - predictor branch (prior_feat) learns,
+    - target branch (z -> e) learns,
+    - z participates in representation shaping.
+4. Optionally ramp CPC weight down later, but not to zero too early.
+
+## Update (2026-04-06, Joint WM+Policy from Scratch Plan)
+goal - train policy with world model
+
+Plan (intrinsic-only, staged):
+1. Build a minimal trainable maze wrapper from existing `tester.py` dynamics.
+2. Phase A (no latent `z`): train baseline (`model-type=rnn` or `transformer`) + policy jointly from scratch.
+3. Use intrinsic reward only for policy optimization: `r_t = beta * MI_proxy_t` (no environment reward in this phase).
+4. Keep probe losses as diagnostics only (they do not shape backbone); backbone shaping comes from sensor objective + AC-CPC.
+5. Phase B (latent on): switch to `rssm-discrete`/`tssm` and compare emergent behavior against Phase A under the same intrinsic-reward setup.
+6. Track: coverage, loop/cycle tendency, episode length, `cpc_acc`, and transfer to goal-reaching when extrinsic reward is re-enabled later.

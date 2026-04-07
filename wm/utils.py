@@ -2,7 +2,7 @@
 """Shared utility functions for world-model training and evaluation."""
 
 import random
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -201,36 +201,78 @@ def masked_action_acc(logits: torch.Tensor, target_idx: torch.Tensor, mask: torc
     return correct
 
 
-def batch_row_next_step_contrastive_pair_loss(
-    pred_emb: Optional[torch.Tensor],
+def batch_row_k_step_contrastive_pair_stats(
+    pred_steps: List[torch.Tensor],
     target_emb: Optional[torch.Tensor],
     key_padding_mask: torch.Tensor,
     temperature: float,
-) -> torch.Tensor:
-    """InfoNCE for world models: prior-branch prediction vs posterior-z projection.
-
-    Positive pair: (pred_t, target_{t+1}) from the same row.
-    Negative pool: all valid target_{t+1} from other rows.
-    Gradients flow through both branches.
-    """
-    if pred_emb is None or target_emb is None:
-        return torch.tensor(0.0, device=key_padding_mask.device)
-    if pred_emb.ndim != 3 or target_emb.ndim != 3:
-        raise ValueError(
-            f"Expected pred_emb/target_emb [B, T, D], got {tuple(pred_emb.shape)} and {tuple(target_emb.shape)}"
-        )
-    if pred_emb.shape != target_emb.shape:
-        raise ValueError(f"pred_emb and target_emb must have same shape, got {pred_emb.shape} vs {target_emb.shape}")
+    horizon_discount: float = 1.0,
+    max_negatives: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return `(loss, acc)` for multi-horizon row-wise InfoNCE."""
+    if target_emb is None:
+        zero = torch.tensor(0.0, device=key_padding_mask.device)
+        return zero, zero
+    if target_emb.ndim != 3:
+        raise ValueError(f"Expected target_emb [B, T, D], got {tuple(target_emb.shape)}")
     if temperature <= 0:
         raise ValueError("contrastive temperature must be > 0")
+    if horizon_discount <= 0:
+        raise ValueError("horizon_discount must be > 0")
+    if max_negatives < 0:
+        raise ValueError("max_negatives must be >= 0")
+    if not pred_steps:
+        zero = torch.tensor(0.0, device=target_emb.device, dtype=target_emb.dtype)
+        return zero, zero
 
-    B, T, _ = pred_emb.shape
-    if B < 2 or T < 2:
-        return torch.tensor(0.0, device=pred_emb.device, dtype=pred_emb.dtype)
-    anchor = pred_emb[:, :-1, :]    # [B, T-1, D]
-    key = target_emb[:, 1:, :]      # [B, T-1, D]
-    valid = (~key_padding_mask[:, :-1]) & (~key_padding_mask[:, 1:])  # [B, T-1]
-    return _batch_row_infonce(anchor, key, valid, temperature)
+    B, T, _ = target_emb.shape
+    losses: List[torch.Tensor] = []
+    accs: List[torch.Tensor] = []
+    weights: List[torch.Tensor] = []
+    K = len(pred_steps)
+    if K == 0:
+        zero = torch.tensor(0.0, device=target_emb.device, dtype=target_emb.dtype)
+        return zero, zero
+    norm_denom = sum(float(horizon_discount) ** t for t in range(K))
+    for t, pred_h in enumerate(pred_steps):
+        h = t + 1
+        if pred_h is None or pred_h.ndim != 3:
+            continue
+        if pred_h.shape[0] != B:
+            raise ValueError(f"pred_steps[{h-1}] batch mismatch: {pred_h.shape[0]} vs {B}")
+        Th = int(pred_h.shape[1])
+        if Th <= 0 or h >= T:
+            continue
+        max_th = T - h
+        if Th > max_th:
+            pred_h = pred_h[:, :max_th, :]
+            Th = max_th
+        key_h = target_emb[:, h : h + Th, :]
+        if key_h.shape[-1] != pred_h.shape[-1]:
+            raise ValueError(
+                f"pred/target dim mismatch at horizon {h}: {pred_h.shape[-1]} vs {key_h.shape[-1]}"
+            )
+        valid = (~key_padding_mask[:, :Th]) & (~key_padding_mask[:, h : h + Th])
+        loss_h, acc_h = _batch_row_infonce(
+            pred_h,
+            key_h,
+            valid,
+            temperature,
+            max_negatives=max_negatives,
+        )
+        losses.append(loss_h)
+        accs.append(acc_h)
+        weights.append(pred_h.new_tensor((float(horizon_discount) ** t) / norm_denom))
+
+    if not losses:
+        zero = torch.tensor(0.0, device=target_emb.device, dtype=target_emb.dtype)
+        return zero, zero
+    loss_t = torch.stack(losses)
+    acc_t = torch.stack(accs)
+    weight_t = torch.stack(weights)
+    weighted_loss = (loss_t * weight_t).sum()
+    weighted_acc = (acc_t * weight_t).sum() / weight_t.sum()
+    return weighted_loss, weighted_acc
 
 
 def _batch_row_infonce(
@@ -238,29 +280,71 @@ def _batch_row_infonce(
     key: torch.Tensor,
     valid: torch.Tensor,
     temperature: float,
-) -> torch.Tensor:
+    max_negatives: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     if valid.sum() == 0:
-        return torch.tensor(0.0, device=anchor.device, dtype=anchor.dtype)
+        zero = torch.tensor(0.0, device=anchor.device, dtype=anchor.dtype)
+        return zero, zero
+
+    if max_negatives < 0:
+        raise ValueError("max_negatives must be >= 0")
 
     B, Tm1, D = anchor.shape
     K = B * Tm1
     anchor_flat = anchor.reshape(K, D)
     key_flat = key.reshape(K, D)
     valid_flat = valid.reshape(K)
-    row_ids = torch.arange(B, device=anchor.device).view(B, 1).expand(B, Tm1).reshape(K)
 
     sel = torch.nonzero(valid_flat, as_tuple=False).squeeze(1)
     anchor_sel = F.normalize(anchor_flat[sel], dim=-1)
     key_norm = F.normalize(key_flat, dim=-1)
-    logits = torch.matmul(anchor_sel, key_norm.transpose(0, 1)) / temperature  # [N, K]
-
     pos_idx = sel
-    anchor_rows = row_ids[sel]
-    # Keep only valid keys from other rows; always include own positive key.
-    allowed = valid_flat.unsqueeze(0) & (row_ids.unsqueeze(0) != anchor_rows.unsqueeze(1))
-    allowed.scatter_(1, pos_idx.unsqueeze(1), True)
-    logits = logits.masked_fill(~allowed, -1e9)
+
+    # Positive index for each selected anchor is the aligned flattened timestep.
+    # This is equivalent to taking diagonal similarities in Twister-style code
+    # after flattening anchor/key matrices to [B', D] and computing [B', B'].
+    if max_negatives <= 0:
+        logits = torch.matmul(anchor_sel, key_norm.transpose(0, 1)) / temperature  # [N, K]
+        # Full-matrix negatives: all valid keys (including same-row keys),
+        # while keeping the aligned positive at pos_idx.
+        allowed = valid_flat.unsqueeze(0).expand(pos_idx.shape[0], -1).clone()
+        allowed.scatter_(1, pos_idx.unsqueeze(1), True)
+        logits = logits.masked_fill(~allowed, -1e9)
+        loss = F.cross_entropy(logits, pos_idx)
+        acc = (torch.argmax(logits, dim=-1) == pos_idx).to(logits.dtype).mean()
+        return loss, acc
+
+    # Sampled-negatives path: keep positive + up to max_negatives valid keys.
+    # This reduces O(N*K) similarity compute to O(N*max_negatives).
+    valid_idx = torch.nonzero(valid_flat, as_tuple=False).squeeze(1)  # [V]
+    V = int(valid_idx.numel())
+    N = int(pos_idx.numel())
+    if V <= 1:
+        zero = torch.tensor(0.0, device=anchor.device, dtype=anchor.dtype)
+        return zero, zero
+    M = min(int(max_negatives), V - 1)
+    if M <= 0:
+        zero = torch.tensor(0.0, device=anchor.device, dtype=anchor.dtype)
+        return zero, zero
+
+    rank_map = torch.full((K,), -1, dtype=torch.long, device=anchor.device)
+    rank_map[valid_idx] = torch.arange(V, device=anchor.device)
+    pos_rank = rank_map[pos_idx]  # [N]
+    # Sample from [0, V-2], then skip each anchor's positive rank.
+    rnd = torch.randint(0, V - 1, (N, M), device=anchor.device)
+    neg_rank = rnd + (rnd >= pos_rank.unsqueeze(1)).to(torch.long)
+    neg_idx = valid_idx[neg_rank]  # [N, M]
+
+    pos_key = key_norm[pos_idx]  # [N, D]
+    neg_key = key_norm[neg_idx]  # [N, M, D]
+    logits_pos = (anchor_sel * pos_key).sum(dim=-1, keepdim=True) / temperature
+    logits_neg = torch.einsum("nd,nmd->nm", anchor_sel, neg_key) / temperature
+    logits = torch.cat([logits_pos, logits_neg], dim=1)  # [N, 1+M]
+    labels = torch.zeros((N,), dtype=torch.long, device=anchor.device)
 
     # Future improvement: add negatives from virtual rollouts (model-generated embeddings).
     # Future improvement: add hard negatives from the same episode but temporally distant steps.
-    return F.cross_entropy(logits, pos_idx)
+    loss = F.cross_entropy(logits, labels)
+    # Twister-style contrastive accuracy: matched positive is argmax in row.
+    acc = (torch.argmax(logits, dim=-1) == labels).to(logits.dtype).mean()
+    return loss, acc

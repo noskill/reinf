@@ -204,6 +204,7 @@ def build_model_from_checkpoint(ckpt: dict, sensor_mode: str, device: str):
     sensor_max = np.asarray(stats["sensor_max"], dtype=np.int64)
     sensor_bins = (sensor_max - sensor_min + 1).astype(np.int64)
     contrastive_dim_cfg = int(cfg.get("contrastive_dim", 0))
+    contrastive_steps_cfg = int(cfg.get("contrastive_steps", 1))
 
     def resolve_probe_layers(model_cfg_section: dict, probe_hidden_dim: int) -> int:
         raw = model_cfg_section.get("probe_layers", cfg.get("probe_layers", None))
@@ -218,6 +219,7 @@ def build_model_from_checkpoint(ckpt: dict, sensor_mode: str, device: str):
         probe_hidden_dim = int(mcfg.get("probe_hidden_dim", cfg.get("probe_hidden_dim", 0)))
         probe_layers = resolve_probe_layers(mcfg, probe_hidden_dim)
         contrastive_dim = int(mcfg.get("contrastive_dim", contrastive_dim_cfg))
+        contrastive_steps = int(mcfg.get("contrastive_steps", contrastive_steps_cfg))
         model = TSSMDiscretePredictor(
             hidden_size=int(mcfg["hidden_size"]),
             layers=int(mcfg["layers"]),
@@ -249,6 +251,7 @@ def build_model_from_checkpoint(ckpt: dict, sensor_mode: str, device: str):
             probe_hidden_dim=probe_hidden_dim,
             probe_layers=probe_layers,
             contrastive_dim=contrastive_dim,
+            contrastive_steps=contrastive_steps,
             recon_beta=float(mcfg["recon_beta"]),
             obs_loss_mode=str(mcfg["obs_loss_mode"]),
         ).to(device)
@@ -257,6 +260,7 @@ def build_model_from_checkpoint(ckpt: dict, sensor_mode: str, device: str):
         probe_hidden_dim = int(mcfg.get("probe_hidden_dim", cfg.get("probe_hidden_dim", 0)))
         probe_layers = resolve_probe_layers(mcfg, probe_hidden_dim)
         contrastive_dim = int(mcfg.get("contrastive_dim", contrastive_dim_cfg))
+        contrastive_steps = int(mcfg.get("contrastive_steps", contrastive_steps_cfg))
         transition = str(mcfg.get("transition", cfg.get("rssm_transition", "gru")))
         residual_scale = float(mcfg.get("residual_scale", cfg.get("rssm_residual_scale", 1.0)))
         state_norm = str(mcfg.get("state_norm", cfg.get("rssm_state_norm", "none")))
@@ -286,6 +290,7 @@ def build_model_from_checkpoint(ckpt: dict, sensor_mode: str, device: str):
             probe_hidden_dim=probe_hidden_dim,
             probe_layers=probe_layers,
             contrastive_dim=contrastive_dim,
+            contrastive_steps=contrastive_steps,
             transition=transition,
             residual_scale=residual_scale,
             state_norm=state_norm,
@@ -297,6 +302,7 @@ def build_model_from_checkpoint(ckpt: dict, sensor_mode: str, device: str):
         probe_hidden_dim = int(model_cfg.get("probe_hidden_dim", cfg.get("probe_hidden_dim", 0)))
         probe_layers = resolve_probe_layers(model_cfg, probe_hidden_dim)
         contrastive_dim = int(model_cfg.get("contrastive_dim", contrastive_dim_cfg))
+        contrastive_steps = int(model_cfg.get("contrastive_steps", contrastive_steps_cfg))
         model = UnifiedPredictor(
             llama_cfg,
             sensor_mode=sensor_mode,
@@ -312,12 +318,14 @@ def build_model_from_checkpoint(ckpt: dict, sensor_mode: str, device: str):
             probe_hidden_dim=probe_hidden_dim,
             probe_layers=probe_layers,
             contrastive_dim=contrastive_dim,
+            contrastive_steps=contrastive_steps,
         ).to(device)
     elif model_type == "rnn":
         rcfg = model_cfg.get("rnn", {})
         probe_hidden_dim = int(rcfg.get("probe_hidden_dim", model_cfg.get("probe_hidden_dim", cfg.get("probe_hidden_dim", 0))))
         probe_layers = resolve_probe_layers(rcfg, probe_hidden_dim)
         contrastive_dim = int(rcfg.get("contrastive_dim", model_cfg.get("contrastive_dim", contrastive_dim_cfg)))
+        contrastive_steps = int(rcfg.get("contrastive_steps", model_cfg.get("contrastive_steps", contrastive_steps_cfg)))
         transition = str(rcfg.get("transition", cfg.get("rnn_transition", "gru")))
         residual_scale = float(rcfg.get("residual_scale", cfg.get("rnn_residual_scale", 1.0)))
         state_norm = str(rcfg.get("state_norm", cfg.get("rnn_state_norm", "none")))
@@ -345,6 +353,7 @@ def build_model_from_checkpoint(ckpt: dict, sensor_mode: str, device: str):
             residual_scale=residual_scale,
             state_norm=state_norm,
             contrastive_dim=contrastive_dim,
+            contrastive_steps=contrastive_steps,
         ).to(device)
     else:
         raise ValueError(f"Unsupported model_type: {model_type}")

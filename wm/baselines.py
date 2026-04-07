@@ -28,6 +28,7 @@ class UnifiedPredictor(PredictionLossMixin, nn.Module):
         probe_hidden_dim: int = 256,
         probe_layers: int = 2,
         contrastive_dim: int = 0,
+        contrastive_steps: int = 1,
     ):
         super().__init__()
         self.backbone = LlamaModel(config)
@@ -36,15 +37,21 @@ class UnifiedPredictor(PredictionLossMixin, nn.Module):
         self.turn_bins = turn_bins
         self.step_bins = step_bins
         self.input_size = config.input_size
+        self.action_dim = int(config.input_size - sensor_dim)
+        if self.action_dim <= 0:
+            raise ValueError("action_dim inferred from config.input_size - sensor_dim must be > 0")
         self.probe_hidden_dim = int(probe_hidden_dim)
         self.probe_layers = int(probe_layers)
         self.contrastive_dim = int(contrastive_dim)
+        self.contrastive_steps = int(contrastive_steps)
         if self.probe_hidden_dim < 0:
             raise ValueError("probe_hidden_dim must be >= 0")
         if self.probe_layers < 1:
             raise ValueError("probe_layers must be >= 1")
         if self.contrastive_dim < 0:
             raise ValueError("contrastive_dim must be >= 0")
+        if self.contrastive_steps < 1:
+            raise ValueError("contrastive_steps must be >= 1")
         if sensor_mode == "categorical":
             assert sensor_bins is not None and len(sensor_bins) == 3
             self.sensor_head_l = nn.Linear(config.hidden_size, int(sensor_bins[0]))
@@ -63,9 +70,44 @@ class UnifiedPredictor(PredictionLossMixin, nn.Module):
         self.fuse = nn.Linear(config.hidden_size + obs_latent_dim, config.hidden_size)
         self.turn_head = nn.Linear(config.hidden_size, turn_bins)
         self.step_head = nn.Linear(config.hidden_size, step_bins)
-        self.contrastive_head: Optional[nn.Module] = None
+        self.contrastive_target_head: Optional[nn.Module] = None
+        self.contrastive_action_heads: Optional[nn.ModuleList] = None
         if self.contrastive_dim > 0:
-            self.contrastive_head = nn.Linear(config.hidden_size, self.contrastive_dim)
+            self.contrastive_target_head = nn.Sequential(
+                nn.Linear(config.hidden_size, config.hidden_size),
+                nn.ReLU(),
+                nn.Linear(config.hidden_size, self.contrastive_dim),
+            )
+            self.contrastive_action_heads = nn.ModuleList(
+                [
+                    nn.Sequential(
+                        nn.Linear(config.hidden_size + h * self.action_dim, config.hidden_size),
+                        nn.ReLU(),
+                        nn.Linear(config.hidden_size, self.contrastive_dim),
+                    )
+                    for h in range(1, self.contrastive_steps + 1)
+                ]
+            )
+
+    def _project_contrastive_target_h(self, h: torch.Tensor) -> Optional[torch.Tensor]:
+        if self.contrastive_target_head is None:
+            return None
+        return self.contrastive_target_head(h)
+
+    def _project_contrastive_pred_steps(self, h: torch.Tensor, actions: torch.Tensor) -> List[torch.Tensor]:
+        if self.contrastive_dim <= 0 or self.contrastive_action_heads is None:
+            return []
+        B, T, _ = h.shape
+        pred_steps: List[torch.Tensor] = []
+        for horizon, head in enumerate(self.contrastive_action_heads, start=1):
+            if horizon >= T:
+                break
+            th = T - horizon
+            action_chunks = [actions[:, i : i + th, :] for i in range(horizon)]
+            action_ctx = torch.cat(action_chunks, dim=-1) if action_chunks else actions.new_zeros((B, th, 0))
+            pred_in = torch.cat([h[:, :th, :], action_ctx], dim=-1)
+            pred_steps.append(head(pred_in))
+        return pred_steps
 
     def forward(
         self,
@@ -76,6 +118,9 @@ class UnifiedPredictor(PredictionLossMixin, nn.Module):
         prev_hidden=None,
         return_state=False,
         return_aux=False,
+        return_losses=False,
+        return_metrics=False,
+        targets=None,
     ):
         sensor = obs["sensor"]
         actions = obs["actions"]
@@ -115,13 +160,32 @@ class UnifiedPredictor(PredictionLossMixin, nn.Module):
         fused = torch.tanh(self.fuse(torch.cat([h_prev.detach(), z.detach()], dim=-1)))
         turn = self.turn_head(fused)
         step = self.step_head(fused)
+        need_aux = return_aux or return_losses or return_metrics
         aux_inputs = None
-        if return_aux:
+        if need_aux:
             aux_inputs = {}
-            if self.contrastive_head is not None:
-                emb = self.contrastive_head(h)
-                aux_inputs["contrastive_pred_emb"] = emb
-                aux_inputs["contrastive_tgt_emb"] = emb
+            if self.contrastive_target_head is not None:
+                aux_inputs["contrastive_tgt_emb"] = self._project_contrastive_target_h(h)
+                aux_inputs["contrastive_pred_emb_steps"] = self._project_contrastive_pred_steps(h, actions)
+
+        preds = (pred_sensor, loc_x, loc_y, heading, turn, step)
+        losses = None
+        metrics = None
+        if return_losses or return_metrics:
+            losses, metrics = self.compute_losses_and_metrics(
+                preds=preds,
+                targets=targets,
+                aux_inputs=aux_inputs,
+                return_metrics=return_metrics,
+            )
+            return {
+                "preds": preds,
+                "state": h[:, -1, :] if return_state else None,
+                "aux": aux_inputs if return_aux else None,
+                "losses": losses,
+                "metrics": metrics,
+            }
+
         if return_state:
             if return_aux:
                 return pred_sensor, loc_x, loc_y, heading, turn, step, h[:, -1, :], aux_inputs
@@ -155,6 +219,7 @@ class RNNPredictor(UnifiedPredictor):
         residual_scale: float = 1.0,
         state_norm: str = "none",
         contrastive_dim: int = 0,
+        contrastive_steps: int = 1,
     ):
         super().__init__(
             config,
@@ -171,6 +236,7 @@ class RNNPredictor(UnifiedPredictor):
             probe_hidden_dim=probe_hidden_dim,
             probe_layers=probe_layers,
             contrastive_dim=contrastive_dim,
+            contrastive_steps=contrastive_steps,
         )
         self.transition = str(transition)
         self.residual_scale = float(residual_scale)
@@ -210,6 +276,9 @@ class RNNPredictor(UnifiedPredictor):
         prev_hidden=None,
         return_state=False,
         return_aux=False,
+        return_losses=False,
+        return_metrics=False,
+        targets=None,
     ):
         del attention_window, past_key_values, cache_position
         sensor = obs["sensor"]
@@ -266,13 +335,32 @@ class RNNPredictor(UnifiedPredictor):
         fused = torch.tanh(self.fuse(torch.cat([h_prev.detach(), z.detach()], dim=-1)))
         turn = self.turn_head(fused)
         step = self.step_head(fused)
+        need_aux = return_aux or return_losses or return_metrics
         aux_inputs = None
-        if return_aux:
+        if need_aux:
             aux_inputs = {}
-            if self.contrastive_head is not None:
-                emb = self.contrastive_head(h)
-                aux_inputs["contrastive_pred_emb"] = emb
-                aux_inputs["contrastive_tgt_emb"] = emb
+            if self.contrastive_target_head is not None:
+                aux_inputs["contrastive_tgt_emb"] = self._project_contrastive_target_h(h)
+                aux_inputs["contrastive_pred_emb_steps"] = self._project_contrastive_pred_steps(h, actions)
+
+        preds = (pred_sensor, loc_x, loc_y, heading, turn, step)
+        losses = None
+        metrics = None
+        if return_losses or return_metrics:
+            losses, metrics = self.compute_losses_and_metrics(
+                preds=preds,
+                targets=targets,
+                aux_inputs=aux_inputs,
+                return_metrics=return_metrics,
+            )
+            return {
+                "preds": preds,
+                "state": h[:, -1, :] if return_state else None,
+                "aux": aux_inputs if return_aux else None,
+                "losses": losses,
+                "metrics": metrics,
+            }
+
         if return_state:
             if return_aux:
                 return pred_sensor, loc_x, loc_y, heading, turn, step, h[:, -1, :], aux_inputs

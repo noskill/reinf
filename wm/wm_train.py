@@ -21,7 +21,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from base import DiscreteLatentPredictorBase
+from base import DiscreteLatentPredictorBase, LossConfig
 from baselines import RNNPredictor, UnifiedPredictor
 from data import HEADING_CANON, WindowedDataset, build_sequences, collate_batch, compute_stats, load_episodes
 from rssm import RSSMDiscretePredictor
@@ -197,6 +197,24 @@ def main():
         help="Temperature for next-step contrastive loss.",
     )
     parser.add_argument(
+        "--contrastive-horizon-discount",
+        type=float,
+        default=0.75,
+        help="Exponential horizon weighting for CPC (horizon h uses weight discount**h).",
+    )
+    parser.add_argument(
+        "--contrastive-steps",
+        type=int,
+        default=1,
+        help="Number of Twister-style action-conditioned contrastive horizons (K).",
+    )
+    parser.add_argument(
+        "--contrastive-negatives",
+        type=int,
+        default=0,
+        help="Number of sampled negatives per anchor for CPC (0 uses all valid negatives).",
+    )
+    parser.add_argument(
         "--bptt-horizon",
         type=int,
         default=0,
@@ -280,8 +298,14 @@ def main():
         raise ValueError("--contrastive-dim must be >= 0")
     if args.contrastive_temp <= 0:
         raise ValueError("--contrastive-temp must be > 0")
+    if args.contrastive_horizon_discount <= 0:
+        raise ValueError("--contrastive-horizon-discount must be > 0")
     if args.contrastive_weight > 0 and args.contrastive_dim <= 0:
         raise ValueError("--contrastive-dim must be > 0 when --contrastive-weight > 0")
+    if args.contrastive_steps < 1:
+        raise ValueError("--contrastive-steps must be >= 1")
+    if args.contrastive_negatives < 0:
+        raise ValueError("--contrastive-negatives must be >= 0")
     try:
         sys.stdout.reconfigure(line_buffering=True)
     except Exception:
@@ -335,7 +359,8 @@ def main():
         f"rssm_transition={args.rssm_transition} rssm_residual_scale={args.rssm_residual_scale} "
         f"rssm_state_norm={args.rssm_state_norm} "
         f"contrastive_w={args.contrastive_weight} contrastive_dim={args.contrastive_dim} "
-        f"contrastive_temp={args.contrastive_temp} "
+        f"contrastive_temp={args.contrastive_temp} contrastive_steps={args.contrastive_steps} "
+        f"contrastive_discount={args.contrastive_horizon_discount} contrastive_negs={args.contrastive_negatives} "
         f"attn_dropout={args.attention_dropout} weight_decay={args.weight_decay} "
         f"prior_roll_w={args.prior_rollout_weight} z_only_w={args.z_only_weight} "
         f"h_only_w={args.h_only_weight} "
@@ -391,11 +416,13 @@ def main():
             probe_hidden_dim=args.probe_hidden_dim,
             probe_layers=args.probe_layers,
             contrastive_dim=args.contrastive_dim,
+            contrastive_steps=args.contrastive_steps,
         ).to(args.device)
         model_config_extra["llama"] = asdict(cfg)
         model_config_extra["probe_hidden_dim"] = args.probe_hidden_dim
         model_config_extra["probe_layers"] = args.probe_layers
         model_config_extra["contrastive_dim"] = args.contrastive_dim
+        model_config_extra["contrastive_steps"] = args.contrastive_steps
     elif args.model_type == "rnn":
         if args.sensor_mode != "categorical":
             raise ValueError("model-type=rnn currently supports --sensor-mode categorical only")
@@ -428,6 +455,7 @@ def main():
             residual_scale=args.rnn_residual_scale,
             state_norm=args.rnn_state_norm,
             contrastive_dim=args.contrastive_dim,
+            contrastive_steps=args.contrastive_steps,
         ).to(args.device)
         model_config_extra["rnn"] = {
             "input_size": input_dim,
@@ -439,6 +467,7 @@ def main():
             "residual_scale": args.rnn_residual_scale,
             "state_norm": args.rnn_state_norm,
             "contrastive_dim": args.contrastive_dim,
+            "contrastive_steps": args.contrastive_steps,
         }
     elif args.model_type == "rssm-discrete":
         model = RSSMDiscretePredictor(
@@ -468,6 +497,7 @@ def main():
             probe_hidden_dim=args.probe_hidden_dim,
             probe_layers=args.probe_layers,
             contrastive_dim=args.contrastive_dim,
+            contrastive_steps=args.contrastive_steps,
             transition=args.rssm_transition,
             residual_scale=args.rssm_residual_scale,
             state_norm=args.rssm_state_norm,
@@ -490,6 +520,7 @@ def main():
             "probe_hidden_dim": args.probe_hidden_dim,
             "probe_layers": args.probe_layers,
             "contrastive_dim": args.contrastive_dim,
+            "contrastive_steps": args.contrastive_steps,
             "transition": args.rssm_transition,
             "residual_scale": args.rssm_residual_scale,
             "state_norm": args.rssm_state_norm,
@@ -530,6 +561,7 @@ def main():
             probe_hidden_dim=args.probe_hidden_dim,
             probe_layers=args.probe_layers,
             contrastive_dim=args.contrastive_dim,
+            contrastive_steps=args.contrastive_steps,
             recon_beta=args.recon_beta,
             obs_loss_mode=args.obs_loss_mode,
         ).to(args.device)
@@ -554,6 +586,7 @@ def main():
             "probe_hidden_dim": args.probe_hidden_dim,
             "probe_layers": args.probe_layers,
             "contrastive_dim": args.contrastive_dim,
+            "contrastive_steps": args.contrastive_steps,
             "recon_beta": args.recon_beta,
             "action_dim": action_dim,
             "obs_loss_mode": args.obs_loss_mode,
@@ -626,67 +659,57 @@ def main():
             make_soft_table(int(sensor_bins[1]), args.sensor_sigma, args.device),
             make_soft_table(int(sensor_bins[2]), args.sensor_sigma, args.device),
         ]
+
+    model.config = LossConfig(
+        sensor_tables=sensor_tables,
+        sensor_min_idx=sensor_min_idx,
+        loc_x_table=loc_x_table,
+        loc_y_table=loc_y_table,
+        heading_table=heading_table,
+        sensor_weight=args.sensor_weight,
+        loc_weight=args.loc_weight,
+        head_weight=args.head_weight,
+        turn_weight=args.turn_weight,
+        step_weight=args.step_weight,
+        contrastive_weight=args.contrastive_weight,
+        contrastive_temp=args.contrastive_temp,
+        contrastive_horizon_discount=args.contrastive_horizon_discount,
+        contrastive_negatives=args.contrastive_negatives,
+        loc_min=loc_min,
+    )
     for epoch in range(1, args.epochs + 1):
         print(f"starting epoch {epoch:03d}", flush=True)
 
-        val_loss, val_mse, val_rmse, val_lr_rmse, val_lr_acc, val_loc_x_rmse, val_loc_y_rmse, val_loc_x_acc, val_loc_y_acc, val_turn_acc, val_step_acc, val_kl_dyn, val_kl_rep, val_prior_roll, val_z_only, val_h_only, val_recon, val_contrastive = run_epoch_joint(
+        val_metrics = run_epoch_joint(
             model,
             val_loader,
             optimizer=None,
             device=args.device,
             attention_window=active_attention_window,
-            sensor_weight=args.sensor_weight,
-            loc_weight=args.loc_weight,
-            head_weight=args.head_weight,
-            turn_weight=args.turn_weight,
-            step_weight=args.step_weight,
-            loc_min=loc_min,
-            sensor_mode=args.sensor_mode,
-            sensor_min_idx=sensor_min_idx,
-            sensor_tables=sensor_tables,
-            loc_x_table=loc_x_table,
-            loc_y_table=loc_y_table,
-            heading_table=heading_table,
-            contrastive_weight=args.contrastive_weight,
-            contrastive_temp=args.contrastive_temp,
         )
 
-        train_loss, train_mse, train_rmse, train_lr_rmse, train_lr_acc, train_loc_x_rmse, train_loc_y_rmse, train_loc_x_acc, train_loc_y_acc, train_turn_acc, train_step_acc, train_kl_dyn, train_kl_rep, train_prior_roll, train_z_only, train_h_only, train_recon, train_contrastive = run_epoch_joint(
+        train_metrics = run_epoch_joint(
             model,
             train_loader,
             optimizer,
             device=args.device,
             attention_window=active_attention_window,
-            sensor_weight=args.sensor_weight,
-            loc_weight=args.loc_weight,
-            head_weight=args.head_weight,
-            turn_weight=args.turn_weight,
-            step_weight=args.step_weight,
-            loc_min=loc_min,
-            sensor_mode=args.sensor_mode,
-            sensor_min_idx=sensor_min_idx,
-            sensor_tables=sensor_tables,
-            loc_x_table=loc_x_table,
-            loc_y_table=loc_y_table,
-            heading_table=heading_table,
-            contrastive_weight=args.contrastive_weight,
-            contrastive_temp=args.contrastive_temp,
         )
 
         print(
             f"epoch {epoch:03d} | "
-            f"train loss {train_loss:.4f} mse {train_mse:.4f} rmse {train_rmse:.4f} "
-            f"lr_rmse {train_lr_rmse:.3f} lr_acc {train_lr_acc:.3f} "
-            f"loc_x_rmse {train_loc_x_rmse:.3f} loc_y_rmse {train_loc_y_rmse:.3f} "
-            f"loc_x_acc {train_loc_x_acc:.3f} loc_y_acc {train_loc_y_acc:.3f} "
-            f"turn_acc {train_turn_acc:.3f} step_acc {train_step_acc:.3f} "
-            f"kl_dyn {train_kl_dyn:.4f} kl_rep {train_kl_rep:.4f} prior_roll {train_prior_roll:.4f} z_only {train_z_only:.4f} h_only {train_h_only:.4f} recon {train_recon:.4f} cpc {train_contrastive:.4f} | "
-            f"val loss {val_loss:.4f} mse {val_mse:.4f} rmse {val_rmse:.4f} "
-            f"lr_rmse {val_lr_rmse:.3f} lr_acc {val_lr_acc:.3f} "
-            f"loc_x_rmse {val_loc_x_rmse:.3f} loc_y_rmse {val_loc_y_rmse:.3f} "
-            f"loc_x_acc {val_loc_x_acc:.3f} loc_y_acc {val_loc_y_acc:.3f} "
-            f"turn_acc {val_turn_acc:.3f} step_acc {val_step_acc:.3f} "
-            f"kl_dyn {val_kl_dyn:.4f} kl_rep {val_kl_rep:.4f} prior_roll {val_prior_roll:.4f} z_only {val_z_only:.4f} h_only {val_h_only:.4f} recon {val_recon:.4f} cpc {val_contrastive:.4f}"
+            f"train loss {train_metrics['loss']:.4f} mse {train_metrics['mse']:.4f} rmse {train_metrics['rmse']:.4f} "
+            f"lr_rmse {train_metrics['lr_rmse']:.3f} lr_acc {train_metrics['lr_acc']:.3f} "
+            f"loc_x_rmse {train_metrics['loc_x_rmse']:.3f} loc_y_rmse {train_metrics['loc_y_rmse']:.3f} "
+            f"loc_x_acc {train_metrics['loc_x_acc']:.3f} loc_y_acc {train_metrics['loc_y_acc']:.3f} "
+            f"turn_acc {train_metrics['turn_acc']:.3f} step_acc {train_metrics['step_acc']:.3f} "
+            f"kl_dyn {train_metrics['kl_dyn']:.4f} kl_rep {train_metrics['kl_rep']:.4f} prior_roll {train_metrics['prior_roll']:.4f} z_only {train_metrics['z_only']:.4f} h_only {train_metrics['h_only']:.4f} recon {train_metrics['recon']:.4f} cpc {train_metrics['contrastive']:.4f} cpc_acc {train_metrics['contrastive_acc']:.3f} | "
+            f"val loss {val_metrics['loss']:.4f} mse {val_metrics['mse']:.4f} rmse {val_metrics['rmse']:.4f} "
+            f"lr_rmse {val_metrics['lr_rmse']:.3f} lr_acc {val_metrics['lr_acc']:.3f} "
+            f"loc_x_rmse {val_metrics['loc_x_rmse']:.3f} loc_y_rmse {val_metrics['loc_y_rmse']:.3f} "
+            f"loc_x_acc {val_metrics['loc_x_acc']:.3f} loc_y_acc {val_metrics['loc_y_acc']:.3f} "
+            f"turn_acc {val_metrics['turn_acc']:.3f} step_acc {val_metrics['step_acc']:.3f} "
+            f"kl_dyn {val_metrics['kl_dyn']:.4f} kl_rep {val_metrics['kl_rep']:.4f} prior_roll {val_metrics['prior_roll']:.4f} z_only {val_metrics['z_only']:.4f} h_only {val_metrics['h_only']:.4f} recon {val_metrics['recon']:.4f} cpc {val_metrics['contrastive']:.4f} cpc_acc {val_metrics['contrastive_acc']:.3f}"
             ,
             flush=True,
         )
@@ -723,6 +746,9 @@ def main():
                 "contrastive_weight": args.contrastive_weight,
                 "contrastive_dim": args.contrastive_dim,
                 "contrastive_temp": args.contrastive_temp,
+                "contrastive_steps": args.contrastive_steps,
+                "contrastive_horizon_discount": args.contrastive_horizon_discount,
+                "contrastive_negatives": args.contrastive_negatives,
                 "pos_sigma": args.pos_sigma,
                 "heading_smoothing": args.heading_smoothing,
             },
