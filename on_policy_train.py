@@ -1,7 +1,6 @@
 import os
 import time
 import sys
-from venv import VectorEnvWrapper
 from typing import Union
 import gymnasium as gym
 import torch
@@ -51,6 +50,9 @@ def setup_env(env_cfg: Union['ManagerBasedRLEnvCfg', 'DirectRLEnvCfg', 'DirectMA
     # Convert multi-agent to single-agent if needed
     # if isinstance(env.unwrapped, MultiAgentEnv):
     #     env = multi_agent_to_single_agent(env)
+
+    # Import lazily so OnPolicyTrainer can be used without IsaacLab runtime deps.
+    from venv import VectorEnvWrapper
 
     # Add the vectorized environment wrapper
     env = VectorEnvWrapper(env, return_dict_observations=True)

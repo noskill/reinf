@@ -220,7 +220,7 @@ class ReinforceBase(Agent):
         self._log_training_stats(actions_batch)
 
         # Recompute log-probs and entropy from current policy for consistency
-        _, log_probs, dist = self.sampler(self.policy, states_batch)
+        _, log_probs, dist = self.sampler(self.policy, states_batch, actions=actions_batch)
         if isinstance(dist, TransformedDistribution):
             entropy = dist.base_dist.entropy()
         else:
@@ -265,12 +265,12 @@ class ReinforceBase(Agent):
         """
         From a list of episodes, each consisting of a sequence of tuples with various data elements,
         extract and organize the data by type across all episodes.
-
+        
         converts list of episodes to a dictionary where keys are data types and values are lists of tensors (one tensor per episode)
 
         Args:
             episodes: List of episodes, where each episode is a list of data tuples
-
+            
         Returns:
             EpisodeBatch
         """
@@ -383,7 +383,6 @@ class ReinforceBase(Agent):
         )
 
     def train_policy(self, log_probs, returns, entropy=torch.zeros(1), states_batch=None, actions=None):
-        import pdb;pdb.set_trace()
         assert log_probs.shape == returns.shape, "Expected same shape for log_probs and returns!"
         assert log_probs.shape == entropy.shape, "Expected same shape for log_probs and entropy!"
         self.optimizer_policy.zero_grad()
@@ -404,7 +403,7 @@ class ReinforceBase(Agent):
         log_clamped = log_probs.clamp(-10, 10)
         policy_loss = -(log_clamped * returns).mean() + self.entropy_coef * e_loss + mu_loss * mu_coef
         if policy_loss.abs() > 100:
-            import pdb;pdb.set_trace()
+            self.logger.log_scalar("policy loss overflow", policy_loss.item())
             return
         policy_loss.backward()
 
