@@ -22,19 +22,17 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from base import DiscreteLatentPredictorBase, LossConfig
-from baselines import RNNPredictor, UnifiedPredictor
+from baselines import TransformerBaseline
 from data import HEADING_CANON, WindowedDataset, build_sequences, collate_batch, compute_stats, load_episodes
-from rssm import RSSMDiscretePredictor
+from log import Logger
 from trainer import run_epoch_joint
-from transformer import LlamaConfig
-from tssm import TSSMDiscretePredictor
 from utils import (
     compute_baseline_lr,
     make_label_smoothing_table,
     make_soft_table,
     set_seed,
 )
-from agent_utils_wm import create_model
+from agent_utils_wm import add_create_model_args, create_model, extract_create_model_args
 
 
 def configure_recon_head_only_training(model: nn.Module) -> List[str]:
@@ -65,7 +63,7 @@ def configure_recon_head_only_training(model: nn.Module) -> List[str]:
 
 def configure_state_probe_only_training(model: nn.Module) -> List[str]:
     """Freeze model and enable only location/heading probe heads."""
-    if not isinstance(model, (DiscreteLatentPredictorBase, UnifiedPredictor)):
+    if not isinstance(model, (DiscreteLatentPredictorBase, TransformerBaseline)):
         raise ValueError("--train-state-probes-only requires model-type transformer/rnn/rssm-discrete/tssm")
 
     for p in model.parameters():
@@ -98,100 +96,12 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--val-split", type=float, default=0.1)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--hidden-size", type=int, default=176)
-    parser.add_argument("--layers", type=int, default=3)
-    parser.add_argument("--heads", type=int, default=4)
-    parser.add_argument("--head-dim", type=int, default=44)
-    parser.add_argument("--intermediate", type=int, default=704)
-    parser.add_argument("--attention-window", type=int, default=None)
-    parser.add_argument(
-        "--attention-dropout",
-        type=float,
-        default=0.0,
-        help="Attention dropout probability for transformer model.",
-    )
-    parser.add_argument(
-        "--model-type",
-        type=str,
-        choices=["transformer", "rnn", "rssm-discrete", "tssm"],
-        default="transformer",
-        help="Model architecture to train.",
-    )
-    parser.add_argument(
-        "--rnn-transition",
-        type=str,
-        choices=["gru", "residual", "residual_mlp"],
-        default="gru",
-        help="RNN deterministic transition: GRU, residual add, or residual add + LLaMA MLP block.",
-    )
-    parser.add_argument(
-        "--rnn-residual-scale",
-        type=float,
-        default=1.0,
-        help="Scale a for residual RNN update when --rnn-transition is residual or residual_mlp: h_t=h_{t-1}+a*g_t.",
-    )
-    parser.add_argument(
-        "--rnn-state-norm",
-        type=str,
-        choices=["none", "layernorm", "rmsnorm"],
-        default="none",
-        help="Normalization on RNN hidden sequence before prediction heads.",
-    )
-    parser.add_argument(
-        "--rssm-transition",
-        type=str,
-        choices=["gru", "residual"],
-        default="gru",
-        help="RSSM deterministic transition: GRUCell or residual update h_t=h_{t-1}+g_t.",
-    )
-    parser.add_argument(
-        "--rssm-residual-scale",
-        type=float,
-        default=1.0,
-        help="Scale for RSSM residual update when --rssm-transition=residual.",
-    )
-    parser.add_argument(
-        "--rssm-state-norm",
-        type=str,
-        choices=["none", "layernorm", "rmsnorm"],
-        default="none",
-        help="Pre-normalization on RSSM h_{t-1} before transition step.",
-    )
-    parser.add_argument("--stoch-size", type=int, default=32, help="Number of categorical latent groups.")
-    parser.add_argument("--stoch-classes", type=int, default=32, help="Number of classes per latent group.")
-    parser.add_argument("--stoch-temp", type=float, default=1.0, help="Gumbel-softmax temperature.")
-    parser.add_argument("--kl-dyn-beta", type=float, default=1.0, help="Weight for dynamics KL term.")
-    parser.add_argument("--kl-rep-beta", type=float, default=0.1, help="Weight for representation KL term.")
-    parser.add_argument("--kl-free-nats", type=float, default=1.0, help="Free nats clamp for both KL terms.")
-    parser.add_argument(
-        "--prior-rollout-weight",
-        type=float,
-        default=0.0,
-        help="Auxiliary weight for full-sequence open-loop prior rollout sensor prediction.",
-    )
-    parser.add_argument(
-        "--z-only-weight",
-        type=float,
-        default=0.0,
-        help="Auxiliary weight for z-only sensor prediction.",
-    )
-    parser.add_argument(
-        "--h-only-weight",
-        type=float,
-        default=0.0,
-        help="Auxiliary weight for h-only sensor prediction.",
-    )
+    add_create_model_args(parser, include_load_path=False)
     parser.add_argument(
         "--contrastive-weight",
         type=float,
         default=0.0,
         help="Weight for next-step embedding contrastive (InfoNCE) loss.",
-    )
-    parser.add_argument(
-        "--contrastive-dim",
-        type=int,
-        default=0,
-        help="Embedding dimension for contrastive head (0 disables contrastive head).",
     )
     parser.add_argument(
         "--contrastive-temp",
@@ -206,36 +116,10 @@ def main():
         help="Exponential horizon weighting for CPC (horizon h uses weight discount**h).",
     )
     parser.add_argument(
-        "--contrastive-steps",
-        type=int,
-        default=1,
-        help="Number of Twister-style action-conditioned contrastive horizons (K).",
-    )
-    parser.add_argument(
         "--contrastive-negatives",
         type=int,
         default=0,
         help="Number of sampled negatives per anchor for CPC (0 uses all valid negatives).",
-    )
-    parser.add_argument(
-        "--bptt-horizon",
-        type=int,
-        default=0,
-        help="Truncated BPTT horizon for RSSM/TSSM recurrent state (0 disables truncation).",
-    )
-    parser.add_argument(
-        "--prior-rollout-steps",
-        type=int,
-        default=0,
-        help="Open-loop prior rollout length for prior_roll loss (0 uses full sequence).",
-    )
-    parser.add_argument("--recon-beta", type=float, default=1.0, help="Weight for observation reconstruction term.")
-    parser.add_argument(
-        "--obs-loss-mode",
-        type=str,
-        choices=["soft", "recon"],
-        default="soft",
-        help="Observation loss for RSSM/TSSM: soft-target heads or L2 reconstruction from [h_t, z_t].",
     )
     parser.add_argument(
         "--train-recon-heads-only",
@@ -247,18 +131,6 @@ def main():
         action="store_true",
         help="Freeze backbone/dynamics and train only location/heading probe heads.",
     )
-    parser.add_argument(
-        "--probe-hidden-dim",
-        type=int,
-        default=256,
-        help="Hidden size for probe MLPs (set 0 to keep linear probes).",
-    )
-    parser.add_argument(
-        "--probe-layers",
-        type=int,
-        default=2,
-        help="Number of linear layers in probe heads (1=linear probe).",
-    )
     parser.add_argument("--max-episodes", type=int, default=None)
     parser.add_argument(
         "--context-len",
@@ -267,19 +139,17 @@ def main():
         help="Input/target sequence length per sample; 0 uses full episode (t->t+1 over full trajectory).",
     )
     parser.add_argument("--save-path", type=str, default="outputs/wm_next_obs.pt")
+    parser.add_argument(
+        "--log-dir",
+        type=str,
+        default=None,
+        help="TensorBoard log directory (default: logs/wm_train/<save_path_stem>).",
+    )
     parser.add_argument("--sensor-weight", type=float, default=1.0)
     parser.add_argument("--loc-weight", type=float, default=1.0)
     parser.add_argument("--head-weight", type=float, default=1.0)
     parser.add_argument("--turn-weight", type=float, default=1.0)
     parser.add_argument("--step-weight", type=float, default=1.0)
-    parser.add_argument("--obs-latent-dim", type=int, default=64)
-    parser.add_argument(
-        "--sensor-mode",
-        type=str,
-        choices=["raw", "categorical"],
-        default="raw",
-        help="Sensor target mode: raw regression or categorical",
-    )
     parser.add_argument("--sensor-sigma", type=float, default=1.0, help="Soft target sigma for sensor bins")
     parser.add_argument("--pos-sigma", type=float, default=1.0, help="Soft target sigma for location bins")
     parser.add_argument("--heading-smoothing", type=float, default=0.0, help="Label smoothing for heading targets")
@@ -315,6 +185,9 @@ def main():
         pass
 
     set_seed(args.seed)
+    save_stem = os.path.splitext(os.path.basename(args.save_path))[0]
+    log_dir = args.log_dir or os.path.join("logs", "wm_train", save_stem)
+    logger = Logger(log_dir=log_dir)
 
     episodes = load_episodes(args.data, max_episodes=args.max_episodes)
     if not episodes:
@@ -357,7 +230,6 @@ def main():
         f"run config | model={args.model_type} train_batches={len(train_loader)} val_batches={len(val_loader)} "
         f"batch_size={args.batch_size} epochs={args.epochs} attention_window={args.attention_window} "
         f"context_len={args.context_len} probe_hidden_dim={args.probe_hidden_dim} probe_layers={args.probe_layers} "
-        f"rnn_transition={args.rnn_transition} rnn_residual_scale={args.rnn_residual_scale} "
         f"rnn_state_norm={args.rnn_state_norm} "
         f"rssm_transition={args.rssm_transition} rssm_residual_scale={args.rssm_residual_scale} "
         f"rssm_state_norm={args.rssm_state_norm} "
@@ -371,6 +243,12 @@ def main():
         f"recon_heads_only={args.train_recon_heads_only}",
         flush=True,
     )
+    logger.log_scalar("config/train_batches", float(len(train_loader)), step=0)
+    logger.log_scalar("config/val_batches", float(len(val_loader)), step=0)
+    logger.log_scalar("config/batch_size", float(args.batch_size), step=0)
+    logger.log_scalar("config/epochs", float(args.epochs), step=0)
+    logger.log_scalar("config/lr", float(args.lr), step=0)
+    logger.log_scalar("config/weight_decay", float(args.weight_decay), step=0)
 
     input_obs_dim = sequences[0].obs_cont.shape[-1]
     input_dim = input_obs_dim + sequences[0].action_cont.shape[-1]
@@ -385,11 +263,15 @@ def main():
     turn_bins = len(stats.turn_to_idx)
     step_bins = len(stats.step_to_idx)
     action_dim = int(sequences[0].action_cont.shape[-1])
-    active_attention_window = args.attention_window if (args.attention_window is not None and args.attention_window > 0) else None
-    cfg = None
+    model_args = extract_create_model_args(args, device=args.device)
+    active_attention_window = (
+        model_args.attention_window
+        if (model_args.attention_window is not None and model_args.attention_window > 0)
+        else None
+    )
     model_config_extra = {}
     model = create_model(
-        args,
+        model_args,
         input_dim=input_dim,
         sensor_dim=sensor_dim,
         sensor_bins=sensor_bins,
@@ -426,6 +308,10 @@ def main():
             ,
             flush=True,
         )
+        logger.log_scalar("baseline/train_lr_rmse", float(train_bl_rmse), step=0)
+        logger.log_scalar("baseline/train_lr_acc", float(train_bl_acc), step=0)
+        logger.log_scalar("baseline/val_lr_rmse", float(val_bl_rmse), step=0)
+        logger.log_scalar("baseline/val_lr_acc", float(val_bl_acc), step=0)
 
     loc_x_table = make_soft_table(loc_x_bins, args.pos_sigma, args.device)
     loc_y_table = make_soft_table(loc_y_bins, args.pos_sigma, args.device)
@@ -458,39 +344,27 @@ def main():
     for epoch in range(1, args.epochs + 1):
         print(f"starting epoch {epoch:03d}", flush=True)
 
-        val_metrics = run_epoch_joint(
+        run_epoch_joint(
             model,
             val_loader,
             optimizer=None,
             device=args.device,
-            attention_window=active_attention_window,
+            logger=logger,
+            metric_prefix="val",
+            step=epoch,
         )
 
-        train_metrics = run_epoch_joint(
+        run_epoch_joint(
             model,
             train_loader,
             optimizer,
             device=args.device,
-            attention_window=active_attention_window,
+            logger=logger,
+            metric_prefix="train",
+            step=epoch,
         )
-
-        print(
-            f"epoch {epoch:03d} | "
-            f"train loss {train_metrics['loss']:.4f} mse {train_metrics['mse']:.4f} rmse {train_metrics['rmse']:.4f} "
-            f"lr_rmse {train_metrics['lr_rmse']:.3f} lr_acc {train_metrics['lr_acc']:.3f} "
-            f"loc_x_rmse {train_metrics['loc_x_rmse']:.3f} loc_y_rmse {train_metrics['loc_y_rmse']:.3f} "
-            f"loc_x_acc {train_metrics['loc_x_acc']:.3f} loc_y_acc {train_metrics['loc_y_acc']:.3f} "
-            f"turn_acc {train_metrics['turn_acc']:.3f} step_acc {train_metrics['step_acc']:.3f} "
-            f"kl_dyn {train_metrics['kl_dyn']:.4f} kl_rep {train_metrics['kl_rep']:.4f} prior_roll {train_metrics['prior_roll']:.4f} z_only {train_metrics['z_only']:.4f} h_only {train_metrics['h_only']:.4f} recon {train_metrics['recon']:.4f} cpc {train_metrics['contrastive']:.4f} cpc_acc {train_metrics['contrastive_acc']:.3f} | "
-            f"val loss {val_metrics['loss']:.4f} mse {val_metrics['mse']:.4f} rmse {val_metrics['rmse']:.4f} "
-            f"lr_rmse {val_metrics['lr_rmse']:.3f} lr_acc {val_metrics['lr_acc']:.3f} "
-            f"loc_x_rmse {val_metrics['loc_x_rmse']:.3f} loc_y_rmse {val_metrics['loc_y_rmse']:.3f} "
-            f"loc_x_acc {val_metrics['loc_x_acc']:.3f} loc_y_acc {val_metrics['loc_y_acc']:.3f} "
-            f"turn_acc {val_metrics['turn_acc']:.3f} step_acc {val_metrics['step_acc']:.3f} "
-            f"kl_dyn {val_metrics['kl_dyn']:.4f} kl_rep {val_metrics['kl_rep']:.4f} prior_roll {val_metrics['prior_roll']:.4f} z_only {val_metrics['z_only']:.4f} h_only {val_metrics['h_only']:.4f} recon {val_metrics['recon']:.4f} cpc {val_metrics['contrastive']:.4f} cpc_acc {val_metrics['contrastive_acc']:.3f}"
-            ,
-            flush=True,
-        )
+        logger.log_scalar("train/lr", float(optimizer.param_groups[0]["lr"]), step=epoch)
+        print(f"finished epoch {epoch:03d}", flush=True)
 
     save_dir = os.path.dirname(args.save_path)
     if save_dir:
@@ -515,8 +389,6 @@ def main():
                 "context_len": args.context_len,
                 "probe_hidden_dim": args.probe_hidden_dim,
                 "probe_layers": args.probe_layers,
-                "rnn_transition": args.rnn_transition,
-                "rnn_residual_scale": args.rnn_residual_scale,
                 "rnn_state_norm": args.rnn_state_norm,
                 "rssm_transition": args.rssm_transition,
                 "rssm_residual_scale": args.rssm_residual_scale,
@@ -534,6 +406,7 @@ def main():
         args.save_path,
     )
     print(f"saved checkpoint to {args.save_path}", flush=True)
+    logger.log_scalar("run/saved", 1.0, step=args.epochs)
 
 
 if __name__ == "__main__":

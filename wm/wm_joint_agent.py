@@ -7,30 +7,26 @@ import random
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+import copy
 import torch
 import torch.nn.functional as F
+from torch.distributions import Categorical
 
+from agent_utils_wm import create_model
 from base import LossConfig
-from baselines import RNNPredictor
+from baselines import TransformerBaseline
 from pool import EpisodesOldPoolMixin
-from transformer import LlamaConfig
+from reinforce import Reinforce
 from utils import make_label_smoothing_table, make_soft_table
 
 
-def create_maze_rnn_world_model(
+def create_maze_world_model(
     *,
+    model_args,
     device: torch.device,
     maze_dim: int,
     turn_bins: int,
     step_bins: int,
-    hidden_size: int = 176,
-    layers: int = 3,
-    intermediate: Optional[int] = None,
-    obs_latent_dim: int = 64,
-    probe_hidden_dim: int = 128,
-    probe_layers: int = 2,
-    contrastive_dim: int = 64,
-    contrastive_steps: int = 1,
     contrastive_temp: float = 0.1,
     contrastive_horizon_discount: float = 0.75,
     contrastive_negatives: int = 0,
@@ -43,10 +39,8 @@ def create_maze_rnn_world_model(
     pos_sigma: float = 1.0,
     heading_smoothing: float = 0.0,
     sensor_max_bin: int = 64,
-) -> RNNPredictor:
-    if intermediate is None:
-        intermediate = hidden_size * 4
-    if contrastive_dim <= 0:
+) -> TransformerBaseline:
+    if int(model_args.contrastive_dim) <= 0:
         raise ValueError("contrastive_dim must be > 0 for AC-CPC intrinsic reward")
     if sensor_max_bin < 1:
         raise ValueError("sensor_max_bin must be >= 1")
@@ -55,21 +49,16 @@ def create_maze_rnn_world_model(
 
     sensor_bin_count = int(sensor_max_bin) + 1
     sensor_bins = np.array([sensor_bin_count, sensor_bin_count, sensor_bin_count], dtype=np.int64)
-
-    cfg = LlamaConfig(
-        input_size=5,  # 3 sensor + 2 action
-        hidden_size=int(hidden_size),
-        intermediate_size=int(intermediate),
-        num_hidden_layers=int(layers),
-        num_attention_heads=4,
-        num_key_value_heads=4,
-        head_dim=max(1, int(hidden_size) // 4),
-        attention_dropout=0.0,
-        attention_window=None,
+    model_args.device = device
+    active_attention_window = (
+        model_args.attention_window
+        if (model_args.attention_window is not None and model_args.attention_window > 0)
+        else None
     )
-    model = RNNPredictor(
-        cfg,
-        sensor_mode="categorical",
+    model_config_extra: Dict = {}
+    model = create_model(
+        model_args,
+        input_dim=5,  # 3 sensor + 2 action
         sensor_dim=3,
         sensor_bins=sensor_bins,
         loc_x_bins=int(maze_dim),
@@ -78,16 +67,11 @@ def create_maze_rnn_world_model(
         turn_bins=int(turn_bins),
         step_bins=int(step_bins),
         obs_dim=3,
-        obs_latent_dim=int(obs_latent_dim),
-        probe_hidden_dim=int(probe_hidden_dim),
-        probe_layers=int(probe_layers),
-        transition="gru",
-        residual_scale=1.0,
-        state_norm="none",
-        contrastive_dim=int(contrastive_dim),
-        contrastive_steps=int(contrastive_steps),
-    ).to(device)
-
+        action_dim=2,
+        active_attention_window=active_attention_window,
+        model_config_extra=model_config_extra,
+    )
+    model.detach_action_heads = False
     loc_min = torch.tensor([0.0, 0.0], dtype=torch.float32, device=device)
     sensor_min_idx = torch.zeros(3, dtype=torch.long, device=device)
     model.config = LossConfig(
@@ -117,13 +101,17 @@ def create_maze_rnn_world_model(
 class WMActionHeadPolicy(torch.nn.Module):
     """Discrete policy logits computed from WM action heads."""
 
-    def __init__(self, wm_model: RNNPredictor, action_table: Sequence[Tuple[int, int]], device: torch.device):
+    def __init__(
+        self,
+        wm_model: TransformerBaseline,
+        action_table: Sequence[Tuple[int, int]],
+        device: torch.device,
+        backprop_through_wm: bool = True,
+    ):
         super().__init__()
-        self.obs_encoder = wm_model.obs_encoder
-        self.fuse = wm_model.fuse
-        self.turn_head = wm_model.turn_head
-        self.step_head = wm_model.step_head
-        self.hidden_size = int(wm_model.fuse.out_features)
+        self.wm_model = wm_model
+        self.action_dim = int(self.wm_model.action_dim)
+        self.backprop_through_wm = bool(backprop_through_wm)
 
         turns = sorted({int(t) for t, _ in action_table})
         steps = sorted({int(s) for _, s in action_table})
@@ -133,41 +121,111 @@ class WMActionHeadPolicy(torch.nn.Module):
         step_ids = [step_to_idx[int(s)] for _, s in action_table]
         self.register_buffer("action_turn_ids", torch.tensor(turn_ids, dtype=torch.long, device=device))
         self.register_buffer("action_step_ids", torch.tensor(step_ids, dtype=torch.long, device=device))
+        turn_vals = torch.tensor([int(t) for t, _ in action_table], dtype=torch.float32, device=device)
+        step_vals = torch.tensor([int(s) for _, s in action_table], dtype=torch.float32, device=device)
+        self.register_buffer(
+            "action_cont_table",
+            torch.stack([turn_vals, step_vals], dim=-1),
+        )
+        self._prev_actions: Optional[torch.Tensor] = None
+
+    def reset_policy_state(self):
+        self._prev_actions = None
+        if hasattr(self.wm_model, "clear_cache"):
+            self.wm_model.clear_cache()
+
+    def record_sampled_actions(self, actions: torch.Tensor):
+        if actions is None:
+            return
+        if not isinstance(actions, torch.Tensor):
+            actions = torch.as_tensor(actions, device=self.action_cont_table.device)
+        actions = actions.to(self.action_cont_table.device).long()
+        if actions.dim() > 1:
+            actions = actions.view(actions.shape[0], -1)[:, 0]
+        if self._prev_actions is None or self._prev_actions.shape[0] != actions.shape[0]:
+            self._prev_actions = torch.zeros(
+                (actions.shape[0], self.action_dim),
+                dtype=self.action_cont_table.dtype,
+                device=self.action_cont_table.device,
+            )
+        self._prev_actions = self.action_cont_table[actions].to(self._prev_actions.dtype).detach()
 
     def forward(self, state, **kwargs):
-        del kwargs
+        episode_start = kwargs.get("episode_start", None)
         if not isinstance(state, dict):
             raise ValueError("WMActionHeadPolicy expects dict observation with 'sensor'")
         sensor = state["sensor"].to(torch.float32)
+        return_sequence = sensor.dim() == 3
         if sensor.dim() == 2:
             sensor = sensor.unsqueeze(1)
         if sensor.dim() != 3:
             raise ValueError(f"Expected sensor shape [B,3] or [B,T,3], got {tuple(sensor.shape)}")
-        batch_size = sensor.shape[0]
-        z = self.obs_encoder(sensor)
-        h_prev = torch.zeros((batch_size, sensor.shape[1], self.hidden_size), dtype=z.dtype, device=z.device)
-        fused = torch.tanh(self.fuse(torch.cat([h_prev.detach(), z.detach()], dim=-1)))
-        turn_logits = self.turn_head(fused)
-        step_logits = self.step_head(fused)
-        turn_last = turn_logits[:, -1, :]
-        step_last = step_logits[:, -1, :]
-        turn_logp = F.log_softmax(turn_last, dim=-1)
-        step_logp = F.log_softmax(step_last, dim=-1)
-        action_logits = turn_logp[:, self.action_turn_ids] + step_logp[:, self.action_step_ids]
+        batch_size, seq_len = int(sensor.shape[0]), int(sensor.shape[1])
+        if episode_start is None:
+            prev_actions = sensor.new_zeros((batch_size, seq_len, self.action_dim))
+            actions = prev_actions
+            model_obs = {
+                "sensor": sensor,
+                "actions": actions,
+                "prev_actions": prev_actions,
+            }
+            batch_out = self.wm_model(
+                model_obs,
+            )
+            preds = batch_out.get("preds")
+            if preds is None or len(preds) != 6:
+                raise ValueError("forward(...)[\"preds\"] must be a 6-tuple")
+            _pred_sensor, _loc_x, _loc_y, _heading, turn_logits, step_logits = preds
+        else:
+            if not isinstance(episode_start, torch.Tensor):
+                episode_start_t = torch.as_tensor(episode_start, dtype=torch.bool, device=sensor.device)
+            else:
+                episode_start_t = episode_start.to(sensor.device).bool()
+            if self._prev_actions is None:
+                self._prev_actions = torch.zeros((batch_size, self.action_dim), dtype=sensor.dtype, device=sensor.device)
+            if episode_start_t.any():
+                self._prev_actions[episode_start_t, :] = 0.0
+            prev_actions = self._prev_actions.unsqueeze(1).expand(batch_size, seq_len, self.action_dim)
+            model_obs = {
+                "sensor": sensor,
+                "actions": None,
+                "prev_actions": prev_actions,
+            }
+            roll_out = self.wm_model(
+                model_obs,
+                episode_start=episode_start_t,
+            )
+            preds = roll_out.get("preds")
+            if preds is None or len(preds) != 6:
+                raise ValueError("forward(...)[\"preds\"] must be a 6-tuple")
+            _pred_sensor, _loc_x, _loc_y, _heading, turn_logits, step_logits = preds
+        # Build logits over discrete action_table entries by factorizing
+        # p(action_i)=p(turn_i)*p(step_i), i.e. log p(action_i)=log p(turn_i)+log p(step_i).
+        turn_logp = F.log_softmax(turn_logits, dim=-1)
+        step_logp = F.log_softmax(step_logits, dim=-1)
+        action_logits = turn_logp[..., self.action_turn_ids] + step_logp[..., self.action_step_ids]
+        if not return_sequence:
+            action_logits = action_logits[:, 0, :]
         return action_logits
 
 
-class JointWMAgent:
-    """Wraps an on-policy agent and augments rewards via AC-CPC intrinsic signal."""
+class JointWMReinforce(Reinforce):
+    """Reinforce agent with joint AC-CPC world-model updates."""
 
     def __init__(
         self,
         *,
-        policy_agent,
-        wm_model: RNNPredictor,
+        policy: torch.nn.Module,
+        sampler,
+        policy_lr: float,
+        num_envs: int,
+        discount: float,
+        logger,
+        wm_model: TransformerBaseline,
         wm_optimizer: torch.optim.Optimizer,
         action_table: Sequence[Tuple[int, int]],
         device: torch.device,
+        entropy_coef: float = 0.01,
         intrinsic_reward_scale: float = 1.0,
         env_reward_scale: float = 1.0,
         wm_updates_per_policy: int = 1,
@@ -176,14 +234,23 @@ class JointWMAgent:
         sensor_max_bin: int = 64,
         maze_dim: int = 10,
     ):
-        self.policy_agent = policy_agent
+        super().__init__(
+            policy=policy,
+            sampler=sampler,
+            policy_lr=policy_lr,
+            num_envs=num_envs,
+            discount=discount,
+            device=device,
+            logger=logger,
+            entropy_coef=entropy_coef,
+        )
         self.wm_model = wm_model
+        self.wm_model_copy = copy.deepcopy(wm_model)
         self.wm_optimizer = wm_optimizer
+        self.optimizer_policy = self.wm_optimizer
         self.action_table = [(int(turn), int(step)) for turn, step in action_table]
         self.device = torch.device(device)
-        self.logger = policy_agent.logger
 
-        self.num_envs = int(policy_agent.num_envs)
         self.intrinsic_reward_scale = float(intrinsic_reward_scale)
         self.env_reward_scale = float(env_reward_scale)
         self.wm_updates_per_policy = int(wm_updates_per_policy)
@@ -205,176 +272,288 @@ class JointWMAgent:
         self._step_cls = torch.tensor(
             [self.step_to_idx[s] for _, s in self.action_table], dtype=torch.long, device=self.device
         )
-        self._turn_norm = max(1.0, float(torch.max(torch.abs(self._turn_vals)).item()))
-        self._step_norm = max(1.0, float(torch.max(torch.abs(self._step_vals)).item()))
 
         if self.wm_replay_capacity <= 0:
             raise ValueError("wm_replay_capacity must be > 0")
         self._wm_pool = _WMEpisodePool(num_envs=self.num_envs, pool_size=self.wm_replay_capacity)
 
     def episode_start(self):
-        self.policy_agent.episode_start()
+        super().episode_start()
+        policy = getattr(self, "policy", None)
+        if policy is not None and hasattr(policy, "reset_policy_state"):
+            policy.reset_policy_state()
         self._wm_pool.reset_episodes()
 
     def get_action(self, state, episode_start):
-        return self.policy_agent.get_action(state, episode_start)
+        action = super().get_action(state, episode_start)
+        policy = getattr(self, "policy", None)
+        policy.record_sampled_actions(action)
+        return action
 
     def update(self, rewards, dones, info=None, **kwargs):
         del info, kwargs
-        rewards_t = rewards
-        if not isinstance(rewards_t, torch.Tensor):
-            rewards_t = torch.tensor(rewards_t, dtype=torch.float32, device=self.device)
-        rewards_t = rewards_t.to(self.device).float()
-
-        dones_t = dones
-        if not isinstance(dones_t, torch.Tensor):
-            dones_t = torch.tensor(dones_t, dtype=torch.bool, device=self.device)
-        dones_t = dones_t.to(self.device).bool()
+        rewards_t = torch.as_tensor(rewards, dtype=torch.float32, device=self.device)
+        dones_t = torch.as_tensor(dones, dtype=torch.bool, device=self.device)
 
         env_rewards = self.env_reward_scale * rewards_t
         for env_idx in range(self.num_envs):
-            self.policy_agent.add_reward(env_idx, env_rewards[env_idx])
-        self.policy_agent.process_dones(dones_t)
+            self.add_reward(env_idx, env_rewards[env_idx])
+        self.process_dones(dones_t)
 
-        if not self.policy_agent.should_learn():
-            if self.logger is not None:
-                self.logger.log_scalar("reward/env_mean", env_rewards.mean().item())
-                self.logger.log_scalar("reward/intrinsic_mean", 0.0)
-                self.logger.log_scalar("reward/total_mean", env_rewards.mean().item())
+        if not self.should_learn():
+            self.logger.log_scalar("reward/env_mean", env_rewards.mean().item())
             return False
 
-        episodes = self.policy_agent.get_train_episodes()
-        episodes_aug, reward_stats = self._augment_policy_episodes_with_intrinsic(episodes)
-        self.policy_agent.learn_from_episodes(episodes_aug)
-        self.policy_agent.print_episode_stats(self.policy_agent.get_completed_episodes())
-        self.policy_agent.version += 1
-        self.policy_agent.clear_completed()
+        episodes = self.get_train_episodes()
+        policy_wm_episodes = []
+        for ep in episodes:
+            wm_episode = self._build_wm_episode_from_policy_episode(ep)
+            if wm_episode:
+                policy_wm_episodes.append(wm_episode)
 
-        self._remember_wm_episodes(episodes_aug)
-        self._train_world_model_from_replay()
+        replay_episodes = self._sample_replay_episodes()
+        obs_mix, targets_mix, _policy_batch_mix = self._build_wm_batch(policy_wm_episodes + replay_episodes)
 
-        if self.logger is not None:
-            self.logger.log_scalar("reward/env_mean", reward_stats["env_mean"])
-            self.logger.log_scalar("reward/intrinsic_mean", reward_stats["intrinsic_mean"])
-            self.logger.log_scalar("reward/total_mean", reward_stats["total_mean"])
+        obs_new, targets_new, policy_meta = self._build_wm_batch(policy_wm_episodes)
+        n_policy_episodes = int(len(policy_wm_episodes))
+        updates = max(1, self.wm_updates_per_policy)
+        wm_loss_sums: Dict[str, float] = {}
+        wm_metric_sums: Dict[str, float] = {}
+        total_loss_sum = 0.0
+        wm_loss_sum = 0.0
+        policy_loss_sum = 0.0
+        entropy_mean_sum = 0.0
+        policy_valid_steps_sum = 0.0
+        reward_env_mean_sum = 0.0
+        reward_intr_mean_sum = 0.0
+        reward_total_mean_sum = 0.0
+
+        self.wm_model.train()
+        lp_rewards = self.lp_reward(obs_new, obs_mix)
+
+        for _ in range(updates):
+            # Policy update on new-policy dataset with LP reward.
+            self.wm_optimizer.zero_grad(set_to_none=True)
+            policy_forward = self.wm_model(obs_new)
+            policy_preds = policy_forward["preds"]
+            policy_loss, policy_stats = self._compute_policy_loss_from_joint_batch(
+                preds=policy_preds,
+                meta=policy_meta,
+                intrinsic_steps=intrinsic_steps,
+                n_policy_episodes=n_policy_episodes,
+            )
+            policy_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.wm_model.parameters(), 1.0)
+            self.wm_optimizer.step()
+
+            total_loss = wm_loss + policy_loss
+            total_loss_sum += self._as_scalar(total_loss)
+            wm_loss_sum += self._as_scalar(wm_loss)
+            policy_loss_sum += self._as_scalar(policy_loss)
+            entropy_mean_sum += float(policy_stats["entropy_mean"])
+            policy_valid_steps_sum += float(policy_stats["valid_steps"])
+            reward_env_mean_sum += float(policy_stats["reward_env_mean"])
+            reward_intr_mean_sum += float(policy_stats["reward_intrinsic_mean"])
+            reward_total_mean_sum += float(policy_stats["reward_total_mean"])
+            for key, value in losses.items():
+                wm_loss_sums[key] = wm_loss_sums.get(key, 0.0) + self._as_scalar(value)
+            for key, value in metrics.items():
+                wm_metric_sums[key] = wm_metric_sums.get(key, 0.0) + self._as_scalar(value)
+
+        self._remember_wm_episodes(policy_wm_episodes, prebuilt=True)
+        self.print_episode_stats(self.get_completed_episodes())
+        self.version += 1
+        self.clear_completed()
+        self.logger.log_scalar("joint/loss_total", total_loss_sum / updates)
+        self.logger.log_scalar("policy/loss", policy_loss_sum / updates)
+        self.logger.log_scalar("policy/entropy_mean", entropy_mean_sum / updates)
+        self.logger.log_scalar("policy/valid_steps", policy_valid_steps_sum / updates)
+        self.logger.log_scalar("reward/env_mean", reward_env_mean_sum / updates)
+        self.logger.log_scalar("reward/intrinsic_mean", reward_intr_mean_sum / updates)
+        self.logger.log_scalar("reward/total_mean", reward_total_mean_sum / updates)
+        for key in sorted(wm_loss_sums.keys()):
+            self.logger.log_scalar(f"wm/loss/{key}", wm_loss_sums[key] / updates)
+        self.logger.log_scalar("wm/loss/total", wm_loss_sum / updates)
+        for key in sorted(wm_metric_sums.keys()):
+            self.logger.log_scalar(f"wm/metric/{key}", wm_metric_sums[key] / updates)
+        self.logger.log_scalar("wm/replay_size", float(len(self._wm_pool.episode_pool)))
+        self.logger.log_scalar("wm/replay_sampled_episodes", float(len(replay_episodes)))
+        self.logger.log_scalar("wm/policy_sampled_episodes", float(n_policy_episodes))
+        joint_sampled_episodes = float(len(policy_wm_episodes) + len(replay_episodes))
+        self.logger.log_scalar("wm/joint_sampled_episodes", joint_sampled_episodes)
+        sampled_transitions = float(
+            sum(len(ep) for ep in policy_wm_episodes) + sum(len(ep) for ep in replay_episodes)
+        )
+        self.logger.log_scalar("wm/joint_sampled_transitions", sampled_transitions)
+
         return True
 
-    def _actions_to_cont(self, actions_idx: torch.Tensor) -> torch.Tensor:
+    def lp_reward(self, obs_new, obs_mix):
+        with torch.no_grad():
+            # sync weights
+            for param, target_param in zip(self.wm_model.parameters(), self.wm_model_copy.parameters()):
+                target_param.copy_(param.data)
+
+        cpc_error_before = self._evaluate_step_cpc_error_no_grad(self.wm_model_copy, obs_new, targets_new)
+
+        # World-model update on mixed dataset (new + replay).
+        self.wm_optimizer_copy.zero_grad()
+        forward_out = self.wm_model_copy(
+            obs_mix,
+        )
+        preds = forward_out["preds"]
+        aux_inputs = forward_out["aux"]
+        losses = self.wm_model_copy.compute_prediction_losses(
+            preds=preds,
+            targets=targets_mix,
+            aux_inputs=aux_inputs,
+        )
+        metrics = self.wm_model_copy.compute_prediction_metrics(
+            preds=preds,
+            targets=targets_mix,
+            aux_inputs=aux_inputs,
+        )
+        wm_loss = self._compute_wm_total_loss(losses)
+        wm_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.wm_model_copy.parameters(), 1.0)
+        self.wm_optimizer_copy.step()
+
+        cpc_error_after = self._evaluate_step_cpc_error_no_grad(self.wm_optimizer_copy, obs_new, targets_new)
+        intrinsic_steps = cpc_error_before - cpc_error_after
+        return intrinsic_steps
+
+    def action_idx_to_val(self, actions_idx: torch.Tensor) -> torch.Tensor:
         idx = actions_idx.to(self.device).long().view(-1)
-        turn = self._turn_vals[idx] / self._turn_norm
-        step = self._step_vals[idx] / self._step_norm
+        turn = self._turn_vals[idx]
+        step = self._step_vals[idx]
         return torch.stack([turn, step], dim=-1)
 
-    def _compute_step_cpc_reward(
-        self, obs_t: Dict[str, torch.Tensor], action_t: torch.Tensor, obs_tp1: Dict[str, torch.Tensor]
+    @staticmethod
+    def _as_scalar(value) -> float:
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return 0.0
+            if value.numel() == 1:
+                return float(value.detach().cpu())
+            return float(value.detach().float().mean().cpu())
+        return float(value)
+
+    def _build_action_logits_from_preds(self, preds: Tuple) -> torch.Tensor:
+        _pred_sensor, _loc_x, _loc_y, _heading, turn_logits, step_logits = preds
+        turn_logp = F.log_softmax(turn_logits, dim=-1)
+        step_logp = F.log_softmax(step_logits, dim=-1)
+        return turn_logp[..., self.policy.action_turn_ids] + step_logp[..., self.policy.action_step_ids]
+
+    def _compute_step_cpc_error_from_aux(
+        self,
+        *,
+        aux_inputs: Optional[Dict[str, torch.Tensor]],
+        key_padding_mask: torch.Tensor,
     ) -> torch.Tensor:
-        if self.wm_model.contrastive_dim <= 0:
-            batch = int(obs_t["sensor"].shape[0])
-            return torch.zeros((batch,), dtype=torch.float32, device=self.device)
-        batch = int(obs_t["sensor"].shape[0])
-        was_training = self.wm_model.training
-        self.wm_model.eval()
+        B, T = key_padding_mask.shape
+        out = torch.zeros((B, T), dtype=torch.float32, device=key_padding_mask.device)
+        if aux_inputs is None:
+            return out
+        contrastive_stats = self.wm_model._compute_contrastive_stats(
+            aux_inputs=aux_inputs,
+            key_padding_mask=key_padding_mask,
+            temperature=self.wm_model.config.contrastive_temp,
+            horizon_discount=self.wm_model.config.contrastive_horizon_discount,
+            max_negatives=self.wm_model.config.contrastive_negatives,
+        )
+        per_step_loss = contrastive_stats.get("per_step_loss")
+        per_step_valid = contrastive_stats.get("per_step_valid")
+        if per_step_loss is None or per_step_valid is None:
+            return out
+        valid = per_step_valid
+        out[valid] = per_step_loss[valid].to(out.dtype)
+        return out
+
+    def _evaluate_step_cpc_error_no_grad(self, wm_model, obs: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> torch.Tensor:
+        was_training = wm_model.training
+        wm_model.eval()
         with torch.no_grad():
-            sensor_pair = torch.stack([obs_t["sensor"], obs_tp1["sensor"]], dim=1)
-            action_pair = torch.zeros((batch, 2, 2), dtype=torch.float32, device=self.device)
-            action_pair[:, 0, :] = action_t
-            key_padding_mask = torch.zeros((batch, 2), dtype=torch.bool, device=self.device)
-            obs_batch = {
-                "sensor": sensor_pair,
-                "actions": action_pair,
-                "key_padding_mask": key_padding_mask,
-            }
-            model_out = self.wm_model(obs_batch, return_aux=True)
-            aux_inputs = model_out[-1]
-            pred_steps = aux_inputs.get("contrastive_pred_emb_steps", [])
-            tgt_emb = aux_inputs.get("contrastive_tgt_emb")
-            if tgt_emb is None or not pred_steps:
-                intrinsic = torch.zeros((batch,), dtype=torch.float32, device=self.device)
-            else:
-                pred = pred_steps[0][:, 0, :]
-                key = tgt_emb[:, 1, :]
-                pred = F.normalize(pred, dim=-1)
-                key = F.normalize(key, dim=-1)
-                logits = torch.matmul(pred, key.transpose(0, 1)) / float(self.wm_model.config.contrastive_temp)
-                logp = F.log_softmax(logits, dim=1)
-                intrinsic = torch.diag(logp).to(torch.float32)
+            forward_out = wm_model(obs)
+            aux_inputs = forward_out["aux"]
+            cpc_error = self._compute_step_cpc_error_from_aux(
+                aux_inputs=aux_inputs,
+                key_padding_mask=targets["key_padding_mask"],
+            ).to(torch.float32)
         if was_training:
-            self.wm_model.train()
-        return intrinsic
+            wm_model.train()
+        return cpc_error
 
-    def compute_additional_reward(self, episodes):
-        rewards = []
-        for ep in episodes:
-            L = len(ep)
-            intrinsic_per_step = torch.zeros((L,), dtype=torch.float32, device=self.device)
-            if L > 1:
-                intrinsic_per_step = self._compute_episode_intrinsic(ep)
-            rewards.append(intrinsic_per_step)
-        return rewards 
+    def _discount_rewards_with_mask(self, rewards: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+        out = torch.zeros_like(rewards)
+        B, T = rewards.shape
+        for b in range(B):
+            ret = rewards.new_tensor(0.0)
+            for t in range(T - 1, -1, -1):
+                if valid_mask[b, t]:
+                    ret = rewards[b, t] + self.discount * ret
+                    out[b, t] = ret
+                else:
+                    ret = rewards.new_tensor(0.0)
+        return out
 
-    def _augment_policy_episodes_with_intrinsic(self, episodes):
-        intrinsic_per_episode = self.compute_additional_reward(episodes)
-        augmented = []
-        env_sum = 0.0
-        intr_sum = 0.0
-        total_sum = 0.0
-        count = 0
+    def _compute_policy_loss_from_joint_batch(
+        self,
+        *,
+        preds: Tuple,
+        meta: Dict[str, torch.Tensor],
+        intrinsic_steps: torch.Tensor,
+        n_policy_episodes: int,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        action_logits = self._build_action_logits_from_preds(preds)
+        assert n_policy_episodes > 0
+        policy_actions = meta["policy_action_idx"][:n_policy_episodes]
+        key_padding_mask = meta["key_padding_mask"][:n_policy_episodes]
+        policy_valid = (~key_padding_mask) & (policy_actions >= 0)
+        assert policy_valid.any()
 
-        for ep, intr in zip(episodes, intrinsic_per_episode):
-            ep_aug = []
-            for t, tr in enumerate(ep):
-                if len(tr) < 5:
-                    ep_aug.append(tr)
-                    continue
-                reward_env = torch.as_tensor(tr[4], dtype=torch.float32, device=self.device)
-                reward_intr = self.intrinsic_reward_scale * intr[t]
-                reward_total = reward_env + reward_intr
-                ep_aug.append(tr[:-1] + (reward_total,))
-                env_sum += float(reward_env.detach().cpu())
-                intr_sum += float(reward_intr.detach().cpu())
-                total_sum += float(reward_total.detach().cpu())
-                count += 1
-            augmented.append(ep_aug)
+        env_rewards = meta["policy_env_reward"][:n_policy_episodes]
+        intrinsic_rewards = self.intrinsic_reward_scale * intrinsic_steps[:n_policy_episodes]
+        total_rewards = env_rewards + intrinsic_rewards
+        discounted_returns = self._discount_rewards_with_mask(total_rewards, policy_valid)
+        returns_flat = discounted_returns[policy_valid]
+        ret_mean = returns_flat.detach().mean()
+        ret_std = returns_flat.detach().std(unbiased=False).clamp_min(1e-7)
+        normalized_returns = (returns_flat - ret_mean) / ret_std
 
-        denom = max(1, count)
-        return augmented, {
-            "env_mean": env_sum / denom,
-            "intrinsic_mean": intr_sum / denom,
-            "total_mean": total_sum / denom,
+        logits_flat = action_logits[:n_policy_episodes][policy_valid]
+        actions_flat = policy_actions[policy_valid].to(torch.long)
+        dist = Categorical(logits=logits_flat)
+        log_probs = dist.log_prob(actions_flat)
+        entropy = dist.entropy()
+        e_loss = -entropy.mean()
+        policy_loss = -(log_probs.clamp(-10, 10) * normalized_returns).mean() + self.entropy_coef * e_loss
+        return policy_loss, {
+            "entropy_mean": float(entropy.detach().mean().cpu()),
+            "valid_steps": float(policy_valid.sum().detach().cpu()),
+            "reward_env_mean": float(env_rewards[policy_valid].detach().mean().cpu()),
+            "reward_intrinsic_mean": float(intrinsic_rewards[policy_valid].detach().mean().cpu()),
+            "reward_total_mean": float(total_rewards[policy_valid].detach().mean().cpu()),
         }
 
-    def _compute_episode_intrinsic(self, episode) -> torch.Tensor:
-        L = len(episode)
-        out = torch.zeros((L,), dtype=torch.float32, device=self.device)
-        pos = []
-        sensors_t = []
-        sensors_tp1 = []
-        actions_idx = []
-        for t in range(L - 1):
-            tr_t = episode[t]
-            tr_tp1 = episode[t + 1]
-            if len(tr_t) < 2 or len(tr_tp1) < 1:
-                continue
-            s_t = tr_t[0]
-            a_t = tr_t[1]
-            s_tp1 = tr_tp1[0]
-            if not isinstance(s_t, dict) or not isinstance(s_tp1, dict):
-                continue
-            sensors_t.append(torch.as_tensor(s_t["sensor"], dtype=torch.float32, device=self.device))
-            sensors_tp1.append(torch.as_tensor(s_tp1["sensor"], dtype=torch.float32, device=self.device))
-            actions_idx.append(torch.as_tensor(a_t, dtype=torch.long, device=self.device).view(-1)[0])
-            pos.append(t)
-
-        if not pos:
-            return out
-
-        obs_t = {"sensor": torch.stack(sensors_t, dim=0)}
-        obs_tp1 = {"sensor": torch.stack(sensors_tp1, dim=0)}
-        actions_idx_t = torch.stack(actions_idx, dim=0)
-        action_cont = self._actions_to_cont(actions_idx_t)
-        intrinsic = self._compute_step_cpc_reward(obs_t, action_cont, obs_tp1)
-        out[torch.as_tensor(pos, dtype=torch.long, device=self.device)] = intrinsic
-        return out
+    def _compute_wm_total_loss(self, losses: Dict[str, torch.Tensor]) -> torch.Tensor:
+        cfg = self.wm_model.config
+        obs_total = losses.get("obs_total")
+        if obs_total is None:
+            obs_total = (
+                cfg.sensor_weight * losses["sensor"]
+                + cfg.loc_weight * (losses["loc_x"] + losses["loc_y"])
+                + cfg.head_weight * losses["head"]
+            )
+        total_loss = (
+            obs_total
+            + cfg.turn_weight * losses["turn"]
+            + cfg.step_weight * losses["step"]
+            + losses.get("aux_total", torch.tensor(0.0, device=self.device))
+        )
+        total_loss = total_loss + cfg.contrastive_weight * losses.get(
+            "contrastive", torch.tensor(0.0, device=self.device)
+        )
+        return total_loss
 
     def _build_wm_episode_from_policy_episode(self, episode):
         wm_episode = []
@@ -384,7 +563,7 @@ class JointWMAgent:
         for t in range(L - 1):
             tr_t = episode[t]
             tr_tp1 = episode[t + 1]
-            if len(tr_t) < 2 or len(tr_tp1) < 1:
+            if len(tr_t) < 5 or len(tr_tp1) < 1:
                 continue
             s_t = tr_t[0]
             a_t = tr_t[1]
@@ -392,10 +571,13 @@ class JointWMAgent:
             if not isinstance(s_t, dict) or not isinstance(s_tp1, dict):
                 continue
             action_idx = torch.as_tensor(a_t, dtype=torch.long, device=self.device).view(-1)[0]
-            action_cont = self._actions_to_cont(action_idx.view(1))[0]
+            action_cont = self.action_idx_to_val(action_idx.view(1))[0]
+            env_reward = torch.as_tensor(tr_t[4], dtype=torch.float32, device=self.device)
             transition = {
                 "obs_sensor": torch.as_tensor(s_t["sensor"], dtype=torch.float32, device=self.device),
                 "action_cont": action_cont.to(torch.float32),
+                "action_idx": action_idx.to(torch.long),
+                "env_reward": env_reward.to(torch.float32),
                 "next_sensor": torch.as_tensor(s_tp1["sensor"], dtype=torch.float32, device=self.device),
                 "next_heading": torch.as_tensor(s_tp1["heading_idx"], dtype=torch.long, device=self.device),
                 "next_location": torch.as_tensor(s_tp1["location"], dtype=torch.long, device=self.device),
@@ -405,9 +587,9 @@ class JointWMAgent:
             wm_episode.append(transition)
         return wm_episode
 
-    def _remember_wm_episodes(self, episodes):
+    def _remember_wm_episodes(self, episodes, *, prebuilt: bool = False):
         for ep in episodes:
-            wm_episode = self._build_wm_episode_from_policy_episode(ep)
+            wm_episode = ep if prebuilt else self._build_wm_episode_from_policy_episode(ep)
             if wm_episode:
                 self._wm_pool.add_completed_episode(wm_episode)
 
@@ -422,11 +604,10 @@ class JointWMAgent:
 
     def _build_wm_batch(self, episodes: List[List[Dict[str, torch.Tensor]]]):
         if not episodes:
-            return None, None
-        lengths = [len(ep) for ep in episodes if len(ep) > 0]
-        if not lengths:
-            return None, None
-        episodes = [ep for ep in episodes if len(ep) > 0]
+            raise ValueError("episodes must be non-empty")
+        lengths = [len(ep) for ep in episodes]
+        if min(lengths) <= 0:
+            raise ValueError("episodes must contain at least one transition each")
         batch_size = len(episodes)
         max_len = max(lengths)
         obs_sensor = torch.zeros((batch_size, max_len, 3), dtype=torch.float32, device=self.device)
@@ -438,6 +619,8 @@ class JointWMAgent:
         y_turn = torch.full((batch_size, max_len), -100, dtype=torch.long, device=self.device)
         y_step = torch.full((batch_size, max_len), -100, dtype=torch.long, device=self.device)
         key_padding_mask = torch.ones((batch_size, max_len), dtype=torch.bool, device=self.device)
+        policy_action_idx = torch.full((batch_size, max_len), -100, dtype=torch.long, device=self.device)
+        policy_env_reward = torch.zeros((batch_size, max_len), dtype=torch.float32, device=self.device)
 
         for i, ep in enumerate(episodes):
             L = len(ep)
@@ -447,13 +630,17 @@ class JointWMAgent:
                     tr = tr[0]
                 obs_sensor[i, t] = tr["obs_sensor"]
                 obs_actions[i, t] = tr["action_cont"]
+                if "action_idx" in tr:
+                    policy_action_idx[i, t] = tr["action_idx"].to(torch.long)
+                if "env_reward" in tr:
+                    policy_env_reward[i, t] = tr["env_reward"].to(torch.float32)
                 y_sensor[i, t] = tr["next_sensor"]
                 y_sensor_idx[i, t] = tr["next_sensor"].round().to(torch.long).clamp_(0, self.sensor_max_bin)
                 y_loc_xy[i, t] = tr["next_location"].to(torch.long).clamp_(0, self.maze_dim - 1)
                 y_head[i, t] = tr["next_heading"].to(torch.long)
                 y_turn[i, t] = tr["turn_idx"].to(torch.long)
                 y_step[i, t] = tr["step_idx"].to(torch.long)
-            if L > 0:
+                # Ignore first-step action CE: t=0 is conditioned on synthetic prev_action (BOS), not a real action history.
                 y_turn[i, 0] = -100
                 y_step[i, 0] = -100
 
@@ -471,62 +658,17 @@ class JointWMAgent:
             "y_step": y_step,
             "key_padding_mask": key_padding_mask,
         }
-        return obs, targets
-
-    def _train_world_model_from_replay(self) -> None:
-        episodes = self._sample_replay_episodes()
-        obs, targets = self._build_wm_batch(episodes)
-        if obs is None:
-            return
-
-        self.wm_model.train()
-        loss_value = 0.0
-        cpc_value = 0.0
-        cpc_acc = 0.0
-        for _ in range(max(1, self.wm_updates_per_policy)):
-            self.wm_optimizer.zero_grad(set_to_none=True)
-            out = self.wm_model(
-                obs,
-                return_losses=True,
-                return_metrics=True,
-                targets=targets,
-            )
-            losses = out["losses"]
-            metrics = out["metrics"]
-            cfg = self.wm_model.config
-            obs_total = losses.get("obs_total")
-            if obs_total is None:
-                obs_total = (
-                    cfg.sensor_weight * losses["sensor"]
-                    + cfg.loc_weight * (losses["loc_x"] + losses["loc_y"])
-                    + cfg.head_weight * losses["head"]
-                )
-            total_loss = (
-                obs_total
-                + cfg.turn_weight * losses["turn"]
-                + cfg.step_weight * losses["step"]
-                + losses.get("aux_total", torch.tensor(0.0, device=self.device))
-            )
-            total_loss = total_loss + cfg.contrastive_weight * losses.get(
-                "contrastive", torch.tensor(0.0, device=self.device)
-            )
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.wm_model.parameters(), 1.0)
-            self.wm_optimizer.step()
-
-            loss_value = float(total_loss.detach().cpu())
-            cpc_value = float(losses.get("contrastive", torch.tensor(0.0, device=self.device)).detach().cpu())
-            cpc_acc = float(metrics.get("contrastive_acc", torch.tensor(0.0, device=self.device)).detach().cpu())
-
-        if self.logger is not None:
-            self.logger.log_scalar("wm/loss", loss_value)
-            self.logger.log_scalar("wm/cpc", cpc_value)
-            self.logger.log_scalar("wm/cpc_acc", cpc_acc)
-            self.logger.log_scalar("wm/replay_size", float(len(self._wm_pool.episode_pool)))
+        meta = {
+            "policy_action_idx": policy_action_idx,
+            "policy_env_reward": policy_env_reward,
+            "key_padding_mask": key_padding_mask,
+        }
+        return obs, targets, meta
 
     def get_state_dict(self):
+        base_state = super().get_state_dict()
         return {
-            "policy_state": self.policy_agent.get_state_dict(),
+            "policy_state": base_state,
             "wm_model": self.wm_model.state_dict(),
             "wm_optimizer": self.wm_optimizer.state_dict(),
             "wm_replay_size": len(self._wm_pool.episode_pool),
@@ -534,7 +676,7 @@ class JointWMAgent:
 
     def load_state_dict(self, state_dict):
         policy_state = state_dict.get("policy_state", state_dict)
-        self.policy_agent.load_state_dict(policy_state)
+        super().load_state_dict(policy_state)
         wm_state = state_dict.get("wm_model")
         if wm_state is not None:
             self.wm_model.load_state_dict(wm_state)

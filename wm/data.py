@@ -235,11 +235,11 @@ class WindowedDataset(Dataset):
         # Location is a target/probe only; keep current loc separately.
         obs_loc = seq.loc_idx[start:end].astype(np.float32)
 
-        # targets: next observation
+        # targets: next sensor observation, plus current-step state probes
         y_sensor = seq.obs_cont[start + 1 : end + 1]  # next-step sensors (left/front/right)
         y_sensor_idx = seq.sensor_idx[start + 1 : end + 1]
-        y_heading = seq.heading_idx[start + 1 : end + 1]
-        y_loc_xy = seq.loc_idx[start + 1 : end + 1]
+        y_heading = seq.heading_idx[start:end]
+        y_loc_xy = seq.loc_idx[start:end]
         # action targets aligned to current obs (t), first step will be masked
         y_turn = seq.turn_idx[start:end]
         y_step = seq.step_idx[start:end]

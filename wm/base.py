@@ -42,7 +42,96 @@ class LossConfig:
     contrastive_horizon_discount: float = 1.0
     contrastive_negatives: int = 0
     loc_min: Optional[torch.Tensor] = None
+
+
 class PredictionLossMixin:
+    @staticmethod
+    def _shift_prev_actions(actions: torch.Tensor) -> torch.Tensor:
+        if actions.ndim != 3:
+            raise ValueError(f"Expected actions [B, T, A], got {tuple(actions.shape)}")
+        zeros = actions.new_zeros((actions.shape[0], 1, actions.shape[2]))
+        return torch.cat([zeros, actions[:, :-1, :]], dim=1)
+
+    def _validate_obs_contract(self, obs, *, episode_start):
+        if not isinstance(obs, dict):
+            raise ValueError(f"{self.__class__.__name__} expects dict observation")
+        rollout = episode_start is not None
+
+        required = ["sensor", "prev_actions"] if rollout else ["sensor", "actions"]
+        missing = [k for k in required if k not in obs]
+        if missing:
+            mode = "rollout" if rollout else "train"
+            raise ValueError(f"{self.__class__.__name__} {mode} obs missing keys: {missing}")
+
+        sensor = obs["sensor"]
+        actions = obs.get("actions")
+        prev_actions = obs.get("prev_actions")
+        key_padding_mask = obs.get("key_padding_mask")
+        if rollout and actions is None:
+            actions = prev_actions
+
+        if not isinstance(sensor, torch.Tensor):
+            sensor = torch.as_tensor(sensor)
+        if actions is None:
+            raise ValueError("actions must be provided (or inferred from prev_actions in rollout)")
+        if not isinstance(actions, torch.Tensor):
+            actions = torch.as_tensor(actions, device=sensor.device)
+        if sensor.ndim == 2:
+            sensor = sensor.unsqueeze(1)
+        if actions.ndim == 2:
+            actions = actions.unsqueeze(1)
+        if sensor.ndim != 3:
+            raise ValueError(f"Expected sensor [B,T,S] or [B,S], got {tuple(sensor.shape)}")
+        if actions.ndim != 3:
+            raise ValueError(f"Expected actions [B,T,A] or [B,A], got {tuple(actions.shape)}")
+        if sensor.shape[:2] != actions.shape[:2]:
+            raise ValueError(f"sensor/actions shape mismatch: {tuple(sensor.shape)} vs {tuple(actions.shape)}")
+
+        expected_action_dim = getattr(self, "action_dim", None)
+        if expected_action_dim is not None and int(actions.shape[-1]) != int(expected_action_dim):
+            raise ValueError(
+                f"Expected action dim {int(expected_action_dim)}, got {int(actions.shape[-1])}"
+            )
+
+        if key_padding_mask is not None:
+            if not isinstance(key_padding_mask, torch.Tensor):
+                key_padding_mask = torch.as_tensor(key_padding_mask, device=sensor.device)
+            if key_padding_mask.ndim == 1:
+                key_padding_mask = key_padding_mask.unsqueeze(1)
+            if key_padding_mask.ndim != 2 or key_padding_mask.shape != sensor.shape[:2]:
+                raise ValueError(
+                    f"key_padding_mask must be [B,T]={tuple(sensor.shape[:2])}, got {tuple(key_padding_mask.shape)}"
+                )
+            key_padding_mask = key_padding_mask.to(torch.bool)
+
+        if prev_actions is not None:
+            if not isinstance(prev_actions, torch.Tensor):
+                prev_actions = torch.as_tensor(prev_actions, device=sensor.device)
+            if prev_actions.ndim == 2:
+                prev_actions = prev_actions.unsqueeze(1)
+            if prev_actions.ndim != 3:
+                raise ValueError(f"Expected prev_actions [B,T,A] or [B,A], got {tuple(prev_actions.shape)}")
+            if prev_actions.shape != actions.shape:
+                raise ValueError(
+                    f"prev_actions shape must match actions: {tuple(prev_actions.shape)} vs {tuple(actions.shape)}"
+                )
+
+        if rollout:
+            if key_padding_mask is not None:
+                raise ValueError("rollout obs must not include key_padding_mask")
+            if sensor.shape[1] != 1:
+                raise ValueError("rollout obs expects single-step [B,S] or [B,1,S]")
+        if prev_actions is None:
+            prev_actions = self._shift_prev_actions(actions)
+
+        return (
+            sensor.to(torch.float32),
+            actions.to(torch.float32),
+            prev_actions.to(torch.float32),
+            key_padding_mask,
+            rollout,
+        )
+
     def compute_soft_target_loss(
         self,
         *,
@@ -140,15 +229,29 @@ class PredictionLossMixin:
         temperature: float,
         horizon_discount: float = 1.0,
         max_negatives: int = 0,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Dict[str, torch.Tensor]:
+        B, T = key_padding_mask.shape
+        device = key_padding_mask.device
+
+        def _zero_stats() -> Dict[str, torch.Tensor]:
+            return {
+                "loss": torch.tensor(0.0, device=device),
+                "acc": torch.tensor(0.0, device=device),
+                "per_step_loss": torch.zeros((B, T), device=device),
+                "per_step_acc": torch.zeros((B, T), device=device),
+                "per_step_weight": torch.zeros((B, T), device=device),
+                "per_step_valid": torch.zeros((B, T), device=device, dtype=torch.bool),
+                "per_horizon_loss": torch.zeros((0,), device=device),
+                "per_horizon_acc": torch.zeros((0,), device=device),
+                "per_horizon_valid": torch.zeros((0,), device=device, dtype=torch.bool),
+            }
+
         if aux_inputs is None:
-            zero = torch.tensor(0.0, device=key_padding_mask.device)
-            return zero, zero
+            return _zero_stats()
         pred_steps = aux_inputs.get("contrastive_pred_emb_steps")
         tgt_emb = aux_inputs.get("contrastive_tgt_emb")
         if pred_steps is None or tgt_emb is None:
-            zero = torch.tensor(0.0, device=key_padding_mask.device)
-            return zero, zero
+            return _zero_stats()
         return batch_row_k_step_contrastive_pair_stats(
             pred_steps=pred_steps,
             target_emb=tgt_emb,
@@ -164,8 +267,26 @@ class PredictionLossMixin:
         preds: Tuple,
         targets: Dict[str, torch.Tensor],
         aux_inputs: Optional[Dict[str, torch.Tensor]] = None,
-        return_metrics: bool = True,
-    ) -> Tuple[Dict[str, torch.Tensor], Optional[Dict[str, torch.Tensor]]]:
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        losses = self.compute_prediction_losses(
+            preds=preds,
+            targets=targets,
+            aux_inputs=aux_inputs,
+        )
+        metrics = self.compute_prediction_metrics(
+            preds=preds,
+            targets=targets,
+            aux_inputs=aux_inputs,
+        )
+        return losses, metrics
+
+    def compute_prediction_losses(
+        self,
+        *,
+        preds: Tuple,
+        targets: Dict[str, torch.Tensor],
+        aux_inputs: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> Dict[str, torch.Tensor]:
         cfg = self.config
         pred_sensor, pred_loc_x, pred_loc_y, pred_head, pred_turn, pred_step = preds
         losses = self.compute_all_losses(
@@ -184,36 +305,50 @@ class PredictionLossMixin:
             key_padding_mask=targets["key_padding_mask"],
             aux_inputs=aux_inputs,
         )
-
-        contrastive_loss, contrastive_acc = self._compute_contrastive_stats(
+        contrastive_stats = self._compute_contrastive_stats(
             aux_inputs=aux_inputs,
             key_padding_mask=targets["key_padding_mask"],
             temperature=cfg.contrastive_temp,
             horizon_discount=cfg.contrastive_horizon_discount,
             max_negatives=cfg.contrastive_negatives,
         )
-        losses["contrastive"] = contrastive_loss
+        losses["contrastive"] = contrastive_stats["loss"]
+        return losses
 
-        metrics = None
-        if return_metrics:
-            metrics = self.compute_metrics(
-                pred_sensor=pred_sensor,
-                pred_loc_x=pred_loc_x,
-                pred_loc_y=pred_loc_y,
-                pred_turn=pred_turn,
-                pred_step=pred_step,
-                y_sensor=targets["y_sensor"],
-                y_sensor_idx=targets["y_sensor_idx"],
-                y_loc_xy=targets["y_loc_xy"],
-                y_turn=targets["y_turn"],
-                y_step=targets["y_step"],
-                key_padding_mask=targets["key_padding_mask"],
-                sensor_min_idx=cfg.sensor_min_idx,
-                loc_min=cfg.loc_min,
-                aux_inputs=aux_inputs,
-            )
-            metrics["contrastive_acc"] = contrastive_acc
-        return losses, metrics
+    def compute_prediction_metrics(
+        self,
+        *,
+        preds: Tuple,
+        targets: Dict[str, torch.Tensor],
+        aux_inputs: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> Dict[str, torch.Tensor]:
+        cfg = self.config
+        pred_sensor, pred_loc_x, pred_loc_y, _pred_head, pred_turn, pred_step = preds
+        metrics = self.compute_metrics(
+            pred_sensor=pred_sensor,
+            pred_loc_x=pred_loc_x,
+            pred_loc_y=pred_loc_y,
+            pred_turn=pred_turn,
+            pred_step=pred_step,
+            y_sensor=targets["y_sensor"],
+            y_sensor_idx=targets["y_sensor_idx"],
+            y_loc_xy=targets["y_loc_xy"],
+            y_turn=targets["y_turn"],
+            y_step=targets["y_step"],
+            key_padding_mask=targets["key_padding_mask"],
+            sensor_min_idx=cfg.sensor_min_idx,
+            loc_min=cfg.loc_min,
+            aux_inputs=aux_inputs,
+        )
+        contrastive_stats = self._compute_contrastive_stats(
+            aux_inputs=aux_inputs,
+            key_padding_mask=targets["key_padding_mask"],
+            temperature=cfg.contrastive_temp,
+            horizon_discount=cfg.contrastive_horizon_discount,
+            max_negatives=cfg.contrastive_negatives,
+        )
+        metrics["contrastive_acc"] = contrastive_stats["acc"]
+        return metrics
 
     def compute_metrics(
         self,
@@ -359,6 +494,7 @@ class DiscreteLatentPredictorBase(PredictionLossMixin, nn.Module):
         probe_layers: int = 2,
         contrastive_dim: int = 0,
         contrastive_steps: int = 1,
+        detach_action_heads: bool = True,
     ):
         super().__init__()
         self.sensor_mode = sensor_mode
@@ -384,6 +520,7 @@ class DiscreteLatentPredictorBase(PredictionLossMixin, nn.Module):
         self.probe_layers = int(probe_layers)
         self.contrastive_dim = int(contrastive_dim)
         self.contrastive_steps = int(contrastive_steps)
+        self.detach_action_heads = bool(detach_action_heads)
         if self.prior_rollout_steps < 0:
             raise ValueError("prior_rollout_steps must be >= 0")
         if self.probe_hidden_dim < 0:
@@ -529,23 +666,33 @@ class DiscreteLatentPredictorBase(PredictionLossMixin, nn.Module):
         key_padding_mask: torch.Tensor,
         aux_inputs: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Dict[str, torch.Tensor]:
+        del y_sensor, y_sensor_idx, y_loc_xy, y_head
         cfg = self.config
-        if self.obs_loss_mode == "recon":
-            # Recon mode: single decoder head outputs a continuous obs vector.
-            # We use MSE against a mixed target (continuous loc/sensor + one-hot heading).
-            if aux_inputs is None or "obs_hat" not in aux_inputs or "obs_target" not in aux_inputs:
-                raise ValueError("aux_inputs['obs_hat'] and aux_inputs['obs_target'] are required for reconstruction loss")
-            obs_hat = aux_inputs["obs_hat"]
-            obs_target = aux_inputs["obs_target"].to(obs_hat.dtype)
-            # Note: unlike soft-target losses, this treats heading as a continuous one-hot vector.
-            recon = masked_mse(obs_hat, obs_target, key_padding_mask)
-            return {"obs_total": self.recon_beta * recon}
-
         if aux_inputs is None or "sensor_target" not in aux_inputs or "loc_target" not in aux_inputs or "head_target" not in aux_inputs:
-            raise ValueError("aux_inputs targets are required for soft-mode observation loss")
+            raise ValueError("aux_inputs targets are required for observation loss")
         sensor_target = aux_inputs["sensor_target"]
         loc_target = aux_inputs["loc_target"]
         head_target = aux_inputs["head_target"]
+
+        loc_idx = loc_target.round().to(torch.long).clamp(min=0)
+        loss_loc_x = soft_cross_entropy(pred_loc_x, cfg.loc_x_table[loc_idx[..., 0]], key_padding_mask)
+        loss_loc_y = soft_cross_entropy(pred_loc_y, cfg.loc_y_table[loc_idx[..., 1]], key_padding_mask)
+        head_idx = head_target.clamp(min=0)
+        loss_head = soft_cross_entropy(pred_head, cfg.heading_table[head_idx], key_padding_mask)
+
+        if self.obs_loss_mode == "recon":
+            # Recon mode: single decoder head outputs a continuous obs vector.
+            if "obs_hat" not in aux_inputs or "obs_target" not in aux_inputs:
+                raise ValueError("aux_inputs['obs_hat'] and aux_inputs['obs_target'] are required for reconstruction loss")
+            obs_hat = aux_inputs["obs_hat"]
+            obs_target = aux_inputs["obs_target"].to(obs_hat.dtype)
+            recon = masked_mse(obs_hat, obs_target, key_padding_mask)
+            return {
+                "obs_total": self.recon_beta * recon,
+                "loc_x": loss_loc_x,
+                "loc_y": loss_loc_y,
+                "head": loss_head,
+            }
 
         if self.sensor_mode == "categorical":
             pred_l, pred_f, pred_r = pred_sensor
@@ -559,12 +706,6 @@ class DiscreteLatentPredictorBase(PredictionLossMixin, nn.Module):
             )
         else:
             loss_sensor = masked_mse(pred_sensor, sensor_target, key_padding_mask)
-
-        loc_idx = loc_target.round().to(torch.long).clamp(min=0)
-        loss_loc_x = soft_cross_entropy(pred_loc_x, cfg.loc_x_table[loc_idx[..., 0]], key_padding_mask)
-        loss_loc_y = soft_cross_entropy(pred_loc_y, cfg.loc_y_table[loc_idx[..., 1]], key_padding_mask)
-        head_idx = head_target.clamp(min=0)
-        loss_head = soft_cross_entropy(pred_head, cfg.heading_table[head_idx], key_padding_mask)
 
         return {
             "sensor": loss_sensor,
@@ -591,52 +732,43 @@ class DiscreteLatentPredictorBase(PredictionLossMixin, nn.Module):
         loc_min: Optional[torch.Tensor],
         aux_inputs: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Dict[str, torch.Tensor]:
+        del y_sensor, y_sensor_idx, y_loc_xy
         if aux_inputs is None or "sensor_target" not in aux_inputs or "loc_target" not in aux_inputs or "head_target" not in aux_inputs:
-            return super().compute_metrics(
-                pred_sensor=pred_sensor,
-                pred_loc_x=pred_loc_x,
-                pred_loc_y=pred_loc_y,
-                pred_turn=pred_turn,
-                pred_step=pred_step,
-                y_sensor=y_sensor,
-                y_sensor_idx=y_sensor_idx,
-                y_loc_xy=y_loc_xy,
-                y_turn=y_turn,
-                y_step=y_step,
-                key_padding_mask=key_padding_mask,
-                sensor_min_idx=sensor_min_idx,
-                loc_min=loc_min,
-                aux_inputs=aux_inputs,
-            )
+            raise ValueError("aux_inputs targets are required for metrics")
 
         sensor_target = aux_inputs["sensor_target"]
         loc_target = aux_inputs["loc_target"]
 
-        sensor_for_lr = aux_inputs.get("prior_sensor_pred", pred_sensor)
-        if self.sensor_mode == "categorical":
-            pred_l, pred_f, pred_r = pred_sensor
-            lr_l, _lr_f, lr_r = sensor_for_lr
-            sensor_target_abs = sensor_target.round().to(torch.long).clamp(min=0)
-            idx = sensor_target_abs
-            if sensor_min_idx is not None:
-                idx = (idx - sensor_min_idx.view(1, 1, -1)).clamp(min=0)
-                sensor_min_metric = sensor_min_idx.to(torch.float32)
-            else:
-                sensor_min_metric = torch.zeros(3, device=pred_l.device, dtype=torch.float32)
-            exp_l = expected_from_logits(pred_l, float(sensor_min_metric[0].item()))
-            exp_f = expected_from_logits(pred_f, float(sensor_min_metric[1].item()))
-            exp_r = expected_from_logits(pred_r, float(sensor_min_metric[2].item()))
-            pred_sensor_exp = torch.stack([exp_l, exp_f, exp_r], dim=-1)
-            target_sensor_cont = sensor_target_abs.to(pred_sensor_exp.dtype)
-            mse = masked_mse(pred_sensor_exp, target_sensor_cont, key_padding_mask)
-            rmse = masked_rmse(pred_sensor_exp, target_sensor_cont, key_padding_mask)
-            lr_rmse, lr_acc = masked_lr_metrics_logits(
-                lr_l, lr_r, sensor_target_abs, key_padding_mask, sensor_min_metric
-            )
-        else:
+        if self.obs_loss_mode == "recon":
             mse = masked_mse(pred_sensor, sensor_target, key_padding_mask)
             rmse = masked_rmse(pred_sensor, sensor_target, key_padding_mask)
-            lr_rmse, lr_acc = masked_lr_metrics(sensor_for_lr, sensor_target, key_padding_mask)
+            lr_rmse, lr_acc = masked_lr_metrics(pred_sensor, sensor_target, key_padding_mask)
+        else:
+            sensor_for_lr = aux_inputs.get("prior_sensor_pred", pred_sensor)
+            if self.sensor_mode == "categorical":
+                pred_l, pred_f, pred_r = pred_sensor
+                lr_l, _lr_f, lr_r = sensor_for_lr
+                sensor_target_abs = sensor_target.round().to(torch.long).clamp(min=0)
+                idx = sensor_target_abs
+                if sensor_min_idx is not None:
+                    idx = (idx - sensor_min_idx.view(1, 1, -1)).clamp(min=0)
+                    sensor_min_metric = sensor_min_idx.to(torch.float32)
+                else:
+                    sensor_min_metric = torch.zeros(3, device=pred_l.device, dtype=torch.float32)
+                exp_l = expected_from_logits(pred_l, float(sensor_min_metric[0].item()))
+                exp_f = expected_from_logits(pred_f, float(sensor_min_metric[1].item()))
+                exp_r = expected_from_logits(pred_r, float(sensor_min_metric[2].item()))
+                pred_sensor_exp = torch.stack([exp_l, exp_f, exp_r], dim=-1)
+                target_sensor_cont = sensor_target_abs.to(pred_sensor_exp.dtype)
+                mse = masked_mse(pred_sensor_exp, target_sensor_cont, key_padding_mask)
+                rmse = masked_rmse(pred_sensor_exp, target_sensor_cont, key_padding_mask)
+                lr_rmse, lr_acc = masked_lr_metrics_logits(
+                    lr_l, lr_r, sensor_target_abs, key_padding_mask, sensor_min_metric
+                )
+            else:
+                mse = masked_mse(pred_sensor, sensor_target, key_padding_mask)
+                rmse = masked_rmse(pred_sensor, sensor_target, key_padding_mask)
+                lr_rmse, lr_acc = masked_lr_metrics(sensor_for_lr, sensor_target, key_padding_mask)
 
         if loc_min is not None:
             loc_x_idx = loc_target[..., 0].to(torch.long)
@@ -778,28 +910,21 @@ class DiscreteLatentPredictorBase(PredictionLossMixin, nn.Module):
             aux_inputs=aux_inputs,
         )
         if self.obs_loss_mode == "recon":
-            base_losses["recon"] = base_losses["obs_total"]
+            recon = base_losses["obs_total"]
+            probe_total = cfg.loc_weight * (base_losses["loc_x"] + base_losses["loc_y"]) + cfg.head_weight * base_losses["head"]
+            base_losses["obs_total"] = recon + probe_total
+            base_losses["recon"] = recon
         return {**base_losses, **aux_losses}
 
-    def _encode_obs(self, obs):
-        sensor = obs["sensor"][..., :3]      # use only left/front/right sensors
-        loc = obs["loc"]                     # [B, T, 2]
-        heading = obs["heading"]             # [B, T]
-        actions = obs["actions"]             # [B, T, A]
-        key_padding_mask = obs.get("key_padding_mask")
-        if actions.ndim != 3:
-            raise ValueError(f"{self.__class__.__name__} expects batched sequences [B, T, A].")
+    def _encode_obs(self, obs, *, episode_start=None):
+        sensor, actions, prev_actions, key_padding_mask, _ = self._validate_obs_contract(
+            obs,
+            episode_start=episode_start,
+        )
+        obs_features = sensor[..., :3]      # use only left/front/right sensors
         B, T, _ = actions.shape
-        obs_features = sensor
         obs_embed = self.obs_encoder(obs_features)
-        return obs_embed, obs_features, actions, key_padding_mask, B, T
-
-    @staticmethod
-    def _build_prev_actions(actions: torch.Tensor) -> torch.Tensor:
-        a_prev = torch.zeros_like(actions)
-        if actions.shape[1] > 1:
-            a_prev[:, 1:, :] = actions[:, :-1, :]
-        return a_prev
+        return obs_embed, obs_features, actions, prev_actions, key_padding_mask, B, T
 
     def _split_sensor_logits(self, obs_out: torch.Tensor):
         """Map flattened sensor logits into (left, front, right) heads."""
@@ -834,10 +959,15 @@ class DiscreteLatentPredictorBase(PredictionLossMixin, nn.Module):
         return self._split_sensor_logits(self.h_obs_head(h_flat.detach()))
 
     def _decode_feat(self, feat: torch.Tensor):
-        """Decode sensors/actions from full feature; probe heads use detached features."""
+        """Decode sensors/actions from full feature.
+
+        Probe heads always read detached features. Action heads read detached
+        or live features based on model construction setting.
+        """
         feat_detached = feat.detach()
-        turn = self.turn_head(feat_detached)
-        step = self.step_head(feat_detached)
+        action_feat = feat_detached if self.detach_action_heads else feat
+        turn = self.turn_head(action_feat)
+        step = self.step_head(action_feat)
         loc_x = self.loc_probe_x(feat_detached)
         loc_y = self.loc_probe_y(feat_detached)
         heading_out = self.head_probe(feat_detached)
@@ -884,4 +1014,4 @@ class DiscreteLatentPredictorBase(PredictionLossMixin, nn.Module):
         """Project posterior stochastic latent z_t for contrastive targets."""
         if self.z_contrastive_head is None:
             return None
-        return self.z_contrastive_head(z_flat)
+        return self.z_contrastive_head(z_flat.detach())

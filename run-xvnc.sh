@@ -4,13 +4,20 @@
 DEFAULT_PASSWORD="mypassword123"
 DEFAULT_DISPLAY_NUM=15
 DEFAULT_RFBPORT=5900
+# Default command to run inside the X session.  Users can override
+# this with the `-c`/`--command` flag or by passing a command after
+# the option list.
 DEFAULT_COMMAND="./isaaclab.sh -p ./my/issaclab/create_scene.py"
+# How long (in seconds) the user command is allowed to run before it
+# is force-terminated. A value of 0 means no timeout.
+DEFAULT_TIMEOUT=0
 # --------------------------------------------------------------------
 usage() {
-  echo "Usage: $0 [-p password] [-d display_number] [-r rfbport] [-c command] [-- command...]"
+  echo "Usage: $0 [-p password] [-d display_number] [-r rfbport] [-t timeout] [-c command] [-- command...]"
   echo "  -p : VNC password           (default: $DEFAULT_PASSWORD)"
   echo "  -d : Display number         (default: $DEFAULT_DISPLAY_NUM)"
   echo "  -r : RFB port               (default: $DEFAULT_RFBPORT)"
+  echo "  -t : Timeout (seconds)       (default: $DEFAULT_TIMEOUT, 0 disables)"
   echo "  -c : Command to run         (default: $DEFAULT_COMMAND)"
   exit 1
 }
@@ -19,11 +26,12 @@ usage() {
 # Parse short options first. Everything after "--" (if present) is treated
 # as the command to run so the user doesn't have to quote it.
 
-while getopts "p:d:r:c:h" opt; do
+while getopts "p:d:r:t:c:h" opt; do
   case "$opt" in
     p) PASSWORD="$OPTARG" ;;
     d) DISPLAY_NUM="$OPTARG" ;;
     r) RFBPORT="$OPTARG" ;;
+    t) TIMEOUT="$OPTARG" ;;
     c) COMMAND="$OPTARG" ;;
     h|?) usage ;;
   esac
@@ -42,6 +50,8 @@ PASSWORD=${PASSWORD:-$DEFAULT_PASSWORD}
 DISPLAY_NUM=${DISPLAY_NUM:-$DEFAULT_DISPLAY_NUM}
 RFBPORT=${RFBPORT:-$DEFAULT_RFBPORT}
 COMMAND=${COMMAND:-$DEFAULT_COMMAND}
+# Timeout (0 = disabled)
+TIMEOUT=${TIMEOUT:-$DEFAULT_TIMEOUT}
 # Make the command visible to the xstartup script that will be
 # executed by the VNC session.
 export COMMAND
@@ -62,6 +72,10 @@ fi
 [[ "$DISPLAY_NUM" =~ ^[0-9]+$ ]] || { echo "Display number must be integer"; exit 1; }
 if ! [[ "$RFBPORT" =~ ^[0-9]+$ ]] || (( RFBPORT < 1024 || RFBPORT > 65535 )); then
   echo "RFB port must be 1024-65535"; exit 1
+fi
+# Validate TIMEOUT
+if ! [[ "$TIMEOUT" =~ ^[0-9]+$ ]]; then
+  echo "Timeout must be a non-negative integer"; exit 1
 fi
 # --------------------------------------------------------------------
 RESOLUTION="1920x1080"
@@ -130,8 +144,24 @@ if [ $? -eq 0 ]; then
   export DISPLAY=":$DISPLAY_NUM"
 
   # Run the user command in the foreground.
-  echo "Running: $COMMAND"
-  eval "$COMMAND"
+  echo "Running: $COMMAND (timeout=$TIMEOUT)"
+  #glxinfo > ~/vnc_capabilities.txt
+  export LIBGL_DEBUG=verbose
+
+  # If TIMEOUT > 0 use GNU `timeout` for enforcement.  We give the
+  # command a 10-second grace period to shut down cleanly before
+  # sending SIGKILL to the entire process group so that runaway
+  # children cannot keep the X session alive.
+  if (( TIMEOUT > 0 )); then
+    echo "Enforcing runtime limit: ${TIMEOUT}s (10s grace)"
+    timeout \
+      --preserve-status \
+      --signal=TERM --kill-after=10s "$TIMEOUT" \
+      bash -c "$COMMAND"
+  else
+    # No timeout requested.
+    eval "$COMMAND"
+  fi
   CMD_STATUS=$?
 
   # Tear down the VNC session.

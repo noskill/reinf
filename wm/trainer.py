@@ -8,7 +8,9 @@ def run_epoch_joint(
     loader,
     optimizer,
     device,
-    attention_window=None,
+    logger,
+    metric_prefix=None,
+    step=None,
 ):
     is_train = optimizer is not None
     model.train(is_train)
@@ -59,16 +61,25 @@ def run_epoch_joint(
             "key_padding_mask": kpm,
         }
 
-        out = model(
+        forward_out = model(
             obs,
-            attention_window=attention_window,
-            return_aux=False,
-            return_losses=True,
-            return_metrics=True,
-            targets=targets,
         )
-        loss_dict = out["losses"]
-        metrics = out["metrics"]
+        if not isinstance(forward_out, dict):
+            raise ValueError("forward(...) must return dict with preds/aux/state")
+        preds = forward_out.get("preds")
+        aux_inputs = forward_out.get("aux")
+        if preds is None or not isinstance(preds, tuple) or len(preds) != 6:
+            raise ValueError("forward(...)[\"preds\"] must be a 6-tuple")
+        loss_dict = model.compute_prediction_losses(
+            preds=preds,
+            targets=targets,
+            aux_inputs=aux_inputs,
+        )
+        metrics = model.compute_prediction_metrics(
+            preds=preds,
+            targets=targets,
+            aux_inputs=aux_inputs,
+        )
 
         obs_total = loss_dict.get("obs_total")
         if obs_total is None:
@@ -122,5 +133,8 @@ def run_epoch_joint(
         total_batches += 1
 
     if total_batches == 0:
-        return {}
-    return {k: v / total_batches for k, v in totals.items()}
+        return
+    epoch_metrics = {k: v / total_batches for k, v in totals.items()}
+    for key, value in epoch_metrics.items():
+        name = f"{metric_prefix}/{key}" if metric_prefix else key
+        logger.log_scalar(name, value, step=step)

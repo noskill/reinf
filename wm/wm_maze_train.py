@@ -16,10 +16,10 @@ import gymnasium as gym
 import numpy as np
 import torch
 
+from agent_utils_wm import MAZE_WM_MODEL_DEFAULTS, add_create_model_args, extract_create_model_args
 from log import Logger
-from reinforce import Reinforce
 from sample import DiscreteActionSampler
-from wm_joint_agent import JointWMAgent, WMActionHeadPolicy, create_maze_rnn_world_model
+from wm_joint_agent import JointWMReinforce, WMActionHeadPolicy, create_maze_world_model
 
 
 THIS_DIR = Path(__file__).resolve().parent
@@ -69,31 +69,6 @@ class MazeTrainerEnvAdapter:
         self.env.close()
 
 
-def build_agent(
-    *,
-    action_dim: int,
-    num_envs: int,
-    policy_lr: float,
-    discount: float,
-    entropy_coef: float,
-    device: torch.device,
-    logger: Logger,
-    policy_module: torch.nn.Module,
-):
-    policy = policy_module.to(device)
-    sampler = DiscreteActionSampler()
-    return Reinforce(
-        policy=policy,
-        sampler=sampler,
-        num_envs=num_envs,
-        policy_lr=policy_lr,
-        discount=discount,
-        device=device,
-        entropy_coef=entropy_coef,
-        logger=logger,
-    )
-
-
 def default_experiment_dir(experiment_name: str | None) -> str:
     if experiment_name is None:
         experiment_name = f"maze_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
@@ -134,6 +109,19 @@ def parse_args():
     parser.add_argument("--policy-lr", type=float, default=3e-4)
     parser.add_argument("--discount", type=float, default=0.99)
     parser.add_argument("--entropy-coef", type=float, default=0.01)
+    parser.set_defaults(policy_backprop_through_wm=True)
+    parser.add_argument(
+        "--policy-backprop-through-wm",
+        dest="policy_backprop_through_wm",
+        action="store_true",
+        help="Allow policy loss gradients to flow through WM backbone/action-state path.",
+    )
+    parser.add_argument(
+        "--no-policy-backprop-through-wm",
+        dest="policy_backprop_through_wm",
+        action="store_false",
+        help="Disable policy-gradient flow through WM backbone/action-state path.",
+    )
     parser.add_argument("--intrinsic-reward-scale", type=float, default=1.0)
     parser.add_argument("--env-reward-scale", type=float, default=1.0)
     parser.add_argument("--wm-lr", type=float, default=3e-4)
@@ -141,14 +129,12 @@ def parse_args():
     parser.add_argument("--wm-updates-per-policy", type=int, default=1)
     parser.add_argument("--wm-replay-capacity", type=int, default=2048)
     parser.add_argument("--wm-train-episodes", type=int, default=64)
-    parser.add_argument("--wm-hidden-size", type=int, default=176)
-    parser.add_argument("--wm-layers", type=int, default=3)
-    parser.add_argument("--wm-intermediate", type=int, default=704)
-    parser.add_argument("--wm-obs-latent-dim", type=int, default=64)
-    parser.add_argument("--wm-probe-hidden-dim", type=int, default=128)
-    parser.add_argument("--wm-probe-layers", type=int, default=2)
-    parser.add_argument("--wm-contrastive-dim", type=int, default=64)
-    parser.add_argument("--wm-contrastive-steps", type=int, default=1)
+    add_create_model_args(
+        parser,
+        arg_prefix="wm",
+        defaults=MAZE_WM_MODEL_DEFAULTS,
+        include_load_path=True,
+    )
     parser.add_argument("--wm-contrastive-temp", type=float, default=0.1)
     parser.add_argument("--wm-contrastive-discount", type=float, default=0.75)
     parser.add_argument("--wm-contrastive-negatives", type=int, default=0)
@@ -202,22 +188,16 @@ def main():
     if args.wm_sensor_max_bin < 1:
         raise ValueError("--wm-sensor-max-bin must be >= 1")
 
+    wm_model_args = extract_create_model_args(args, arg_prefix="wm", device=args.device)
     maze_dim = int(base_env._mazes[0].dim)
     turn_bins = len({int(turn) for turn, _ in base_env.action_table})
     step_bins = len({int(step) for _, step in base_env.action_table})
-    wm_model = create_maze_rnn_world_model(
+    wm_model = create_maze_world_model(
+        model_args=wm_model_args,
         device=torch.device(args.device),
         maze_dim=maze_dim,
         turn_bins=turn_bins,
         step_bins=step_bins,
-        hidden_size=args.wm_hidden_size,
-        layers=args.wm_layers,
-        intermediate=args.wm_intermediate,
-        obs_latent_dim=args.wm_obs_latent_dim,
-        probe_hidden_dim=args.wm_probe_hidden_dim,
-        probe_layers=args.wm_probe_layers,
-        contrastive_dim=args.wm_contrastive_dim,
-        contrastive_steps=args.wm_contrastive_steps,
         contrastive_temp=args.wm_contrastive_temp,
         contrastive_horizon_discount=args.wm_contrastive_discount,
         contrastive_negatives=args.wm_contrastive_negatives,
@@ -235,29 +215,26 @@ def main():
         wm_model=wm_model,
         action_table=base_env.action_table,
         device=torch.device(args.device),
+        backprop_through_wm=args.policy_backprop_through_wm,
     )
 
-    policy_agent = build_agent(
-        action_dim=env.action_space.n,
-        num_envs=env.num_envs,
-        policy_lr=args.policy_lr,
-        discount=args.discount,
-        entropy_coef=args.entropy_coef,
-        device=torch.device(args.device),
-        logger=logger,
-        policy_module=policy_module,
-    )
     wm_optimizer = torch.optim.AdamW(
         [p for p in wm_model.parameters() if p.requires_grad],
         lr=args.wm_lr,
         weight_decay=args.wm_weight_decay,
     )
-    agent = JointWMAgent(
-        policy_agent=policy_agent,
+    agent = JointWMReinforce(
+        policy=policy_module,
+        sampler=DiscreteActionSampler(),
+        policy_lr=args.policy_lr,
+        num_envs=env.num_envs,
+        discount=args.discount,
+        logger=logger,
         wm_model=wm_model,
         wm_optimizer=wm_optimizer,
         action_table=base_env.action_table,
         device=torch.device(args.device),
+        entropy_coef=args.entropy_coef,
         intrinsic_reward_scale=args.intrinsic_reward_scale,
         env_reward_scale=args.env_reward_scale,
         wm_updates_per_policy=args.wm_updates_per_policy,

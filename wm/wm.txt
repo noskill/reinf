@@ -1,0 +1,72 @@
+WORLD MODELS
+World models are models that infer world state from observations and predict how this state evolves given actions. This allows to train policy in virtual episodes.
+Here we describe to prominent models Dreamer v3 and TWISTER and their components.
+
+https://arxiv.org/pdf/1807.03748 
+https://arxiv.org/pdf/2503.04416
+
+Key components of DREAMER/TWISTER
+
+ht =Fϕ​(ht-1,zt-1​,at−1​)  - context encoder e.g. RNN or transformer. 
+zt ∼ qϕ(zt | ot)  - observation encoder, models distribution of z_t given only current observation ot e.g. VAE encoder in dreamer v3 its zt ∼ qϕ(* | ot, ht) .
+zt ∼ dϕ(zt | ht) - dynamics predictor: models distribution of world state given context. Virtually this predicts how world changes given previous state and action at-1which encoded in ht
+st = {ht, zt} - concatenation of context and world state.
+ot ∼ pϕ(ot | zt)  - observation decoder, models distribution for observations e.g. VAE decoder, in dreamer it’s ot ∼ pϕ(ot | st).
+         et= u (zt)- model that projects world states to embedding space.
+
+et:t+k = wϕ (st, at:t+k) - predicted embeddings given state and actions
+         rt ∼ rϕ(rt | st) - predicted reward for current transition
+ct ∼ cϕ(ct | st) - predicted episode continuation/termination
+
+losses:
+zt~dϕ is learnt with KL divergence with zt produced by observation encoder.
+qϕ and pϕ are trained with whatever encoder-decoder loss is suitable e.g. ELBO loss.
+wϕ is trained with constructive loss with projection u(zt) of observed zt to predicted  et:t+k
+
+It is also possible to learn other useful signals such as rewards and episode termination.
+
+Action Conditioned (AC-CPC)
+This is TWISTER component that is responsible for et= u (zt)training.
+This is an architecture that allows compressing high-dimensional observations into useful representations. 
+
+
+RSSM stands for Recurrent State-Space Model. This is a part of dreamer that constitutes the world model. In TWISTER it is TSSM - transformer instead of recurrent model.  
+There are two key differences:
+Dreamer updates distribution zt ∼ dϕ(* | ht) to match different encoder: zt ∼ qϕ(* | ot, ht).
+This is very similar to recursive Bayesian estimation or Bayesian filtering, very similar to the inference in the hidden-markov model. Unlike TWISTER which uses zt ∼ qϕ(* | ot) 
+AC-CPC/TWISTER contrastive loss for embeddings additionally to reconstructive loss in Dreamer. 
+
+Another minor difference decoder in dreamer is ot ∼ pϕ(ot | st)
+
+Having said that it helps to concatenate many observations ot or use dreamer style encoder  qϕ(zt | ot, ht) for AC-CPC.
+Both methods are reported to work best with discrete distribution of world states  zt.  though can be used with different distributions. 
+
+
+conceptually:
+
+baselines:
+h0 = f(h-1,a-1, o0)
+h0 -> a0
+h0, a0 -> predict o1
+h1 = f(h0, a0, o1)
+
+
+
+// world models
+h0=0, posterior z0 = qϕ(h0, o0)
+s0 = [ h0, z0] -> a0
+h1=Fϕ(z0, h0, a0), prior hat z1 = dϕ(h1)
+posterior z1 = qϕ(h1, O1)
+s1 = [h1, z1] -> a0
+h2=Fϕ(z1, h1, a1)
+
+conceptually:
+z0 = q(h0, o0) -> h1 = F(h0, z0, a0)  -> predict a1 from o0, a0, o1
+s0 -> a0,
+s1 -> a1
+and for ac-cpc starting from h1:
+e10 = f(h1) - conditioned by a0 via h1
+e12 = f(h1, hat z1, a1)
+e13 = f(h1, hat z1, a1, a2)
+with positives e10 <-> z1, e12 <-> z2, e13 <-> z3…
+

@@ -28,7 +28,7 @@ from wm_train import (
     RNNPredictor,
     RSSMDiscretePredictor,
     TSSMDiscretePredictor,
-    UnifiedPredictor,
+    TransformerBaseline,
     compute_stats,
     set_seed,
 )
@@ -303,7 +303,7 @@ def build_model_from_checkpoint(ckpt: dict, sensor_mode: str, device: str):
         probe_layers = resolve_probe_layers(model_cfg, probe_hidden_dim)
         contrastive_dim = int(model_cfg.get("contrastive_dim", contrastive_dim_cfg))
         contrastive_steps = int(model_cfg.get("contrastive_steps", contrastive_steps_cfg))
-        model = UnifiedPredictor(
+        model = TransformerBaseline(
             llama_cfg,
             sensor_mode=sensor_mode,
             sensor_dim=sensor_dim,
@@ -326,8 +326,6 @@ def build_model_from_checkpoint(ckpt: dict, sensor_mode: str, device: str):
         probe_layers = resolve_probe_layers(rcfg, probe_hidden_dim)
         contrastive_dim = int(rcfg.get("contrastive_dim", model_cfg.get("contrastive_dim", contrastive_dim_cfg)))
         contrastive_steps = int(rcfg.get("contrastive_steps", model_cfg.get("contrastive_steps", contrastive_steps_cfg)))
-        transition = str(rcfg.get("transition", cfg.get("rnn_transition", "gru")))
-        residual_scale = float(rcfg.get("residual_scale", cfg.get("rnn_residual_scale", 1.0)))
         state_norm = str(rcfg.get("state_norm", cfg.get("rnn_state_norm", "none")))
         default_input_size = sensor_dim + 2
         rnn_cfg = LlamaConfig(
@@ -349,8 +347,6 @@ def build_model_from_checkpoint(ckpt: dict, sensor_mode: str, device: str):
             obs_latent_dim=obs_latent_dim,
             probe_hidden_dim=probe_hidden_dim,
             probe_layers=probe_layers,
-            transition=transition,
-            residual_scale=residual_scale,
             state_norm=state_norm,
             contrastive_dim=contrastive_dim,
             contrastive_steps=contrastive_steps,
@@ -508,10 +504,13 @@ def main():
             h_prev = None
             z_prev_flat = None
             if isinstance(model, (RSSMDiscretePredictor, TSSMDiscretePredictor)):
-                if len(out) < 8:
+                if not isinstance(out, dict):
                     skipped_eps += 1
                     continue
-                last_state = out[-1]
+                last_state = out.get("state")
+                if last_state is None:
+                    skipped_eps += 1
+                    continue
                 state_prev = last_state[:, 0, :] if last_state.dim() == 3 else last_state
                 h_prev = state_prev[:, : model.hidden_size]
                 z_prev_flat = state_prev[:, model.hidden_size :]
@@ -569,7 +568,7 @@ def main():
                     )
                     h_t = h_step[:, -1, :]
                     pos_idx += 1
-                elif isinstance(model, UnifiedPredictor):
+                elif isinstance(model, TransformerBaseline):
                     # Deterministic non-latent rollout: feed predicted sensor as next input.
                     if ridx == 0:
                         roll_sensor_in = obs_sensor[:, -1:, :]

@@ -2,7 +2,7 @@
 """Shared utility functions for world-model training and evaluation."""
 
 import random
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -208,11 +208,28 @@ def batch_row_k_step_contrastive_pair_stats(
     temperature: float,
     horizon_discount: float = 1.0,
     max_negatives: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Return `(loss, acc)` for multi-horizon row-wise InfoNCE."""
+) -> Dict[str, torch.Tensor]:
+    """Return multi-horizon row-wise InfoNCE stats (scalar and per-step)."""
+    B, T = key_padding_mask.shape
+    K = len(pred_steps)
+    device = key_padding_mask.device
+    default_dtype = target_emb.dtype if target_emb is not None else torch.float32
+
+    def _zero_stats(*, num_horizons: int) -> Dict[str, torch.Tensor]:
+        return {
+            "loss": torch.tensor(0.0, device=device, dtype=default_dtype),
+            "acc": torch.tensor(0.0, device=device, dtype=default_dtype),
+            "per_step_loss": torch.zeros((B, T), device=device, dtype=default_dtype),
+            "per_step_acc": torch.zeros((B, T), device=device, dtype=default_dtype),
+            "per_step_weight": torch.zeros((B, T), device=device, dtype=default_dtype),
+            "per_step_valid": torch.zeros((B, T), device=device, dtype=torch.bool),
+            "per_horizon_loss": torch.zeros((num_horizons,), device=device, dtype=default_dtype),
+            "per_horizon_acc": torch.zeros((num_horizons,), device=device, dtype=default_dtype),
+            "per_horizon_valid": torch.zeros((num_horizons,), device=device, dtype=torch.bool),
+        }
+
     if target_emb is None:
-        zero = torch.tensor(0.0, device=key_padding_mask.device)
-        return zero, zero
+        return _zero_stats(num_horizons=K)
     if target_emb.ndim != 3:
         raise ValueError(f"Expected target_emb [B, T, D], got {tuple(target_emb.shape)}")
     if temperature <= 0:
@@ -222,17 +239,16 @@ def batch_row_k_step_contrastive_pair_stats(
     if max_negatives < 0:
         raise ValueError("max_negatives must be >= 0")
     if not pred_steps:
-        zero = torch.tensor(0.0, device=target_emb.device, dtype=target_emb.dtype)
-        return zero, zero
+        return _zero_stats(num_horizons=0)
 
     B, T, _ = target_emb.shape
     losses: List[torch.Tensor] = []
     accs: List[torch.Tensor] = []
     weights: List[torch.Tensor] = []
-    K = len(pred_steps)
-    if K == 0:
-        zero = torch.tensor(0.0, device=target_emb.device, dtype=target_emb.dtype)
-        return zero, zero
+    stats = _zero_stats(num_horizons=K)
+    per_step_loss_weighted = torch.zeros((B, T), device=target_emb.device, dtype=target_emb.dtype)
+    per_step_acc_weighted = torch.zeros((B, T), device=target_emb.device, dtype=target_emb.dtype)
+    per_step_weight = torch.zeros((B, T), device=target_emb.device, dtype=target_emb.dtype)
     norm_denom = sum(float(horizon_discount) ** t for t in range(K))
     for t, pred_h in enumerate(pred_steps):
         h = t + 1
@@ -253,26 +269,47 @@ def batch_row_k_step_contrastive_pair_stats(
                 f"pred/target dim mismatch at horizon {h}: {pred_h.shape[-1]} vs {key_h.shape[-1]}"
             )
         valid = (~key_padding_mask[:, :Th]) & (~key_padding_mask[:, h : h + Th])
-        loss_h, acc_h = _batch_row_infonce(
+        stats_h = _batch_row_infonce(
             pred_h,
             key_h,
             valid,
             temperature,
             max_negatives=max_negatives,
         )
-        losses.append(loss_h)
-        accs.append(acc_h)
-        weights.append(pred_h.new_tensor((float(horizon_discount) ** t) / norm_denom))
+        weight_h = pred_h.new_tensor((float(horizon_discount) ** t) / norm_denom)
+        stats["per_horizon_loss"][t] = stats_h["loss"]
+        stats["per_horizon_acc"][t] = stats_h["acc"]
+        if int(stats_h["num_rows"].item()) > 0:
+            stats["per_horizon_valid"][t] = True
+            losses.append(stats_h["loss"])
+            accs.append(stats_h["acc"])
+            weights.append(weight_h)
+
+            row_valid = stats_h["row_valid"]
+            row_loss = stats_h["row_loss"]
+            row_acc = stats_h["row_acc"]
+            valid_weight = row_valid.to(row_loss.dtype)
+            per_step_loss_weighted[:, :Th] = per_step_loss_weighted[:, :Th] + weight_h * row_loss
+            per_step_acc_weighted[:, :Th] = per_step_acc_weighted[:, :Th] + weight_h * row_acc
+            per_step_weight[:, :Th] = per_step_weight[:, :Th] + weight_h * valid_weight
+
+    stats["per_step_weight"] = per_step_weight
+    stats["per_step_valid"] = per_step_weight > 0
+    valid_steps = stats["per_step_valid"]
+    if valid_steps.any():
+        stats["per_step_loss"][valid_steps] = per_step_loss_weighted[valid_steps] / per_step_weight[valid_steps]
+        stats["per_step_acc"][valid_steps] = per_step_acc_weighted[valid_steps] / per_step_weight[valid_steps]
 
     if not losses:
-        zero = torch.tensor(0.0, device=target_emb.device, dtype=target_emb.dtype)
-        return zero, zero
+        return stats
     loss_t = torch.stack(losses)
     acc_t = torch.stack(accs)
     weight_t = torch.stack(weights)
     weighted_loss = (loss_t * weight_t).sum()
     weighted_acc = (acc_t * weight_t).sum() / weight_t.sum()
-    return weighted_loss, weighted_acc
+    stats["loss"] = weighted_loss
+    stats["acc"] = weighted_acc
+    return stats
 
 
 def _batch_row_infonce(
@@ -281,10 +318,24 @@ def _batch_row_infonce(
     valid: torch.Tensor,
     temperature: float,
     max_negatives: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    if valid.sum() == 0:
-        zero = torch.tensor(0.0, device=anchor.device, dtype=anchor.dtype)
-        return zero, zero
+) -> Dict[str, torch.Tensor]:
+    B, Tm1, _ = anchor.shape
+    row_loss = torch.zeros((B, Tm1), device=anchor.device, dtype=anchor.dtype)
+    row_acc = torch.zeros((B, Tm1), device=anchor.device, dtype=anchor.dtype)
+    row_valid = valid.to(torch.bool)
+
+    def _stats_zero(*, use_valid_mask: bool) -> Dict[str, torch.Tensor]:
+        return {
+            "loss": torch.tensor(0.0, device=anchor.device, dtype=anchor.dtype),
+            "acc": torch.tensor(0.0, device=anchor.device, dtype=anchor.dtype),
+            "row_loss": row_loss.clone(),
+            "row_acc": row_acc.clone(),
+            "row_valid": row_valid if use_valid_mask else torch.zeros_like(row_valid),
+            "num_rows": torch.tensor(0, device=anchor.device, dtype=torch.long),
+        }
+
+    if row_valid.sum() == 0:
+        return _stats_zero(use_valid_mask=False)
 
     if max_negatives < 0:
         raise ValueError("max_negatives must be >= 0")
@@ -293,7 +344,7 @@ def _batch_row_infonce(
     K = B * Tm1
     anchor_flat = anchor.reshape(K, D)
     key_flat = key.reshape(K, D)
-    valid_flat = valid.reshape(K)
+    valid_flat = row_valid.reshape(K)
 
     sel = torch.nonzero(valid_flat, as_tuple=False).squeeze(1)
     anchor_sel = F.normalize(anchor_flat[sel], dim=-1)
@@ -310,9 +361,18 @@ def _batch_row_infonce(
         allowed = valid_flat.unsqueeze(0).expand(pos_idx.shape[0], -1).clone()
         allowed.scatter_(1, pos_idx.unsqueeze(1), True)
         logits = logits.masked_fill(~allowed, -1e9)
-        loss = F.cross_entropy(logits, pos_idx)
-        acc = (torch.argmax(logits, dim=-1) == pos_idx).to(logits.dtype).mean()
-        return loss, acc
+        per_row_loss = F.cross_entropy(logits, pos_idx, reduction="none")
+        per_row_acc = (torch.argmax(logits, dim=-1) == pos_idx).to(logits.dtype)
+        row_loss.view(-1)[sel] = per_row_loss
+        row_acc.view(-1)[sel] = per_row_acc
+        return {
+            "loss": per_row_loss.mean(),
+            "acc": per_row_acc.mean(),
+            "row_loss": row_loss,
+            "row_acc": row_acc,
+            "row_valid": row_valid,
+            "num_rows": torch.tensor(int(sel.numel()), device=anchor.device, dtype=torch.long),
+        }
 
     # Sampled-negatives path: keep positive + up to max_negatives valid keys.
     # This reduces O(N*K) similarity compute to O(N*max_negatives).
@@ -320,12 +380,10 @@ def _batch_row_infonce(
     V = int(valid_idx.numel())
     N = int(pos_idx.numel())
     if V <= 1:
-        zero = torch.tensor(0.0, device=anchor.device, dtype=anchor.dtype)
-        return zero, zero
+        return _stats_zero(use_valid_mask=False)
     M = min(int(max_negatives), V - 1)
     if M <= 0:
-        zero = torch.tensor(0.0, device=anchor.device, dtype=anchor.dtype)
-        return zero, zero
+        return _stats_zero(use_valid_mask=False)
 
     rank_map = torch.full((K,), -1, dtype=torch.long, device=anchor.device)
     rank_map[valid_idx] = torch.arange(V, device=anchor.device)
@@ -344,7 +402,16 @@ def _batch_row_infonce(
 
     # Future improvement: add negatives from virtual rollouts (model-generated embeddings).
     # Future improvement: add hard negatives from the same episode but temporally distant steps.
-    loss = F.cross_entropy(logits, labels)
+    per_row_loss = F.cross_entropy(logits, labels, reduction="none")
     # Twister-style contrastive accuracy: matched positive is argmax in row.
-    acc = (torch.argmax(logits, dim=-1) == labels).to(logits.dtype).mean()
-    return loss, acc
+    per_row_acc = (torch.argmax(logits, dim=-1) == labels).to(logits.dtype)
+    row_loss.view(-1)[sel] = per_row_loss
+    row_acc.view(-1)[sel] = per_row_acc
+    return {
+        "loss": per_row_loss.mean(),
+        "acc": per_row_acc.mean(),
+        "row_loss": row_loss,
+        "row_acc": row_acc,
+        "row_valid": row_valid,
+        "num_rows": torch.tensor(int(sel.numel()), device=anchor.device, dtype=torch.long),
+    }

@@ -9,6 +9,8 @@ import torch
 from base import DiscreteLatentPredictorBase
 from transformer import LlamaConfig, LlamaModel
 from tr_cache import PositionBasedDynamicCache, WindowedPositionBasedDynamicCache
+
+
 class TSSMDiscretePredictor(DiscreteLatentPredictorBase):
     """Transformer state-space model with discrete stochastic latents.
 
@@ -54,6 +56,7 @@ class TSSMDiscretePredictor(DiscreteLatentPredictorBase):
         probe_layers: int = 2,
         contrastive_dim: int = 0,
         contrastive_steps: int = 1,
+        detach_action_heads: bool = True,
     ):
         if int(hidden_size) != int(heads) * int(head_dim):
             raise ValueError("For tssm, hidden_size must equal heads * head_dim")
@@ -87,6 +90,7 @@ class TSSMDiscretePredictor(DiscreteLatentPredictorBase):
             probe_layers=probe_layers,
             contrastive_dim=contrastive_dim,
             contrastive_steps=contrastive_steps,
+            detach_action_heads=detach_action_heads,
         )
         self.attention_window = attention_window
 
@@ -103,20 +107,20 @@ class TSSMDiscretePredictor(DiscreteLatentPredictorBase):
         )
         self.transition = LlamaModel(trans_cfg)
 
-    def forward(
+    def _forward_core(
         self,
         obs,
+        *,
         attention_window=None,
-        return_state=False,
-        return_aux=True,
-        return_losses=False,
-        return_metrics=False,
-        targets=None,
+        episode_start=None,
+        need_aux: bool = False,
     ):
-        obs_embed, obs_features, actions, key_padding_mask, B, T = self._encode_obs(obs)
+        obs_embed, obs_features, actions, a_prev, key_padding_mask, B, T = self._encode_obs(
+            obs,
+            episode_start=episode_start,
+        )
         device = actions.device
 
-        a_prev = self._build_prev_actions(actions)
         h_prev = actions.new_zeros((B, self.hidden_size))
         z_prev_flat = actions.new_zeros((B, self.stoch_flat))
         h_init = h_prev
@@ -214,7 +218,6 @@ class TSSMDiscretePredictor(DiscreteLatentPredictorBase):
                 feat_roll = torch.stack(feat_roll_steps, dim=1)
                 prior_roll_sensor_pred = self._decode_sensor_from_feat(feat_roll)
 
-        need_aux = return_aux or return_losses or return_metrics
         aux_inputs = None
         if need_aux:
             aux_inputs = {
@@ -222,7 +225,7 @@ class TSSMDiscretePredictor(DiscreteLatentPredictorBase):
                 "post_logits": post_logits,
                 "feat": feat,
                 "obs_target": obs_features,
-                "sensor_target": obs["sensor"],
+                "sensor_target": obs_features,
                 "loc_target": obs["loc"],
                 "head_target": obs["heading"],
                 "prior_sensor_pred": prior_sensor_pred,
@@ -230,39 +233,34 @@ class TSSMDiscretePredictor(DiscreteLatentPredictorBase):
                 "z_only_pred": z_only_pred,
                 "h_only_pred": h_only_pred,
             }
-            if self.contrastive_head is not None:
-                # Twister-style action-conditioned contrastive predictors for horizons 1..K.
-                aux_inputs["contrastive_pred_emb_steps"] = self._project_contrastive_pred_steps(
-                    feat_prior,
-                    actions,
-                )
-                aux_inputs["contrastive_tgt_emb"] = self._project_contrastive_target_z(z_post)
+            # Twister-style action-conditioned contrastive predictors for horizons 1..K.
+            aux_inputs["contrastive_pred_emb_steps"] = self._project_contrastive_pred_steps(
+                feat_prior,
+                actions,
+            )
+            aux_inputs["contrastive_tgt_emb"] = self._project_contrastive_target_z(z_post)
             if obs_hat is not None:
                 aux_inputs["obs_hat"] = obs_hat
 
-        preds = outputs
-        losses = None
-        metrics = None
-        if return_losses or return_metrics:
-            losses, metrics = self.compute_losses_and_metrics(
-                preds=preds,
-                targets=targets,
-                aux_inputs=aux_inputs,
-                return_metrics=return_metrics,
-            )
-            return {
-                "preds": preds,
-                "state": torch.cat([h_prev, z_prev_flat], dim=-1) if return_state else None,
-                "aux": aux_inputs if return_aux else None,
-                "losses": losses,
-                "metrics": metrics,
-            }
+        last_state = torch.cat([h_prev, z_prev_flat], dim=-1)
+        return outputs, aux_inputs, last_state
 
-        if return_state:
-            last_state = torch.cat([h_prev, z_prev_flat], dim=-1)
-            if return_aux:
-                return (*outputs, aux_inputs, last_state)
-            return (*outputs, last_state)
-        if return_aux:
-            return (*outputs, aux_inputs)
-        return outputs
+    def forward(
+        self,
+        obs,
+        attention_window=None,
+        return_state=False,
+        episode_start=None,
+    ):
+        need_aux = episode_start is None
+        outputs, aux_inputs, last_state = self._forward_core(
+            obs,
+            attention_window=attention_window,
+            episode_start=episode_start,
+            need_aux=need_aux,
+        )
+        return {
+            "preds": outputs,
+            "aux": aux_inputs if need_aux else None,
+            "state": last_state if return_state else None,
+        }

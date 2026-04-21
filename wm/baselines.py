@@ -8,9 +8,13 @@ import torch
 from torch import nn
 
 from base import PredictionLossMixin
-from transformer import LlamaConfig, LlamaMLP, LlamaModel, LlamaRMSNorm
+from tr_cache import PositionBasedDynamicCache, WindowedPositionBasedDynamicCache
+from transformer import LlamaConfig, LlamaModel, LlamaRMSNorm
 from utils import make_probe_head
-class UnifiedPredictor(PredictionLossMixin, nn.Module):
+
+
+
+class TransformerBaseline(PredictionLossMixin, nn.Module):
     def __init__(
         self,
         config: LlamaConfig,
@@ -29,6 +33,7 @@ class UnifiedPredictor(PredictionLossMixin, nn.Module):
         probe_layers: int = 2,
         contrastive_dim: int = 0,
         contrastive_steps: int = 1,
+        detach_action_heads: bool = True,
     ):
         super().__init__()
         self.backbone = LlamaModel(config)
@@ -44,6 +49,7 @@ class UnifiedPredictor(PredictionLossMixin, nn.Module):
         self.probe_layers = int(probe_layers)
         self.contrastive_dim = int(contrastive_dim)
         self.contrastive_steps = int(contrastive_steps)
+        self.detach_action_heads = bool(detach_action_heads)
         if self.probe_hidden_dim < 0:
             raise ValueError("probe_hidden_dim must be >= 0")
         if self.probe_layers < 1:
@@ -62,12 +68,12 @@ class UnifiedPredictor(PredictionLossMixin, nn.Module):
         self.loc_x_head = make_probe_head(config.hidden_size, loc_x_bins, self.probe_hidden_dim, self.probe_layers)
         self.loc_y_head = make_probe_head(config.hidden_size, loc_y_bins, self.probe_hidden_dim, self.probe_layers)
         self.heading_head = make_probe_head(config.hidden_size, heading_dim, self.probe_hidden_dim, self.probe_layers)
-        self.obs_encoder = nn.Sequential(
-            nn.Linear(obs_dim, obs_latent_dim),
+        self.action_encoder = nn.Sequential(
+            nn.Linear(self.action_dim, obs_latent_dim),
             nn.ReLU(),
             nn.Linear(obs_latent_dim, obs_latent_dim),
         )
-        self.fuse = nn.Linear(config.hidden_size + obs_latent_dim, config.hidden_size)
+        self.obs_fuse = nn.Linear(config.hidden_size + obs_latent_dim, config.hidden_size)
         self.turn_head = nn.Linear(config.hidden_size, turn_bins)
         self.step_head = nn.Linear(config.hidden_size, step_bins)
         self.contrastive_target_head: Optional[nn.Module] = None
@@ -88,11 +94,37 @@ class UnifiedPredictor(PredictionLossMixin, nn.Module):
                     for h in range(1, self.contrastive_steps + 1)
                 ]
             )
+        self._num_envs: Optional[int] = None
+        self._cache_position: Optional[torch.Tensor] = None
+        self._cache = None
+        self.attention_window = config.attention_window
+
+    def init_cache(self, num_envs: int, device: torch.device):
+        self._num_envs = int(num_envs)
+        if self.attention_window is not None and self.attention_window > 0:
+            self._cache = WindowedPositionBasedDynamicCache(self.attention_window).to(device=device)
+        else:
+            self._cache = PositionBasedDynamicCache().to(device=device)
+        self._cache_position = torch.zeros(self._num_envs, dtype=torch.long, device=device)
+
+    def reset_cache(self, reset_mask: torch.Tensor):
+        if self._cache_position is None:
+            return
+        reset_mask = reset_mask.to(torch.bool).view(-1)
+        if reset_mask.numel() != self._cache_position.numel():
+            raise ValueError("reset_mask size must match num_envs for cache reset")
+        self._cache.reset(reset_mask)
+        self._cache_position[reset_mask] = 0
+
+    def clear_cache(self):
+        self._num_envs = None
+        self._cache_position = None
+        self._cache = None
 
     def _project_contrastive_target_h(self, h: torch.Tensor) -> Optional[torch.Tensor]:
         if self.contrastive_target_head is None:
             return None
-        return self.contrastive_target_head(h)
+        return self.contrastive_target_head(h.detach())
 
     def _project_contrastive_pred_steps(self, h: torch.Tensor, actions: torch.Tensor) -> List[torch.Tensor]:
         if self.contrastive_dim <= 0 or self.contrastive_action_heads is None:
@@ -109,96 +141,93 @@ class UnifiedPredictor(PredictionLossMixin, nn.Module):
             pred_steps.append(head(pred_in))
         return pred_steps
 
-    def forward(
+    def _forward_core(
         self,
         obs,
-        attention_window=None,
-        past_key_values=None,
-        cache_position=None,
-        prev_hidden=None,
-        return_state=False,
-        return_aux=False,
-        return_losses=False,
-        return_metrics=False,
-        targets=None,
+        *,
+        episode_start=None,
+        need_aux: bool = False,
     ):
-        sensor = obs["sensor"]
-        actions = obs["actions"]
-        key_padding_mask = obs.get("key_padding_mask")
+        sensor, actions, prev_actions, key_padding_mask, _ = self._validate_obs_contract(
+            obs,
+            episode_start=episode_start,
+        )
 
-        x = torch.cat([sensor, actions], dim=-1)
+        using_internal_cache = episode_start is not None
+        if using_internal_cache:
+            episode_start_t = torch.as_tensor(episode_start, dtype=torch.bool, device=sensor.device).view(-1)
+            if episode_start_t.numel() != sensor.shape[0]:
+                raise ValueError(
+                    f"episode_start batch mismatch: expected {sensor.shape[0]}, got {episode_start_t.numel()}"
+                )
+            if self._cache is None or self._cache_position is None or self._cache_position.numel() != episode_start_t.numel():
+                self.init_cache(num_envs=episode_start_t.numel(), device=sensor.device)
+            else:
+                self.reset_cache(episode_start_t)
+
+        x = torch.cat([sensor, prev_actions], dim=-1)
         if x.shape[-1] != self.input_size:
             raise ValueError(f"Expected input_size {self.input_size}, got {x.shape[-1]}")
 
         h = self.backbone(
             x,
-            past_key_values=past_key_values,
-            cache_position=cache_position,
+            past_key_values=self._cache if using_internal_cache else None,
+            cache_position=self._cache_position.unsqueeze(1) if using_internal_cache else None,
             key_padding_mask=key_padding_mask,
-            attention_window=attention_window,
+            attention_window=self.attention_window,
         )
+        if using_internal_cache:
+            self._cache_position.add_(1)
+        action_latent = self.action_encoder(actions)
+        obs_feat = torch.tanh(self.obs_fuse(torch.cat([h, action_latent], dim=-1)))
         if self.sensor_mode != "categorical":
-            raise ValueError("UnifiedPredictor currently supports sensor_mode='categorical' only.")
+            raise ValueError("TransformerBaseline currently supports sensor_mode='categorical' only.")
         pred_sensor = (
-            self.sensor_head_l(h),
-            self.sensor_head_f(h),
-            self.sensor_head_r(h),
+            self.sensor_head_l(obs_feat),
+            self.sensor_head_f(obs_feat),
+            self.sensor_head_r(obs_feat),
         )
-        # Probe heads should not shape backbone dynamics.
+        # State probes (current-step location/heading) read detached state.
         h_probe = h.detach()
+        # Action heads use detached or live state based on constructor setting.
+        action_feat = h_probe if self.detach_action_heads else h
         loc_x = self.loc_x_head(h_probe)
         loc_y = self.loc_y_head(h_probe)
         heading = self.heading_head(h_probe)
-        z = self.obs_encoder(sensor)
-        # For chunked training, the first action in a chunk uses previous chunk state.
-        if prev_hidden is None:
-            prev_hidden = torch.zeros((h.shape[0], 1, h.shape[-1]), device=h.device, dtype=h.dtype)
-        elif prev_hidden.dim() == 2:
-            prev_hidden = prev_hidden.unsqueeze(1)
-        h_prev = torch.cat([prev_hidden, h[:, :-1, :]], dim=1)
-        # Action heads are probes: detach inputs so they do not shape backbone dynamics.
-        fused = torch.tanh(self.fuse(torch.cat([h_prev.detach(), z.detach()], dim=-1)))
-        turn = self.turn_head(fused)
-        step = self.step_head(fused)
-        need_aux = return_aux or return_losses or return_metrics
+        turn = self.turn_head(action_feat)
+        step = self.step_head(action_feat)
         aux_inputs = None
         if need_aux:
             aux_inputs = {}
-            if self.contrastive_target_head is not None:
-                aux_inputs["contrastive_tgt_emb"] = self._project_contrastive_target_h(h)
-                aux_inputs["contrastive_pred_emb_steps"] = self._project_contrastive_pred_steps(h, actions)
+            aux_inputs["contrastive_tgt_emb"] = self._project_contrastive_target_h(h)
+            aux_inputs["contrastive_pred_emb_steps"] = self._project_contrastive_pred_steps(h, actions)
 
         preds = (pred_sensor, loc_x, loc_y, heading, turn, step)
-        losses = None
-        metrics = None
-        if return_losses or return_metrics:
-            losses, metrics = self.compute_losses_and_metrics(
-                preds=preds,
-                targets=targets,
-                aux_inputs=aux_inputs,
-                return_metrics=return_metrics,
-            )
-            return {
-                "preds": preds,
-                "state": h[:, -1, :] if return_state else None,
-                "aux": aux_inputs if return_aux else None,
-                "losses": losses,
-                "metrics": metrics,
-            }
+        return preds, aux_inputs, h[:, -1, :]
 
-        if return_state:
-            if return_aux:
-                return pred_sensor, loc_x, loc_y, heading, turn, step, h[:, -1, :], aux_inputs
-            return pred_sensor, loc_x, loc_y, heading, turn, step, h[:, -1, :]
-        if return_aux:
-            return pred_sensor, loc_x, loc_y, heading, turn, step, aux_inputs
-        return pred_sensor, loc_x, loc_y, heading, turn, step
+    def forward(
+        self,
+        obs,
+        return_state=False,
+        episode_start=None,
+    ):
+        need_aux = episode_start is None
+        preds, aux_inputs, last_state = self._forward_core(
+            obs,
+            episode_start=episode_start,
+            need_aux=need_aux,
+        )
+        return {
+            "preds": preds,
+            "aux": aux_inputs if need_aux else None,
+            "state": last_state if return_state else None,
+        }
 
     def compute_all_losses(self, **kwargs) -> Dict[str, torch.Tensor]:
         return super().compute_all_losses(aux_total=None, **kwargs)
 
 
-class RNNPredictor(UnifiedPredictor):
+class RNNPredictor(TransformerBaseline):
     def __init__(
         self,
         config: LlamaConfig,
@@ -215,11 +244,10 @@ class RNNPredictor(UnifiedPredictor):
         obs_latent_dim: int,
         probe_hidden_dim: int = 256,
         probe_layers: int = 2,
-        transition: str = "gru",
-        residual_scale: float = 1.0,
         state_norm: str = "none",
         contrastive_dim: int = 0,
         contrastive_steps: int = 1,
+        detach_action_heads: bool = True,
     ):
         super().__init__(
             config,
@@ -237,12 +265,9 @@ class RNNPredictor(UnifiedPredictor):
             probe_layers=probe_layers,
             contrastive_dim=contrastive_dim,
             contrastive_steps=contrastive_steps,
+            detach_action_heads=detach_action_heads,
         )
-        self.transition = str(transition)
-        self.residual_scale = float(residual_scale)
         self.state_norm = str(state_norm)
-        if self.transition not in {"gru", "residual", "residual_mlp"}:
-            raise ValueError("transition must be one of {'gru', 'residual', 'residual_mlp'}")
         if self.state_norm not in {"none", "layernorm", "rmsnorm"}:
             raise ValueError("state_norm must be one of {'none', 'layernorm', 'rmsnorm'}")
         if self.state_norm == "layernorm":
@@ -257,114 +282,117 @@ class RNNPredictor(UnifiedPredictor):
             num_layers=config.num_hidden_layers,
             batch_first=True,
         )
-        self.residual_mlp_pre_norm: Optional[nn.Module] = None
-        self.residual_mlp_post_norm: Optional[nn.Module] = None
-        self.residual_mlp: Optional[nn.Module] = None
-        if self.transition == "residual_mlp":
-            # LLaMA-style FFN residual block on recurrent state with extra post norm:
-            # h <- RMSNorm(h), h <- h + MLP(h), h <- RMSNorm(h).
-            self.residual_mlp_pre_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            self.residual_mlp_post_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            self.residual_mlp = LlamaMLP(config)
+        self._state_h: Optional[torch.Tensor] = None
 
-    def forward(
+    def init_cache(self, num_envs: int, device: torch.device):
+        self._num_envs = int(num_envs)
+        self._state_h = torch.zeros(
+            (self.backbone.num_layers, self._num_envs, self.backbone.hidden_size),
+            device=device,
+            dtype=self.obs_fuse.weight.dtype,
+        )
+
+    def reset_cache(self, reset_mask: torch.Tensor):
+        if self._state_h is None:
+            return
+        reset_mask = reset_mask.to(torch.bool).view(-1)
+        if reset_mask.numel() != self._state_h.shape[1]:
+            raise ValueError("reset_mask size must match num_envs for cache reset")
+        self._state_h[:, reset_mask, :] = 0.0
+
+    def clear_cache(self):
+        self._num_envs = None
+        self._state_h = None
+
+    def _forward_core(
         self,
         obs,
-        attention_window=None,
-        past_key_values=None,
-        cache_position=None,
-        prev_hidden=None,
-        return_state=False,
-        return_aux=False,
-        return_losses=False,
-        return_metrics=False,
-        targets=None,
+        *,
+        episode_start=None,
+        need_aux: bool = False,
     ):
-        del attention_window, past_key_values, cache_position
-        sensor = obs["sensor"]
-        actions = obs["actions"]
+        sensor, actions, prev_actions, _key_padding_mask, _ = self._validate_obs_contract(
+            obs,
+            episode_start=episode_start,
+        )
+        using_internal_state = episode_start is not None
+        if using_internal_state:
+            episode_start_t = torch.as_tensor(episode_start, dtype=torch.bool, device=sensor.device).view(-1)
+            if episode_start_t.numel() != sensor.shape[0]:
+                raise ValueError(
+                    f"episode_start batch mismatch: expected {sensor.shape[0]}, got {episode_start_t.numel()}"
+                )
+            if self._state_h is None or self._state_h.shape[1] != episode_start_t.numel():
+                self.init_cache(num_envs=episode_start_t.numel(), device=sensor.device)
+            else:
+                self.reset_cache(episode_start_t)
+            h0 = self._state_h.to(device=sensor.device, dtype=sensor.dtype)
+        else:
+            h0 = None
 
-        x = torch.cat([sensor, actions], dim=-1)
+        x = torch.cat([sensor, prev_actions], dim=-1)
         if x.shape[-1] != self.input_size:
             raise ValueError(f"Expected input_size {self.input_size}, got {x.shape[-1]}")
 
-        if self.transition in {"residual", "residual_mlp"}:
-            # True recurrent residual update on top-layer state:
-            # g_t = GRU(x_t, h_{t-1}), h_t = h_{t-1} + a * g_t.
-            B, T, _ = x.shape
-            nl = int(self.backbone.num_layers)
-            hs = int(self.backbone.hidden_size)
-            h_layers = x.new_zeros((nl, B, hs))
-            h_steps: List[torch.Tensor] = []
-            for t in range(T):
-                g_seq, g_layers = self.backbone(x[:, t : t + 1, :], h_layers)
-                g_t = g_seq[:, 0, :]
-                h_prev_top = h_layers[-1]
-                h_top = h_prev_top + self.residual_scale * g_t
-                if self.transition == "residual_mlp":
-                    h_mlp_in = self.residual_mlp_pre_norm(h_top)
-                    mlp_delta = self.residual_mlp(h_mlp_in)
-                    h_top = h_top + mlp_delta
-                    h_top = self.residual_mlp_post_norm(h_top)
-                h_layers = g_layers
-                h_layers[-1] = h_top
-                h_steps.append(h_top)
-            h = torch.stack(h_steps, dim=1) if h_steps else x.new_zeros((B, 0, hs))
+        if self.attention_window is not None and self.attention_window > 0 and episode_start is None:
+            h, h_n = self.window_iterate(x, h0)
         else:
-            h, _ = self.backbone(x)
+            h, h_n = self.backbone(x, h0)
+        if using_internal_state:
+            self._state_h = h_n.detach()
         h = self.state_out_norm(h)
+        action_latent = self.action_encoder(actions)
+        obs_feat = torch.tanh(self.obs_fuse(torch.cat([h, action_latent], dim=-1)))
         if self.sensor_mode != "categorical":
             raise ValueError("RNNPredictor currently supports sensor_mode='categorical' only.")
         pred_sensor = (
-            self.sensor_head_l(h),
-            self.sensor_head_f(h),
-            self.sensor_head_r(h),
+            self.sensor_head_l(obs_feat),
+            self.sensor_head_f(obs_feat),
+            self.sensor_head_r(obs_feat),
         )
-        # Probe heads should not shape backbone dynamics.
+        # State probes (current-step location/heading) read detached state.
         h_probe = h.detach()
+        # Action heads use detached or live state based on constructor setting.
+        action_feat = h_probe if self.detach_action_heads else h
         loc_x = self.loc_x_head(h_probe)
         loc_y = self.loc_y_head(h_probe)
         heading = self.heading_head(h_probe)
-        z = self.obs_encoder(sensor)
-        if prev_hidden is None:
-            prev_hidden = torch.zeros((h.shape[0], 1, h.shape[-1]), device=h.device, dtype=h.dtype)
-        elif prev_hidden.dim() == 2:
-            prev_hidden = prev_hidden.unsqueeze(1)
-        h_prev = torch.cat([prev_hidden, h[:, :-1, :]], dim=1)
-        # Action heads are probes: detach inputs so they do not shape backbone dynamics.
-        fused = torch.tanh(self.fuse(torch.cat([h_prev.detach(), z.detach()], dim=-1)))
-        turn = self.turn_head(fused)
-        step = self.step_head(fused)
-        need_aux = return_aux or return_losses or return_metrics
+        turn = self.turn_head(action_feat)
+        step = self.step_head(action_feat)
         aux_inputs = None
         if need_aux:
             aux_inputs = {}
-            if self.contrastive_target_head is not None:
-                aux_inputs["contrastive_tgt_emb"] = self._project_contrastive_target_h(h)
-                aux_inputs["contrastive_pred_emb_steps"] = self._project_contrastive_pred_steps(h, actions)
+            aux_inputs["contrastive_tgt_emb"] = self._project_contrastive_target_h(h)
+            aux_inputs["contrastive_pred_emb_steps"] = self._project_contrastive_pred_steps(h, actions)
 
         preds = (pred_sensor, loc_x, loc_y, heading, turn, step)
-        losses = None
-        metrics = None
-        if return_losses or return_metrics:
-            losses, metrics = self.compute_losses_and_metrics(
-                preds=preds,
-                targets=targets,
-                aux_inputs=aux_inputs,
-                return_metrics=return_metrics,
-            )
-            return {
-                "preds": preds,
-                "state": h[:, -1, :] if return_state else None,
-                "aux": aux_inputs if return_aux else None,
-                "losses": losses,
-                "metrics": metrics,
-            }
+        return preds, aux_inputs, h[:, -1, :]
 
-        if return_state:
-            if return_aux:
-                return pred_sensor, loc_x, loc_y, heading, turn, step, h[:, -1, :], aux_inputs
-            return pred_sensor, loc_x, loc_y, heading, turn, step, h[:, -1, :]
-        if return_aux:
-            return pred_sensor, loc_x, loc_y, heading, turn, step, aux_inputs
-        return pred_sensor, loc_x, loc_y, heading, turn, step
+    def window_iterate(self, x, h0):
+        all_h_chunks = []
+        h_current = h0
+        window_size = self.attention_window
+        for i in range(0, x.size(1), window_size):
+            # Slice the current sequence window
+            x_chunk = x[:, i : i + window_size, :]
+            
+            # Forward pass: current hidden state flows in
+            # h_chunk: (batch, window_size, hidden_size)
+            # h_current: (num_layers, batch, hidden_size)
+            h_chunk, h_current = self.backbone(x_chunk, h_current)
+            
+            # Store output chunk for the final 'h' result
+            all_h_chunks.append(h_chunk)
+        
+            # --- CRITICAL STEP FOR BACKPROP RESTRICTION ---
+            # This detaches the hidden state from the graph.
+            # Gradients will NOT flow from the next window back into this one.
+            h_current = h_current.detach() 
+            # ----------------------------------------------
+        
+        # 3. Reconstruct the full 'h' and 'h_n'
+        # h will have shape (batch, 2048, hidden_size)
+        h = torch.cat(all_h_chunks, dim=1)
+        # h_n is simply the h_current from the last iteration
+        h_n = h_current
+        return h, h_n

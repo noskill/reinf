@@ -1,0 +1,27 @@
+
+baselines:
+h0 = f(h-1,a-1, o0)
+h0 -> a0
+h0, a0 -> predict o1
+h1 = f(h0, a0, o1)
+
+
+
+// world models
+h0=0, posterior z0 = qϕ(h0, o0)                                                                                                                
+s0 = [ h0, z0] -> a0   
+h1=Fϕ(z0, h0, a0), prior hat z1 = dϕ(h1)       
+posterior z1 = qϕ(h1, O1)
+s1 = [h1, z1] -> a0
+h2=Fϕ(z1, h1, a1)
+
+conceptually:
+z0 = q(h0, o0) -> h1 = F(h0, z0, a0)  -> predict a1 from o0, a0, o1
+s0 -> a0,                                                                                                                                                                                  
+s1 -> a1                                                                                                                                                                                   
+and for ac-cpc starting from h1:                                                                                                                                                           
+e10 = f(h1) - conditioned by a0 via h1                                                                                                                                                    
+e12 = f(h1, hat z1, a1)                                                                                                                                                                   
+e13 = f(h1, hat z1, a1, a2)                                                                                                                                                               
+with positives e10 <-> z1, e12 <-> z2, e13 <-> z3…   
+
