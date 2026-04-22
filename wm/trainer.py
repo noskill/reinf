@@ -70,12 +70,12 @@ def run_epoch_joint(
         aux_inputs = forward_out.get("aux")
         if preds is None or not isinstance(preds, tuple) or len(preds) != 6:
             raise ValueError("forward(...)[\"preds\"] must be a 6-tuple")
-        loss_dict = model.compute_prediction_losses(
+        loss_dict = model.compute_losses(
             preds=preds,
             targets=targets,
             aux_inputs=aux_inputs,
         )
-        metrics = model.compute_prediction_metrics(
+        metrics = model.compute_metrics(
             preds=preds,
             targets=targets,
             aux_inputs=aux_inputs,

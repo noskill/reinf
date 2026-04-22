@@ -223,7 +223,7 @@ class PredictionLossMixin:
         }
 
     @staticmethod
-    def _compute_contrastive_stats(
+    def compute_contrastive_loss(
         aux_inputs: Optional[Dict[str, torch.Tensor]],
         key_padding_mask: torch.Tensor,
         temperature: float,
@@ -268,19 +268,19 @@ class PredictionLossMixin:
         targets: Dict[str, torch.Tensor],
         aux_inputs: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-        losses = self.compute_prediction_losses(
+        losses = self.compute_losses(
             preds=preds,
             targets=targets,
             aux_inputs=aux_inputs,
         )
-        metrics = self.compute_prediction_metrics(
+        metrics = self.compute_metrics(
             preds=preds,
             targets=targets,
             aux_inputs=aux_inputs,
         )
         return losses, metrics
 
-    def compute_prediction_losses(
+    def compute_losses(
         self,
         *,
         preds: Tuple,
@@ -289,7 +289,7 @@ class PredictionLossMixin:
     ) -> Dict[str, torch.Tensor]:
         cfg = self.config
         pred_sensor, pred_loc_x, pred_loc_y, pred_head, pred_turn, pred_step = preds
-        losses = self.compute_all_losses(
+        losses = self.compute_prediction_losses(
             pred_sensor=pred_sensor,
             pred_loc_x=pred_loc_x,
             pred_loc_y=pred_loc_y,
@@ -305,17 +305,17 @@ class PredictionLossMixin:
             key_padding_mask=targets["key_padding_mask"],
             aux_inputs=aux_inputs,
         )
-        contrastive_stats = self._compute_contrastive_stats(
+        contrastive_results = self.compute_contrastive_loss(
             aux_inputs=aux_inputs,
             key_padding_mask=targets["key_padding_mask"],
             temperature=cfg.contrastive_temp,
             horizon_discount=cfg.contrastive_horizon_discount,
             max_negatives=cfg.contrastive_negatives,
         )
-        losses["contrastive"] = contrastive_stats["loss"]
+        losses["contrastive"] = contrastive_results["loss"]
         return losses
 
-    def compute_prediction_metrics(
+    def compute_metrics(
         self,
         *,
         preds: Tuple,
@@ -324,7 +324,7 @@ class PredictionLossMixin:
     ) -> Dict[str, torch.Tensor]:
         cfg = self.config
         pred_sensor, pred_loc_x, pred_loc_y, _pred_head, pred_turn, pred_step = preds
-        metrics = self.compute_metrics(
+        metrics = self.compute_predictions_metrics(
             pred_sensor=pred_sensor,
             pred_loc_x=pred_loc_x,
             pred_loc_y=pred_loc_y,
@@ -340,7 +340,7 @@ class PredictionLossMixin:
             loc_min=cfg.loc_min,
             aux_inputs=aux_inputs,
         )
-        contrastive_stats = self._compute_contrastive_stats(
+        contrastive_stats = self.compute_contrastive_loss(
             aux_inputs=aux_inputs,
             key_padding_mask=targets["key_padding_mask"],
             temperature=cfg.contrastive_temp,
@@ -350,7 +350,7 @@ class PredictionLossMixin:
         metrics["contrastive_acc"] = contrastive_stats["acc"]
         return metrics
 
-    def compute_metrics(
+    def compute_predictions_metrics(
         self,
         *,
         pred_sensor,
@@ -415,7 +415,7 @@ class PredictionLossMixin:
             "step_acc": step_acc,
         }
 
-    def compute_all_losses(
+    def compute_prediction_losses(
         self,
         *,
         pred_sensor,
@@ -714,7 +714,7 @@ class DiscreteLatentPredictorBase(PredictionLossMixin, nn.Module):
             "head": loss_head,
         }
 
-    def compute_metrics(
+    def compute_predictions_metrics(
         self,
         *,
         pred_sensor,
@@ -800,7 +800,7 @@ class DiscreteLatentPredictorBase(PredictionLossMixin, nn.Module):
             "step_acc": step_acc,
         }
 
-    def compute_all_losses(
+    def compute_prediction_losses(
         self,
         *,
         pred_sensor,
@@ -892,7 +892,7 @@ class DiscreteLatentPredictorBase(PredictionLossMixin, nn.Module):
                 )
                 aux_losses["h_only_sensor"] = h_only_sensor
                 aux_total = aux_total + self.h_only_weight * h_only_sensor
-        base_losses = super().compute_all_losses(
+        base_losses = super().compute_prediction_losses(
             pred_sensor=pred_sensor,
             pred_loc_x=pred_loc_x,
             pred_loc_y=pred_loc_y,

@@ -218,11 +218,7 @@ def main():
         backprop_through_wm=args.policy_backprop_through_wm,
     )
 
-    wm_optimizer = torch.optim.AdamW(
-        [p for p in wm_model.parameters() if p.requires_grad],
-        lr=args.wm_lr,
-        weight_decay=args.wm_weight_decay,
-    )
+
     agent = JointWMReinforce(
         policy=policy_module,
         sampler=DiscreteActionSampler(),
@@ -231,7 +227,6 @@ def main():
         discount=args.discount,
         logger=logger,
         wm_model=wm_model,
-        wm_optimizer=wm_optimizer,
         action_table=base_env.action_table,
         device=torch.device(args.device),
         entropy_coef=args.entropy_coef,
@@ -242,6 +237,8 @@ def main():
         wm_train_episodes=args.wm_train_episodes,
         sensor_max_bin=args.wm_sensor_max_bin,
         maze_dim=maze_dim,
+        wm_weight_decay=args.wm_weight_decay,
+        wm_lr=args.wm_lr
     )
 
     trainer = OnPolicyTrainer(

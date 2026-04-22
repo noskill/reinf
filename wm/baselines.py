@@ -223,9 +223,6 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
             "state": last_state if return_state else None,
         }
 
-    def compute_all_losses(self, **kwargs) -> Dict[str, torch.Tensor]:
-        return super().compute_all_losses(aux_total=None, **kwargs)
-
 
 class RNNPredictor(TransformerBaseline):
     def __init__(

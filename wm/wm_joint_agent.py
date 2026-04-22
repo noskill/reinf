@@ -222,7 +222,6 @@ class JointWMReinforce(Reinforce):
         discount: float,
         logger,
         wm_model: TransformerBaseline,
-        wm_optimizer: torch.optim.Optimizer,
         action_table: Sequence[Tuple[int, int]],
         device: torch.device,
         entropy_coef: float = 0.01,
@@ -233,7 +232,10 @@ class JointWMReinforce(Reinforce):
         wm_train_episodes: int = 64,
         sensor_max_bin: int = 64,
         maze_dim: int = 10,
+        **kwargs
     ):
+        self.wm_model = wm_model
+        self.wm_model_copy = copy.deepcopy(wm_model)
         super().__init__(
             policy=policy,
             sampler=sampler,
@@ -243,10 +245,8 @@ class JointWMReinforce(Reinforce):
             device=device,
             logger=logger,
             entropy_coef=entropy_coef,
+            **kwargs
         )
-        self.wm_model = wm_model
-        self.wm_model_copy = copy.deepcopy(wm_model)
-        self.wm_optimizer = wm_optimizer
         self.optimizer_policy = self.wm_optimizer
         self.action_table = [(int(turn), int(step)) for turn, step in action_table]
         self.device = torch.device(device)
@@ -276,6 +276,19 @@ class JointWMReinforce(Reinforce):
         if self.wm_replay_capacity <= 0:
             raise ValueError("wm_replay_capacity must be > 0")
         self._wm_pool = _WMEpisodePool(num_envs=self.num_envs, pool_size=self.wm_replay_capacity)
+
+    def create_optimizers(self, **kwargs):
+        self.wm_optimizer = torch.optim.AdamW(
+            [p for p in self.wm_model.parameters() if p.requires_grad],
+            lr=kwargs.get('wm_lr', 0.001),
+            weight_decay=kwargs.get('wm_weight_decay', 0.0001),
+        )
+        self.wm_optimizer_copy = torch.optim.AdamW(
+            [p for p in self.wm_model_copy.parameters() if p.requires_grad],
+            lr=kwargs.get('wm_lr', 0.001),
+            weight_decay=kwargs.get('wm_weight_decay', 0.0001),
+        ) 
+        
 
     def episode_start(self):
         super().episode_start()
@@ -329,35 +342,42 @@ class JointWMReinforce(Reinforce):
         reward_total_mean_sum = 0.0
 
         self.wm_model.train()
-        lp_rewards = self.lp_reward(obs_new, obs_mix)
-
+        lp_rewards = self.lp_reward(obs_new, obs_mix, targets_new, targets_mix)
+        # import pdb;pdb.set_trace()
         for _ in range(updates):
             # Policy update on new-policy dataset with LP reward.
-            self.wm_optimizer.zero_grad(set_to_none=True)
-            policy_forward = self.wm_model(obs_new)
-            policy_preds = policy_forward["preds"]
+            self.wm_optimizer.zero_grad()
+            wm_forward = self.wm_model(obs_mix)
+            policy_preds = wm_forward["preds"]
+            aux = wm_forward['aux']
             policy_loss, policy_stats = self._compute_policy_loss_from_joint_batch(
                 preds=policy_preds,
                 meta=policy_meta,
-                intrinsic_steps=intrinsic_steps,
+                intrinsic_rew_steps=lp_rewards,
                 n_policy_episodes=n_policy_episodes,
             )
-            policy_loss.backward()
+            wm_loss_results, wm_loss_metrics = self.wm_model.compute_losses_and_metrics(preds=policy_preds, 
+                                                         targets=targets_mix,
+                                                         aux_inputs=aux)
+            wm_loss = self._compute_wm_total_loss(wm_loss_results)
+
+    
+            total_loss = wm_loss + policy_loss
+            total_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.wm_model.parameters(), 1.0)
             self.wm_optimizer.step()
-
-            total_loss = wm_loss + policy_loss
             total_loss_sum += self._as_scalar(total_loss)
             wm_loss_sum += self._as_scalar(wm_loss)
             policy_loss_sum += self._as_scalar(policy_loss)
+            
             entropy_mean_sum += float(policy_stats["entropy_mean"])
             policy_valid_steps_sum += float(policy_stats["valid_steps"])
             reward_env_mean_sum += float(policy_stats["reward_env_mean"])
             reward_intr_mean_sum += float(policy_stats["reward_intrinsic_mean"])
             reward_total_mean_sum += float(policy_stats["reward_total_mean"])
-            for key, value in losses.items():
+            for key, value in wm_loss_results.items():
                 wm_loss_sums[key] = wm_loss_sums.get(key, 0.0) + self._as_scalar(value)
-            for key, value in metrics.items():
+            for key, value in wm_loss_metrics.items():
                 wm_metric_sums[key] = wm_metric_sums.get(key, 0.0) + self._as_scalar(value)
 
         self._remember_wm_episodes(policy_wm_episodes, prebuilt=True)
@@ -388,7 +408,7 @@ class JointWMReinforce(Reinforce):
 
         return True
 
-    def lp_reward(self, obs_new, obs_mix):
+    def lp_reward(self, obs_new, obs_mix, targets_new, targets_mix):
         with torch.no_grad():
             # sync weights
             for param, target_param in zip(self.wm_model.parameters(), self.wm_model_copy.parameters()):
@@ -403,12 +423,12 @@ class JointWMReinforce(Reinforce):
         )
         preds = forward_out["preds"]
         aux_inputs = forward_out["aux"]
-        losses = self.wm_model_copy.compute_prediction_losses(
+        losses = self.wm_model_copy.compute_losses(
             preds=preds,
             targets=targets_mix,
             aux_inputs=aux_inputs,
         )
-        metrics = self.wm_model_copy.compute_prediction_metrics(
+        metrics = self.wm_model_copy.compute_metrics(
             preds=preds,
             targets=targets_mix,
             aux_inputs=aux_inputs,
@@ -418,7 +438,7 @@ class JointWMReinforce(Reinforce):
         torch.nn.utils.clip_grad_norm_(self.wm_model_copy.parameters(), 1.0)
         self.wm_optimizer_copy.step()
 
-        cpc_error_after = self._evaluate_step_cpc_error_no_grad(self.wm_optimizer_copy, obs_new, targets_new)
+        cpc_error_after = self._evaluate_step_cpc_error_no_grad(self.wm_model_copy, obs_new, targets_new)
         intrinsic_steps = cpc_error_before - cpc_error_after
         return intrinsic_steps
 
@@ -446,6 +466,7 @@ class JointWMReinforce(Reinforce):
 
     def _compute_step_cpc_error_from_aux(
         self,
+        wm_model,
         *,
         aux_inputs: Optional[Dict[str, torch.Tensor]],
         key_padding_mask: torch.Tensor,
@@ -454,15 +475,15 @@ class JointWMReinforce(Reinforce):
         out = torch.zeros((B, T), dtype=torch.float32, device=key_padding_mask.device)
         if aux_inputs is None:
             return out
-        contrastive_stats = self.wm_model._compute_contrastive_stats(
+        contrastive_results = wm_model.compute_contrastive_loss(
             aux_inputs=aux_inputs,
             key_padding_mask=key_padding_mask,
-            temperature=self.wm_model.config.contrastive_temp,
-            horizon_discount=self.wm_model.config.contrastive_horizon_discount,
-            max_negatives=self.wm_model.config.contrastive_negatives,
+            temperature=wm_model.config.contrastive_temp,
+            horizon_discount=wm_model.config.contrastive_horizon_discount,
+            max_negatives=wm_model.config.contrastive_negatives,
         )
-        per_step_loss = contrastive_stats.get("per_step_loss")
-        per_step_valid = contrastive_stats.get("per_step_valid")
+        per_step_loss = contrastive_results.get("per_step_loss")
+        per_step_valid = contrastive_results.get("per_step_valid")
         if per_step_loss is None or per_step_valid is None:
             return out
         valid = per_step_valid
@@ -476,6 +497,7 @@ class JointWMReinforce(Reinforce):
             forward_out = wm_model(obs)
             aux_inputs = forward_out["aux"]
             cpc_error = self._compute_step_cpc_error_from_aux(
+                wm_model,
                 aux_inputs=aux_inputs,
                 key_padding_mask=targets["key_padding_mask"],
             ).to(torch.float32)
@@ -501,7 +523,7 @@ class JointWMReinforce(Reinforce):
         *,
         preds: Tuple,
         meta: Dict[str, torch.Tensor],
-        intrinsic_steps: torch.Tensor,
+        intrinsic_rew_steps: torch.Tensor,
         n_policy_episodes: int,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         action_logits = self._build_action_logits_from_preds(preds)
@@ -512,7 +534,7 @@ class JointWMReinforce(Reinforce):
         assert policy_valid.any()
 
         env_rewards = meta["policy_env_reward"][:n_policy_episodes]
-        intrinsic_rewards = self.intrinsic_reward_scale * intrinsic_steps[:n_policy_episodes]
+        intrinsic_rewards = self.intrinsic_reward_scale * intrinsic_rew_steps[:n_policy_episodes]
         total_rewards = env_rewards + intrinsic_rewards
         discounted_returns = self._discount_rewards_with_mask(total_rewards, policy_valid)
         returns_flat = discounted_returns[policy_valid]
