@@ -1,14 +1,12 @@
 import numpy as np
-import torch
 import torch.nn as nn
 import gymnasium as gym
-
+from gymnasium.spaces.box import Box
 from reinforce import Reinforce
 from vpg import VPG
 from ppo import PPO
 from sample import DiscreteActionSampler, NormalActionSampler
 
-from agent import Agent
 from networks import PolicyNetwork, ValueNetwork as Value
 from transformer import LlamaConfig
 
@@ -133,12 +131,12 @@ def create_networks(
 
 
 def create_sampler(action_space):
-    shape = action_space.shape
-    if len(shape) != 1:
-        raise RuntimeError("unexpected action space size " + str(shape))
     if isinstance(action_space, gym.spaces.Discrete):
         return DiscreteActionSampler()
     elif isinstance(action_space, gym.spaces.Box):
+        shape = action_space.shape
+        if len(shape) != 1:
+            raise RuntimeError("unexpected action space size " + str(shape))
         return NormalActionSampler(shape[0], a_min=-20, a_max=20, transform=False)
     else:
         raise ValueError(f"Unsupported action space type: {type(action_space)}")
@@ -166,20 +164,27 @@ def create_agent(args_cli, env_cfg, env, logger):
     diayn_hidden_dims = (1024, 1024, 512, 512)
     base_activation = nn.ReLU
     diayn_activation = nn.SiLU
-    base_layer_norm = False
-    diayn_layer_norm = True
-    base_dropout = 0.0
-    diayn_dropout = 0.1
 
     def build_networks(use_skill: bool = False, skill_dim: int = None, discrete_skills: bool = True):
-        return create_networks_with_transformer(
-            obs_space=policy_obs_space,
-            action_dim=action_dim,
-            device=device,
-            hidden_dim=diayn_hidden_dims[0] if uses_diayn else base_hidden_dims[0],
-            skill_dim=skill_dim if use_skill else None,
-            discrete_skills=discrete_skills,
-        )
+        if isinstance(obs_space, Box):
+            return create_networks(
+                obs_dim,
+                action_dim=action_dim,
+                device=device,
+                hidden_dim=256,
+                value_hidden_dims=256,
+                activation=base_activation,
+                value_activation=base_activation
+                )
+        else:
+            return create_networks_with_transformer(
+                obs_space=policy_obs_space,
+                action_dim=action_dim,
+                device=device,
+                hidden_dim=diayn_hidden_dims[0] if uses_diayn else base_hidden_dims[0],
+                skill_dim=skill_dim if use_skill else None,
+                discrete_skills=discrete_skills,
+            )
 
     # Create sampler
     sampler = create_sampler(action_space)

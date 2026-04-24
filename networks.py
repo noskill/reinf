@@ -72,7 +72,7 @@ class PolicyNetwork(nn.Module):
         self.output_layer = nn.Linear(prev_dim, n_action)
         self.first_layer = blocks[0].linear if blocks else self.output_layer
 
-    def forward(self, x):
+    def forward(self, x, **kwargs):
         x = x.to(self.output_layer.weight)
         residual = x
         for block in self.backbone:
@@ -109,7 +109,7 @@ class ValueNetwork(nn.Module):
         self.output_layer = nn.Linear(prev_dim, 1)
         self.first_layer = blocks[0].linear if blocks else self.output_layer
 
-    def forward(self, x):
+    def forward(self, x, **kwargs):
         x = x.to(self.output_layer.weight)
         residual = x
         for block in self.backbone:

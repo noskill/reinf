@@ -1,3 +1,6 @@
+import logging
+
+
 try:
     from torch.utils.tensorboard import SummaryWriter
 except ImportError as e:
@@ -35,6 +38,7 @@ class Logger:
     def __init__(self, log_dir="logs"):
         self.writer = SummaryWriter(log_dir)
         self.episode_count = 0
+        self._log = logging.getLogger()
 
     def log_scalar(self, name, value, step=None):
         if step is None:
@@ -46,5 +50,10 @@ class Logger:
 
     def increment_episode(self):
         self.episode_count += 1
+        
+    def warning(self, msg, *args, **kwargs):
+        return self._log.warning(msg, *args, **kwargs)
 
+    def warn(self, *args, **kwargs):
+        return self.warning(*args, **kwargs)
 

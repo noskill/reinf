@@ -10,8 +10,7 @@ from sample import *
 np = numpy
 
 from agent_reinf import Agent
-from pool import *
-from util import RunningNorm
+from pool import EpisodesOldPoolMixin, EpisodesPoolMixin
 
 
 class ReinforceBase(Agent):
@@ -25,7 +24,7 @@ class ReinforceBase(Agent):
         discount=0.99,
         device=torch.device("cpu"),
         logger=None,
-        entropy_coef=0.01,
+        entropy_coef=0.001,
         **kwargs
     ):
         self.num_envs = num_envs
@@ -37,7 +36,7 @@ class ReinforceBase(Agent):
         self.mean_std = 0
         self.device = device
         self.version = 0
-        self.create_optimizers()
+        self.create_optimizers(**kwargs)
         self.entropy_coef = entropy_coef
         self.entropy_thresh = 0.2
         super().__init__(logger=logger, **kwargs)
@@ -50,7 +49,7 @@ class ReinforceBase(Agent):
         self.state_normalizer = None
         self.data_types = ['states', 'actions', 'log_probs', 'entropy', 'rewards']
 
-    def create_optimizers(self):
+    def create_optimizers(self, **kwargs):
         self.optimizer_policy = optim.Adam(self.policy.parameters(), lr=self.policy_lr)
 
     def get_policy_for_action(self):
@@ -199,7 +198,6 @@ class ReinforceBase(Agent):
             return
         episode_batch = episode_batch.to(self.device)
         episode_batch.compute_returns(self.discount)
-
         # Heuristic: treat policies with a temporal decoder attribute as sequence models
         is_sequence_model = hasattr(self.policy, 'temporal_decoder')
 
@@ -230,7 +228,7 @@ class ReinforceBase(Agent):
         if entropy.shape != normalized_returns.shape:
             entropy = entropy.reshape(normalized_returns.shape)
 
-        self.train_policy(log_probs, normalized_returns, entropy, states_batch, actions_batch)
+        self.train_policy(log_probs, normalized_returns, entropy, states_batch, actions_batch=actions_batch)
 
     def _extract_episode_data2(self, episodes):
         """
@@ -382,15 +380,28 @@ class ReinforceBase(Agent):
             actions_batch.to(torch.float32).std()
         )
 
-    def train_policy(self, log_probs, returns, entropy=torch.zeros(1), states_batch=None, actions=None):
+    def train_policy(self, log_probs, returns, entropy=torch.zeros(1), states_batch=None, **kwargs):
+        self.optimizer_policy.zero_grad()
+        policy_loss = self.compute_loss(log_probs, returns=returns, entropy=entropy, states_batch=states_batch, **kwargs)
+        policy_loss.backward()
+
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1)
+        grads = []
+        # Log gradients
+        for name, param in self.policy.named_parameters():
+            if param.grad is not None:
+                grads.append(param.grad.norm().item())
+        self.logger.log_scalar(f"policy grad std :", np.std(grads))
+        self.optimizer_policy.step()
+
+    def compute_loss(self, log_probs, returns, entropy=torch.zeros(1), states_batch=None, **kwargs):
         assert log_probs.shape == returns.shape, "Expected same shape for log_probs and returns!"
         assert log_probs.shape == entropy.shape, "Expected same shape for log_probs and entropy!"
-        self.optimizer_policy.zero_grad()
-
-        # Entropy loss
+        # Entropy loss to increase entropy
         e_loss = -( entropy).to(log_probs).mean()
 
-        # mu loss for normal distribution (continuous action space)
+        # mu loss for normal distribution (continuous action space) - keep values not too extreme
         mu_loss = torch.tensor(0.0, device=self.device)
         if states_batch is not None and isinstance(self.sampler, NormalActionSampler):
             out = self.policy(states_batch, episode_start=None)
@@ -402,23 +413,15 @@ class ReinforceBase(Agent):
         mu_coef = 0.001
         log_clamped = log_probs.clamp(-10, 10)
         policy_loss = -(log_clamped * returns).mean() + self.entropy_coef * e_loss + mu_loss * mu_coef
-        if policy_loss.abs() > 100:
-            self.logger.log_scalar("policy loss overflow", policy_loss.item())
-            return
-        policy_loss.backward()
-
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 0.4)
-        grads = []
-        # Log gradients
-        for name, param in self.policy.named_parameters():
-            if param.grad is not None:
-                grads.append(param.grad.norm().item())
-        self.logger.log_scalar(f"policy grad std :", np.std(grads))
+        self.logger.log_scalar("policy loss:", policy_loss.item())
         self.logger.log_scalar(f"entropy mean :", entropy.mean())
         self.logger.log_scalar(f"entropy loss :", e_loss)
-        self.optimizer_policy.step()
-        self.logger.log_scalar("policy loss:", policy_loss.item())
+        if not torch.isfinite(policy_loss):
+            raise ValueError(f"Non-finite loss: {policy_loss.item()}")
+        if policy_loss.abs() > 100:
+            self.logger.log_scalar("policy loss overflow", policy_loss.item())
+            self.logger.warn("policy loss overflow " + str(policy_loss.item()))
+        return policy_loss
 
     def get_state_dict(self):
         return {
