@@ -418,3 +418,101 @@ Plan (intrinsic-only, staged):
 4. Keep probe losses as diagnostics only (they do not shape backbone); backbone shaping comes from sensor objective + AC-CPC.
 5. Phase B (latent on): switch to `rssm-discrete`/`tssm` and compare emergent behavior against Phase A under the same intrinsic-reward setup.
 6. Track: coverage, loop/cycle tendency, episode length, `cpc_acc`, and transfer to goal-reaching when extrinsic reward is re-enabled later.
+
+## Update (2026-04-08, Baseline Cache API Unification)
+
+Completed:
+- Removed hardcoded maze WM model construction path and wired `create_maze_world_model` through shared `create_model(...)` args.
+- Added shared parser helpers for model creation args so `wm_train.py` and `wm_maze_train.py` use consistent model configuration plumbing.
+- Added internal cache/state handling to baseline predictors:
+  - `UnifiedPredictor`: transformer KV cache lifecycle (`init_cache/reset_cache/clear_cache`) + `episode_start` step path.
+  - `RNNPredictor`: same API surface, backed by recurrent hidden-state + previous-action state.
+
+Next direction:
+1. Switch policy rollout wrappers to call predictor `forward(..., episode_start=...)` directly (remove duplicate rollout-state bookkeeping where possible).
+2. Keep sequence training path unchanged; use cache/state path only for online episode collection.
+3. Then move to WM/baseline cache semantics cleanup (single consistent online API), before enabling latent-state (`z`) variants.
+
+## Update (2026-04-09, Refactor Plan Execution)
+
+Completed:
+- Predictor contract is now explicit and validated in one shared helper (`UnifiedPredictor._validate_obs_contract`):
+  - train: `sensor`, `actions`, optional `key_padding_mask`
+  - rollout: `sensor`, `actions`, `prev_actions`, `episode_start`
+- `WMActionHeadPolicy` now uses `wm_model.forward(..., episode_start=...)` directly and no longer keeps duplicate hidden/KV state.
+- AC-CPC intrinsic reward computation moved to `wm_intrinsic.py` (`compute_step_accpc_reward`), keeping env reward passthrough unchanged.
+- Removed transitional alias `JointWMAgent`.
+- Shared maze model arg defaults moved to `agent_utils_wm.py` (`MAZE_WM_MODEL_DEFAULTS`) and reused by `wm_maze_train.py`.
+- Added focused regression tests in `wm_refactor_tests.py`:
+  - predictor cache/reset behavior
+  - rollout contract validation
+  - MazeVecEnv + OnPolicyTrainer + JointWM startup smoke run
+
+Next:
+1. Keep baseline-only joint runs as primary path (`rnn`/`transformer`) with intrinsic reward only.
+2. After baseline behavior is stable, extend world-model joint path to latent models (`rssm`/`tssm`) under the same rollout contract.
+
+## Thu Apr 16 AM UTC 2026
+
+I can make baselines more like world models with discrete states by projecting ht -> zt
+
+## Update (2026-04-19, Shared Extraction + Contrastive/Policy Gradient Cleanup)
+
+Completed:
+- Shared observation extraction/validation now lives in base mixin:
+  - added shared `_validate_obs_contract` + `_shift_prev_actions`
+  - `rssm`/`tssm` now consume the same path via `_encode_obs(...)` as baselines
+- Rollout contract now supports `actions=None` when `prev_actions` is provided; policy rollout caller updated to pass `actions=None` in rollout mode.
+- Contrastive target detach is now centralized:
+  - baseline target projector detaches internally
+  - world-model (`z`) target projector detaches internally
+- Simplified contrastive aux wiring:
+  - removed per-forward `if contrastive_head is not None` guards
+  - always populate contrastive aux keys; projector helpers return `None`/`[]` when disabled.
+- Moved `detach_action_heads` from forward-time arg to model construction setting (default `True`):
+  - removed per-call `detach_action_heads=...` overrides
+  - forward paths now read `self.detach_action_heads`.
+- Joint WM+policy path now explicitly enables action-head gradient flow by setting `model.detach_action_heads = False` in `create_maze_world_model(...)`.
+
+## Update (2026-04-19, Learning-Progress Reward Plan - Lightweight Variant)
+
+Goal:
+- Use learning-progress (LP) intrinsic reward without expensive twin-model cross-fit.
+
+Rationale:
+- Full cross-fit (`m1/m2`, `D1/D2`) is cleaner but too expensive for fast online iteration.
+- Cheaper approximation: measure CPC error reduction on current policy data, and reduce overfit by mixing replay in training.
+
+Plan:
+1. Build datasets per update:
+   - `D_new`: newly accumulated policy episodes.
+   - `D_mix`: `D_new` + sampled replay episodes.
+2. Pre-eval on `D_new` (no grad):
+   - compute per-step AC-CPC error `e_before` (e.g. `-log p_pos`).
+3. Train world model on `D_mix` (normal WM objective, including CPC).
+4. Post-eval on `D_new` (no grad):
+   - compute per-step AC-CPC error `e_after`.
+5. LP reward on `D_new` steps:
+   - `r_lp = e_before - e_after`.
+6. Policy reward:
+   - `r_total = env_reward_scale * r_env + lp_reward_scale * r_lp`.
+7. Stabilization:
+   - clip LP reward, apply running normalization, and keep meaningful replay fraction in `D_mix`.
+
+Notes:
+- LP reward is computed only for `D_new` policy steps (not replay steps).
+- This is biased versus held-out cross-fit, but much cheaper and appropriate for first experiments.
+
+## Update (2026-04-19, Joint Trainer Simplification + Run Script)
+
+- Added new launcher script with intrinsic-only defaults for maze joint training:
+  - `wm_train_maze_joint_default.sh`
+  - default uses baseline RNN + AC-CPC, `env_reward_scale=0.0`, replay-enabled WM updates.
+
+## update Thu Apr 23 09:27:15 AM UTC 2026
+
+now using cpc error before training as surprise reward
+total reward is error before + lp = error before + (error before - error after)
+
+now using sliding window instead of full batches for cpc loss
+added computation of maze coverage to rl maze env

@@ -116,12 +116,6 @@ def main():
         help="Exponential horizon weighting for CPC (horizon h uses weight discount**h).",
     )
     parser.add_argument(
-        "--contrastive-negatives",
-        type=int,
-        default=0,
-        help="Number of sampled negatives per anchor for CPC (0 uses all valid negatives).",
-    )
-    parser.add_argument(
         "--train-recon-heads-only",
         action="store_true",
         help="Freeze backbone/dynamics and train only sensor reconstruction heads from [z,h], z-only, and h-only.",
@@ -177,8 +171,6 @@ def main():
         raise ValueError("--contrastive-dim must be > 0 when --contrastive-weight > 0")
     if args.contrastive_steps < 1:
         raise ValueError("--contrastive-steps must be >= 1")
-    if args.contrastive_negatives < 0:
-        raise ValueError("--contrastive-negatives must be >= 0")
     try:
         sys.stdout.reconfigure(line_buffering=True)
     except Exception:
@@ -235,7 +227,7 @@ def main():
         f"rssm_state_norm={args.rssm_state_norm} "
         f"contrastive_w={args.contrastive_weight} contrastive_dim={args.contrastive_dim} "
         f"contrastive_temp={args.contrastive_temp} contrastive_steps={args.contrastive_steps} "
-        f"contrastive_discount={args.contrastive_horizon_discount} contrastive_negs={args.contrastive_negatives} "
+        f"contrastive_discount={args.contrastive_horizon_discount} "
         f"attn_dropout={args.attention_dropout} weight_decay={args.weight_decay} "
         f"prior_roll_w={args.prior_rollout_weight} z_only_w={args.z_only_weight} "
         f"h_only_w={args.h_only_weight} "
@@ -338,7 +330,6 @@ def main():
         contrastive_weight=args.contrastive_weight,
         contrastive_temp=args.contrastive_temp,
         contrastive_horizon_discount=args.contrastive_horizon_discount,
-        contrastive_negatives=args.contrastive_negatives,
         loc_min=loc_min,
     )
     for epoch in range(1, args.epochs + 1):
@@ -398,7 +389,6 @@ def main():
                 "contrastive_temp": args.contrastive_temp,
                 "contrastive_steps": args.contrastive_steps,
                 "contrastive_horizon_discount": args.contrastive_horizon_discount,
-                "contrastive_negatives": args.contrastive_negatives,
                 "pos_sigma": args.pos_sigma,
                 "heading_smoothing": args.heading_smoothing,
             },

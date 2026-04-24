@@ -207,7 +207,6 @@ def batch_row_k_step_contrastive_pair_stats(
     key_padding_mask: torch.Tensor,
     temperature: float,
     horizon_discount: float = 1.0,
-    max_negatives: int = 0,
 ) -> Dict[str, torch.Tensor]:
     """Return multi-horizon row-wise InfoNCE stats (scalar and per-step)."""
     B, T = key_padding_mask.shape
@@ -236,8 +235,6 @@ def batch_row_k_step_contrastive_pair_stats(
         raise ValueError("contrastive temperature must be > 0")
     if horizon_discount <= 0:
         raise ValueError("horizon_discount must be > 0")
-    if max_negatives < 0:
-        raise ValueError("max_negatives must be >= 0")
     if not pred_steps:
         return _zero_stats(num_horizons=0)
 
@@ -250,48 +247,88 @@ def batch_row_k_step_contrastive_pair_stats(
     per_step_acc_weighted = torch.zeros((B, T), device=target_emb.device, dtype=target_emb.dtype)
     per_step_weight = torch.zeros((B, T), device=target_emb.device, dtype=target_emb.dtype)
     norm_denom = sum(float(horizon_discount) ** t for t in range(K))
+    
     for t, pred_h in enumerate(pred_steps):
-        h = t + 1
+        assert pred_h.shape[1] == T - 1 - t
+        offset = t + 1
         if pred_h is None or pred_h.ndim != 3:
             continue
         if pred_h.shape[0] != B:
-            raise ValueError(f"pred_steps[{h-1}] batch mismatch: {pred_h.shape[0]} vs {B}")
-        Th = int(pred_h.shape[1])
-        if Th <= 0 or h >= T:
-            continue
-        max_th = T - h
-        if Th > max_th:
-            pred_h = pred_h[:, :max_th, :]
-            Th = max_th
-        key_h = target_emb[:, h : h + Th, :]
+            raise ValueError(f"pred_steps[{offset-1}] batch mismatch: {pred_h.shape[0]} vs {B}")
+        L_pred_h = pred_h.shape[1]
+        key_h = target_emb[:, offset:, :]
         if key_h.shape[-1] != pred_h.shape[-1]:
             raise ValueError(
-                f"pred/target dim mismatch at horizon {h}: {pred_h.shape[-1]} vs {key_h.shape[-1]}"
+                f"pred/target dim mismatch at horizon {offset}: {pred_h.shape[-1]} vs {key_h.shape[-1]}"
             )
-        valid = (~key_padding_mask[:, :Th]) & (~key_padding_mask[:, h : h + Th])
-        stats_h = _batch_row_infonce(
-            pred_h,
-            key_h,
-            valid,
-            temperature,
-            max_negatives=max_negatives,
-        )
-        weight_h = pred_h.new_tensor((float(horizon_discount) ** t) / norm_denom)
+        
+        # valid[t] = not pad[t] and not pad[t + offset]
+        valid = (~key_padding_mask[:, :L_pred_h]) & (~key_padding_mask[:, offset:])
+        window_size = 128
+        if L_pred_h <= window_size:
+            stats_h = _batch_row_infonce(
+                pred_h,
+                key_h,
+                valid,
+                temperature,
+            )
+        else:
+            row_loss_h = torch.zeros((B, L_pred_h), device=target_emb.device, dtype=target_emb.dtype)
+            row_acc_h = torch.zeros((B, L_pred_h), device=target_emb.device, dtype=target_emb.dtype)
+            row_valid_h = torch.zeros((B, L_pred_h), device=target_emb.device, dtype=torch.bool)
+            loss_sum_h = target_emb.new_tensor(0.0)
+            acc_sum_h = target_emb.new_tensor(0.0)
+            num_rows_h = 0
+            for w_start in range(0, L_pred_h, window_size):
+                w_end = min(w_start + window_size, L_pred_h)
+                stats_w = _batch_row_infonce(
+                    pred_h[:, w_start:w_end, :],
+                    key_h[:, w_start:w_end, :],
+                    valid[:, w_start:w_end],
+                    temperature,
+                )
+                row_loss_h[:, w_start:w_end] = stats_w["row_loss"]
+                row_acc_h[:, w_start:w_end] = stats_w["row_acc"]
+                row_valid_h[:, w_start:w_end] = stats_w["row_valid"]
+                rows_w = int(stats_w["num_rows"].item())
+                if rows_w > 0:
+                    loss_sum_h = loss_sum_h + stats_w["loss"] * rows_w
+                    acc_sum_h = acc_sum_h + stats_w["acc"] * rows_w
+                    num_rows_h += rows_w
+            if num_rows_h > 0:
+                stats_h = {
+                    "loss": loss_sum_h / num_rows_h,
+                    "acc": acc_sum_h / num_rows_h,
+                    "row_loss": row_loss_h,
+                    "row_acc": row_acc_h,
+                    "row_valid": row_valid_h,
+                    "num_rows": torch.tensor(num_rows_h, device=target_emb.device, dtype=torch.long),
+                }
+            else:
+                stats_h = {
+                    "loss": target_emb.new_tensor(0.0),
+                    "acc": target_emb.new_tensor(0.0),
+                    "row_loss": row_loss_h,
+                    "row_acc": row_acc_h,
+                    "row_valid": row_valid_h,
+                    "num_rows": torch.tensor(0, device=target_emb.device, dtype=torch.long),
+                }
+        weight_t = pred_h.new_tensor((float(horizon_discount) ** t) / norm_denom)
         stats["per_horizon_loss"][t] = stats_h["loss"]
         stats["per_horizon_acc"][t] = stats_h["acc"]
         if int(stats_h["num_rows"].item()) > 0:
             stats["per_horizon_valid"][t] = True
             losses.append(stats_h["loss"])
             accs.append(stats_h["acc"])
-            weights.append(weight_h)
+            weights.append(weight_t)
 
             row_valid = stats_h["row_valid"]
             row_loss = stats_h["row_loss"]
             row_acc = stats_h["row_acc"]
             valid_weight = row_valid.to(row_loss.dtype)
-            per_step_loss_weighted[:, :Th] = per_step_loss_weighted[:, :Th] + weight_h * row_loss
-            per_step_acc_weighted[:, :Th] = per_step_acc_weighted[:, :Th] + weight_h * row_acc
-            per_step_weight[:, :Th] = per_step_weight[:, :Th] + weight_h * valid_weight
+            per_step_loss_weighted[:, :L_pred_h] = per_step_loss_weighted[:, :L_pred_h] + weight_t * row_loss
+            per_step_acc_weighted[:, :L_pred_h] = per_step_acc_weighted[:, :L_pred_h] + weight_t * row_acc
+            per_step_weight[:, :L_pred_h] = per_step_weight[:, :L_pred_h] + weight_t * valid_weight
 
     stats["per_step_weight"] = per_step_weight
     stats["per_step_valid"] = per_step_weight > 0
@@ -317,28 +354,21 @@ def _batch_row_infonce(
     key: torch.Tensor,
     valid: torch.Tensor,
     temperature: float,
-    max_negatives: int = 0,
 ) -> Dict[str, torch.Tensor]:
     B, Tm1, _ = anchor.shape
     row_loss = torch.zeros((B, Tm1), device=anchor.device, dtype=anchor.dtype)
     row_acc = torch.zeros((B, Tm1), device=anchor.device, dtype=anchor.dtype)
     row_valid = valid.to(torch.bool)
 
-    def _stats_zero(*, use_valid_mask: bool) -> Dict[str, torch.Tensor]:
+    if row_valid.sum() == 0:
         return {
             "loss": torch.tensor(0.0, device=anchor.device, dtype=anchor.dtype),
             "acc": torch.tensor(0.0, device=anchor.device, dtype=anchor.dtype),
-            "row_loss": row_loss.clone(),
-            "row_acc": row_acc.clone(),
-            "row_valid": row_valid if use_valid_mask else torch.zeros_like(row_valid),
+            "row_loss": row_loss,
+            "row_acc": row_acc,
+            "row_valid": torch.zeros_like(row_valid),
             "num_rows": torch.tensor(0, device=anchor.device, dtype=torch.long),
         }
-
-    if row_valid.sum() == 0:
-        return _stats_zero(use_valid_mask=False)
-
-    if max_negatives < 0:
-        raise ValueError("max_negatives must be >= 0")
 
     B, Tm1, D = anchor.shape
     K = B * Tm1
@@ -350,61 +380,17 @@ def _batch_row_infonce(
     anchor_sel = F.normalize(anchor_flat[sel], dim=-1)
     key_norm = F.normalize(key_flat, dim=-1)
     pos_idx = sel
-
     # Positive index for each selected anchor is the aligned flattened timestep.
     # This is equivalent to taking diagonal similarities in Twister-style code
     # after flattening anchor/key matrices to [B', D] and computing [B', B'].
-    if max_negatives <= 0:
-        logits = torch.matmul(anchor_sel, key_norm.transpose(0, 1)) / temperature  # [N, K]
-        # Full-matrix negatives: all valid keys (including same-row keys),
-        # while keeping the aligned positive at pos_idx.
-        allowed = valid_flat.unsqueeze(0).expand(pos_idx.shape[0], -1).clone()
-        allowed.scatter_(1, pos_idx.unsqueeze(1), True)
-        logits = logits.masked_fill(~allowed, -1e9)
-        per_row_loss = F.cross_entropy(logits, pos_idx, reduction="none")
-        per_row_acc = (torch.argmax(logits, dim=-1) == pos_idx).to(logits.dtype)
-        row_loss.view(-1)[sel] = per_row_loss
-        row_acc.view(-1)[sel] = per_row_acc
-        return {
-            "loss": per_row_loss.mean(),
-            "acc": per_row_acc.mean(),
-            "row_loss": row_loss,
-            "row_acc": row_acc,
-            "row_valid": row_valid,
-            "num_rows": torch.tensor(int(sel.numel()), device=anchor.device, dtype=torch.long),
-        }
-
-    # Sampled-negatives path: keep positive + up to max_negatives valid keys.
-    # This reduces O(N*K) similarity compute to O(N*max_negatives).
-    valid_idx = torch.nonzero(valid_flat, as_tuple=False).squeeze(1)  # [V]
-    V = int(valid_idx.numel())
-    N = int(pos_idx.numel())
-    if V <= 1:
-        return _stats_zero(use_valid_mask=False)
-    M = min(int(max_negatives), V - 1)
-    if M <= 0:
-        return _stats_zero(use_valid_mask=False)
-
-    rank_map = torch.full((K,), -1, dtype=torch.long, device=anchor.device)
-    rank_map[valid_idx] = torch.arange(V, device=anchor.device)
-    pos_rank = rank_map[pos_idx]  # [N]
-    # Sample from [0, V-2], then skip each anchor's positive rank.
-    rnd = torch.randint(0, V - 1, (N, M), device=anchor.device)
-    neg_rank = rnd + (rnd >= pos_rank.unsqueeze(1)).to(torch.long)
-    neg_idx = valid_idx[neg_rank]  # [N, M]
-
-    pos_key = key_norm[pos_idx]  # [N, D]
-    neg_key = key_norm[neg_idx]  # [N, M, D]
-    logits_pos = (anchor_sel * pos_key).sum(dim=-1, keepdim=True) / temperature
-    logits_neg = torch.einsum("nd,nmd->nm", anchor_sel, neg_key) / temperature
-    logits = torch.cat([logits_pos, logits_neg], dim=1)  # [N, 1+M]
-    labels = torch.zeros((N,), dtype=torch.long, device=anchor.device)
-
-    # Future improvement: add negatives from virtual rollouts (model-generated embeddings).
-    # Future improvement: add hard negatives from the same episode but temporally distant steps.
-    per_row_loss = F.cross_entropy(logits, labels, reduction="none")
-    # Twister-style contrastive accuracy: matched positive is argmax in row.
-    per_row_acc = (torch.argmax(logits, dim=-1) == labels).to(logits.dtype)
+    logits = torch.matmul(anchor_sel, key_norm.transpose(0, 1)) / temperature  # [N, K]
+    # Full-matrix negatives: all valid keys (including same-row keys),
+    # while keeping the aligned positive at pos_idx.
+    allowed = valid_flat.unsqueeze(0).expand(pos_idx.shape[0], -1).clone()
+    allowed.scatter_(1, pos_idx.unsqueeze(1), True)
+    logits = logits.masked_fill(~allowed, -1e9)
+    per_row_loss = F.cross_entropy(logits, pos_idx, reduction="none")
+    per_row_acc = (torch.argmax(logits, dim=-1) == pos_idx).to(logits.dtype)
     row_loss.view(-1)[sel] = per_row_loss
     row_acc.view(-1)[sel] = per_row_acc
     return {

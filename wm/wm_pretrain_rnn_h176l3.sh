@@ -9,7 +9,6 @@ CPC_WEIGHT="${CPC_WEIGHT:-0.1}"
 CPC_DIM="${CPC_DIM:-64}"
 CPC_STEPS="${CPC_STEPS:-10}"
 CPC_DISCOUNT="${CPC_DISCOUNT:-0.75}"
-CPC_NEGATIVES="${CPC_NEGATIVES:-128}"
 
 python3 wm_train.py --data data.txt \
     --model-type rnn \
@@ -26,6 +25,5 @@ python3 wm_train.py --data data.txt \
     --contrastive-dim "${CPC_DIM}" \
     --contrastive-steps "${CPC_STEPS}" \
     --contrastive-horizon-discount "${CPC_DISCOUNT}" \
-    --contrastive-negatives "${CPC_NEGATIVES}" \
     --loc-weight 0.0 --head-weight 0.0 --turn-weight 0.0 --step-weight 0.0 \
     --save-path "${SAVE_PATH}" | tee "${LOG_PATH}"

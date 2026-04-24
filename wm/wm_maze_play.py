@@ -131,11 +131,6 @@ def _build_parser(saved: Dict[str, Any], inferred_args_json: Optional[Path]) -> 
         type=float,
         default=float(_saved(saved, "wm_contrastive_discount", 0.75)),
     )
-    parser.add_argument(
-        "--wm-contrastive-negatives",
-        type=int,
-        default=int(_saved(saved, "wm_contrastive_negatives", 0)),
-    )
     parser.add_argument("--wm-sensor-max-bin", type=int, default=int(_saved(saved, "wm_sensor_max_bin", 64)))
     parser.add_argument("--wm-sensor-weight", type=float, default=float(_saved(saved, "wm_sensor_weight", 1.0)))
     parser.add_argument("--wm-loc-weight", type=float, default=float(_saved(saved, "wm_loc_weight", 0.0)))
@@ -254,7 +249,6 @@ def main() -> None:
         step_bins=step_bins,
         contrastive_temp=args.wm_contrastive_temp,
         contrastive_horizon_discount=args.wm_contrastive_discount,
-        contrastive_negatives=args.wm_contrastive_negatives,
         sensor_weight=args.wm_sensor_weight,
         loc_weight=args.wm_loc_weight,
         head_weight=args.wm_head_weight,

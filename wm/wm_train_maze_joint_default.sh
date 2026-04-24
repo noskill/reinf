@@ -41,7 +41,6 @@ CMD=(
   --wm-contrastive-steps 3
   --wm-contrastive-temp 0.1
   --wm-contrastive-discount 0.75
-  --wm-contrastive-negatives 128
   --wm-sensor-weight 1.0
   --wm-loc-weight 0.0
   --wm-head-weight 0.0

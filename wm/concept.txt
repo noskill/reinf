@@ -2,9 +2,17 @@
 baselines:
 h0 = f(h-1,a-1, o0)
 h0 -> a0
+h0 -> e0
 h0, a0 -> predict o1
 h1 = f(h0, a0, o1)
+h1 -> a1
+h1 -> e1
 
+and for ac-cpc starting from h1:
+h1, a1 -> hat e2
+h1, a1, a2 -> hat e3
+
+match with positives e1, e2... e3
 
 
 // world models
