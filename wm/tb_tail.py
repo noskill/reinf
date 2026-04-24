@@ -21,6 +21,8 @@ DEFAULT_METRICS: List[str] = [
     "policy/entropy_mean",
     "reward/intrinsic_mean",
     "reward/total_mean",
+    "coverage",
+    "effective_coverage",
     "Average episode length",
 ]
 

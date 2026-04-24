@@ -279,6 +279,7 @@ class RNNPredictor(TransformerBaseline):
             num_layers=config.num_hidden_layers,
             batch_first=True,
         )
+        self.backbone.flatten_parameters()
         self._state_h: Optional[torch.Tensor] = None
 
     def init_cache(self, num_envs: int, device: torch.device):

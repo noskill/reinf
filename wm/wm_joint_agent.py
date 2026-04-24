@@ -29,7 +29,6 @@ def create_maze_world_model(
     step_bins: int,
     contrastive_temp: float = 0.1,
     contrastive_horizon_discount: float = 0.75,
-    contrastive_negatives: int = 0,
     sensor_weight: float = 1.0,
     loc_weight: float = 0.0,
     head_weight: float = 0.0,
@@ -92,7 +91,6 @@ def create_maze_world_model(
         contrastive_weight=1.0,  # CPC term kept explicit in trainer loss.
         contrastive_temp=float(contrastive_temp),
         contrastive_horizon_discount=float(contrastive_horizon_discount),
-        contrastive_negatives=int(contrastive_negatives),
         loc_min=loc_min,
     )
     return model
@@ -304,7 +302,6 @@ class JointWMReinforce(Reinforce):
         return action
 
     def update(self, rewards, dones, info=None, **kwargs):
-        del info, kwargs
         rewards_t = torch.as_tensor(rewards, dtype=torch.float32, device=self.device)
         dones_t = torch.as_tensor(dones, dtype=torch.bool, device=self.device)
 
@@ -342,7 +339,7 @@ class JointWMReinforce(Reinforce):
         reward_total_mean_sum = 0.0
 
         self.wm_model.train()
-        lp_rewards = self.lp_reward(obs_new, obs_mix, targets_new, targets_mix)
+        lp_rewards_new = self.lp_reward(obs_new, obs_mix, targets_new, targets_mix)
         # import pdb;pdb.set_trace()
         for _ in range(updates):
             # Policy update on new-policy dataset with LP reward.
@@ -353,7 +350,7 @@ class JointWMReinforce(Reinforce):
             policy_loss, policy_stats = self._compute_policy_loss_from_joint_batch(
                 preds=policy_preds,
                 meta=policy_meta,
-                intrinsic_rew_steps=lp_rewards,
+                intrinsic_rew_steps=lp_rewards_new,
                 n_policy_episodes=n_policy_episodes,
             )
             wm_loss_results, wm_loss_metrics = self.wm_model.compute_losses_and_metrics(preds=policy_preds, 
@@ -384,29 +381,63 @@ class JointWMReinforce(Reinforce):
         self.print_episode_stats(self.get_completed_episodes())
         self.version += 1
         self.clear_completed()
-        self.logger.log_scalar("joint/loss_total", total_loss_sum / updates)
-        self.logger.log_scalar("policy/loss", policy_loss_sum / updates)
-        self.logger.log_scalar("policy/entropy_mean", entropy_mean_sum / updates)
-        self.logger.log_scalar("policy/valid_steps", policy_valid_steps_sum / updates)
-        self.logger.log_scalar("reward/env_mean", reward_env_mean_sum / updates)
-        self.logger.log_scalar("reward/intrinsic_mean", reward_intr_mean_sum / updates)
-        self.logger.log_scalar("reward/total_mean", reward_total_mean_sum / updates)
-        for key in sorted(wm_loss_sums.keys()):
-            self.logger.log_scalar(f"wm/loss/{key}", wm_loss_sums[key] / updates)
-        self.logger.log_scalar("wm/loss/total", wm_loss_sum / updates)
-        for key in sorted(wm_metric_sums.keys()):
-            self.logger.log_scalar(f"wm/metric/{key}", wm_metric_sums[key] / updates)
-        self.logger.log_scalar("wm/replay_size", float(len(self._wm_pool.episode_pool)))
-        self.logger.log_scalar("wm/replay_sampled_episodes", float(len(replay_episodes)))
-        self.logger.log_scalar("wm/policy_sampled_episodes", float(n_policy_episodes))
-        joint_sampled_episodes = float(len(policy_wm_episodes) + len(replay_episodes))
-        self.logger.log_scalar("wm/joint_sampled_episodes", joint_sampled_episodes)
-        sampled_transitions = float(
-            sum(len(ep) for ep in policy_wm_episodes) + sum(len(ep) for ep in replay_episodes)
+        scalar_sums = {
+            "joint/loss_total": total_loss_sum,
+            "policy/loss": policy_loss_sum,
+            "policy/entropy_mean": entropy_mean_sum,
+            "policy/valid_steps": policy_valid_steps_sum,
+            "reward/env_mean": reward_env_mean_sum,
+            "reward/intrinsic_mean": reward_intr_mean_sum,
+            "reward/total_mean": reward_total_mean_sum,
+            "wm/loss/total": wm_loss_sum,
+        }
+        extra_scalars = {
+            "wm/replay_size": float(len(self._wm_pool.episode_pool)),
+            "wm/replay_sampled_episodes": float(len(replay_episodes)),
+            "wm/policy_sampled_episodes": float(n_policy_episodes),
+            "wm/joint_sampled_episodes": float(len(policy_wm_episodes) + len(replay_episodes)),
+            "wm/joint_sampled_transitions": float(
+                sum(len(ep) for ep in policy_wm_episodes) + sum(len(ep) for ep in replay_episodes)
+            ),
+        }
+        self._log_update_stats(
+            updates=updates,
+            scalar_sums=scalar_sums,
+            extra_scalars=extra_scalars,
+            wm_loss_sums=wm_loss_sums,
+            wm_metric_sums=wm_metric_sums,
+            info=info
         )
-        self.logger.log_scalar("wm/joint_sampled_transitions", sampled_transitions)
 
         return True
+
+    def _log_update_stats(
+        self,
+        *,
+        updates: int,
+        scalar_sums: Dict[str, float],
+        extra_scalars: Dict[str, float],
+        wm_loss_sums: Dict[str, float],
+        wm_metric_sums: Dict[str, float],
+        info
+    ) -> None:
+        for key, value in scalar_sums.items():
+            self.logger.log_scalar(key, value / updates)
+        for key in sorted(wm_loss_sums.keys()):
+            self.logger.log_scalar(f"wm/loss/{key}", wm_loss_sums[key] / updates)
+        for key in sorted(wm_metric_sums.keys()):
+            self.logger.log_scalar(f"wm/metric/{key}", wm_metric_sums[key] / updates)
+        for key, value in extra_scalars.items():
+            self.logger.log_scalar(key, value)
+        if info is not None:
+            per_env = info.get("per_env", None)
+            if per_env:
+                coverage_vals = [float(item["coverage"]) for item in per_env if "coverage" in item]
+                effective_vals = [float(item["effective_coverage"]) for item in per_env if "effective_coverage" in item]
+                if coverage_vals:
+                    self.logger.log_scalar("coverage", sum(coverage_vals) / len(coverage_vals))
+                if effective_vals:
+                    self.logger.log_scalar("effective_coverage", sum(effective_vals) / len(effective_vals))
 
     def lp_reward(self, obs_new, obs_mix, targets_new, targets_mix):
         with torch.no_grad():
@@ -439,8 +470,12 @@ class JointWMReinforce(Reinforce):
         self.wm_optimizer_copy.step()
 
         cpc_error_after = self._evaluate_step_cpc_error_no_grad(self.wm_model_copy, obs_new, targets_new)
-        intrinsic_steps = cpc_error_before - cpc_error_after
-        return intrinsic_steps
+        lp_per_step = cpc_error_before - cpc_error_after
+        valid_new = ~targets_new["key_padding_mask"]
+        self.logger.log_scalar("reward/lp_mean", lp_per_step.detach().mean().cpu().item())
+        self.logger.log_scalar("reward/surprise_mean", cpc_error_before.detach().mean().cpu().item())
+        reward = lp_per_step + cpc_error_before
+        return reward
 
     def action_idx_to_val(self, actions_idx: torch.Tensor) -> torch.Tensor:
         idx = actions_idx.to(self.device).long().view(-1)
@@ -480,7 +515,6 @@ class JointWMReinforce(Reinforce):
             key_padding_mask=key_padding_mask,
             temperature=wm_model.config.contrastive_temp,
             horizon_discount=wm_model.config.contrastive_horizon_discount,
-            max_negatives=wm_model.config.contrastive_negatives,
         )
         per_step_loss = contrastive_results.get("per_step_loss")
         per_step_valid = contrastive_results.get("per_step_valid")

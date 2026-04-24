@@ -40,7 +40,6 @@ class LossConfig:
     contrastive_weight: float = 0.0
     contrastive_temp: float = 0.1
     contrastive_horizon_discount: float = 1.0
-    contrastive_negatives: int = 0
     loc_min: Optional[torch.Tensor] = None
 
 
@@ -228,7 +227,6 @@ class PredictionLossMixin:
         key_padding_mask: torch.Tensor,
         temperature: float,
         horizon_discount: float = 1.0,
-        max_negatives: int = 0,
     ) -> Dict[str, torch.Tensor]:
         B, T = key_padding_mask.shape
         device = key_padding_mask.device
@@ -258,7 +256,6 @@ class PredictionLossMixin:
             key_padding_mask=key_padding_mask,
             temperature=temperature,
             horizon_discount=horizon_discount,
-            max_negatives=max_negatives,
         )
 
     def compute_losses_and_metrics(
@@ -310,7 +307,6 @@ class PredictionLossMixin:
             key_padding_mask=targets["key_padding_mask"],
             temperature=cfg.contrastive_temp,
             horizon_discount=cfg.contrastive_horizon_discount,
-            max_negatives=cfg.contrastive_negatives,
         )
         losses["contrastive"] = contrastive_results["loss"]
         return losses
@@ -345,7 +341,6 @@ class PredictionLossMixin:
             key_padding_mask=targets["key_padding_mask"],
             temperature=cfg.contrastive_temp,
             horizon_discount=cfg.contrastive_horizon_discount,
-            max_negatives=cfg.contrastive_negatives,
         )
         metrics["contrastive_acc"] = contrastive_stats["acc"]
         return metrics
