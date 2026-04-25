@@ -25,6 +25,7 @@ class ReinforceBase(Agent):
         device=torch.device("cpu"),
         logger=None,
         entropy_coef=0.001,
+        sequence_model=False,
         **kwargs
     ):
         self.num_envs = num_envs
@@ -48,6 +49,7 @@ class ReinforceBase(Agent):
         })
         self.state_normalizer = None
         self.data_types = ['states', 'actions', 'log_probs', 'entropy', 'rewards']
+        self.is_sequence_model = sequence_model
 
     def create_optimizers(self, **kwargs):
         self.optimizer_policy = optim.Adam(self.policy.parameters(), lr=self.policy_lr)
@@ -189,7 +191,15 @@ class ReinforceBase(Agent):
         compute per-step log-probs/entropy from current policy before flattening
         valid steps for the REINFORCE loss.
         """
-        # Normalize input into EpisodeBatch with returns
+        # Convert input into EpisodeBatch with returns
+        episode_batch = self._prepare_episode_batch(episodes)
+
+        if self.is_sequence_model:
+            self.train_sequence_policy(episode_batch)
+        else:
+            self.train_flat_policy(episode_batch)
+
+    def _prepare_episode_batch(self, episodes):
         if isinstance(episodes, EpisodeBatch):
             episode_batch = episodes
         else:
@@ -198,23 +208,19 @@ class ReinforceBase(Agent):
             return
         episode_batch = episode_batch.to(self.device)
         episode_batch.compute_returns(self.discount)
-        # Heuristic: treat policies with a temporal decoder attribute as sequence models
-        is_sequence_model = hasattr(self.policy, 'temporal_decoder')
+        return episode_batch
 
-        if is_sequence_model:
-            self.train_sequence_policy(episode_batch)
-        else:
-            self.train_flat_policy(episode_batch)
+    def _normalize_returns(self, returns_batch):
+        return self._normalize_returns_running(returns_batch)
 
     def train_flat_policy(self, episode_batch):
         # Non-sequence fallback: flatten all steps across episodes
-        flat = episode_batch.flatten(fields=['states', 'actions', 'returns'])
+        flat = episode_batch.flatten(fields=['states', 'actions'])
         states_batch = to_device(flat['states'], self.device)
         actions_batch = flat['actions'].to(self.device)
-        returns_batch = flat['returns'].to(self.device)
 
-        normalized_returns = self._normalize_returns_running(returns_batch)
-        self.logger.log_scalar("adv normalized max", normalized_returns.max())
+        effective_reward = self.compute_advantage(episode_batch)
+        self.logger.log_scalar("adv normalized max", effective_reward.max())
         self._log_training_stats(actions_batch)
 
         # Recompute log-probs and entropy from current policy for consistency
@@ -223,12 +229,21 @@ class ReinforceBase(Agent):
             entropy = dist.base_dist.entropy()
         else:
             entropy = dist.entropy()
-        if log_probs.shape != normalized_returns.shape:
-            log_probs = log_probs.reshape(normalized_returns.shape)
-        if entropy.shape != normalized_returns.shape:
-            entropy = entropy.reshape(normalized_returns.shape)
+        if log_probs.shape != effective_reward.shape:
+            log_probs = log_probs.reshape(effective_reward.shape)
+        if entropy.shape != effective_reward.shape:
+            entropy = entropy.reshape(effective_reward.shape)
 
-        self.train_policy(log_probs, normalized_returns, entropy, states_batch, actions_batch=actions_batch)
+        self.train_policy(log_probs, effective_reward, entropy, states_batch, actions_batch=actions_batch)
+
+    def compute_advantage(self, episode_batch):
+        if self.is_sequence_model:
+            raise NotImplementedError("Not implemented for seq models")
+        # Non-sequence fallback: flatten all steps across episodes
+        flat = episode_batch.flatten(fields=['returns'])
+        returns_batch = flat['returns'].to(self.device)
+        # just normalise discounted returns
+        return self._normalize_returns_running(returns_batch)
 
     def _extract_episode_data2(self, episodes):
         """

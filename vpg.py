@@ -7,7 +7,7 @@ import torch.nn.functional as F
 np = numpy
 from pool import EpisodesPoolMixin
 from reinforce import ReinforceBase
-from util import RunningNorm
+from util import RunningNorm, EpisodeBatch, to_device
 
 
 class Value(nn.Module):
@@ -34,57 +34,55 @@ class VPGBase(ReinforceBase):
                     num_envs=num_envs, discount=discount,
                     device=device, logger=logger, entropy_coef=entropy_coef, **kwargs)
         self.sampler = sampler
-        self.create_optimizers()
+        self.create_optimizers(**kwargs)
         self.hparams.update({
             'value_lr': value_lr,
             'weight_decay_vl': self.weight_decay_value
         })
         self.state_normalizer = RunningNorm()
 
-    def create_optimizers(self):
+    def create_optimizers(self, **kwargs):
         super().create_optimizers()
         self.optimizer_value = optim.Adam(self.value.parameters(),
                                           lr=self.value_lr, weight_decay=self.weight_decay_value)
 
     def learn_from_episodes(self, episodes):
-        # Extract per-episode tensors/lists
-        data_dict = self._extract_episode_data(episodes)
-        states_list = data_dict['states']
-        log_probs_list = data_dict['log_probs']
-        actions_list = data_dict['actions']
-        rewards_list = data_dict['rewards']
-        entropy_list = data_dict['entropy']
-        if not states_list:
-            return
-
-        # Prepare batches: compute discounted returns, and then aggregate states, returns, etc.
-        states_batch, returns_batch, log_probs_batch, actions_batch, entropy_batch = self._prepare_batches(
-            states_list, log_probs_list, rewards_list, actions_list, entropy_list
-        )
-
-        states_batch = self.state_normalizer(states_batch)
+        # Convert input into EpisodeBatch with returns
+        episode_batch = self._prepare_episode_batch(episodes)
+        # Non-sequence fallback: flatten all steps across episodes
+        flat = episode_batch.flatten(fields=['states', 'actions', 'returns'])
+        states_batch = to_device(flat['states'], self.device)
+        actions_batch = flat['actions'].to(self.device)
+        returns_batch = flat['returns'].to(self.device)
         # Normalize the returns
         normalized_returns = self._normalize_returns(returns_batch)
-
-        # Log statistics
-        self._log_training_stats(actions_batch)
         self.train_value(normalized_returns, states_batch, value_epochs=3)
 
+        if self.is_sequence_model:
+            self.train_sequence_policy(episode_batch)
+        else:
+            self.train_flat_policy(episode_batch)
+    
+    def compute_advantage(self, episode_batch):
+        # Non-sequence fallback: flatten all steps across episodes
+        flat = episode_batch.flatten(fields=['states', 'actions', 'returns'])
+        states_batch = to_device(flat['states'], self.device)
+        actions_batch = flat['actions'].to(self.device)
+        returns_batch = flat['returns'].to(self.device)
         # Policy Update
         with torch.no_grad():
             updated_values = self.value(states_batch).squeeze(-1)
+        
+        # Normalize the returns
+        normalized_returns = self._normalize_returns(returns_batch)
 
         advantages = normalized_returns - updated_values
         advantage_std = advantages.std()
         advantage_mean = advantages.mean()
         self.logger.log_scalar("Raw advantage mean:", advantage_mean.item())
         self.logger.log_scalar("Raw advantage std:", advantage_std.item())
-        advantages = (advantages - advantage_mean) / advantage_std
-        # Finally, train the policy (using log probs computed from current policy)
-        if len(entropy_batch.shape) == 2 and entropy_batch.shape[1] == 1:
-            entropy_batch = entropy_batch.flatten()
-        self.train_policy(log_probs_batch, advantages,
-                          entropy_batch, states_batch, actions_batch)
+        advantages = (advantages - advantage_mean) / (advantage_std + 1e-3)
+        return advantages
 
     def train_value(self, returns, states_batch, value_epochs = 2,  mini_batch_size = 128):
         # Value Network Update

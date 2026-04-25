@@ -2,7 +2,7 @@
 
 class Agent():
     def __init__(self, *args, logger=None, state_extractor=None, **kwargs):
-        super().__init__(*args, **kwargs)
+        super().__init__()
         self.logger = logger
         self.state_extractor = state_extractor
         self.hparams = dict()
