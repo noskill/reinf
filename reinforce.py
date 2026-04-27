@@ -137,53 +137,61 @@ class ReinforceBase(Agent):
         self.logger.log_scalar(f"min return",  min(episode_returns))
         self.logger.log_scalar(f"max return",  max(episode_returns))
 
-    def train_sequence_policy(self, episode_batch: EpisodeBatch):
-        # Prepare padded tensors [B,T,...] and key padding mask
-        # we will pass padded states to sequence policy model
-        fields = ['states', 'actions', 'returns']
-        padded, key_padding_mask, _ = episode_batch.pad(fields=fields)
+    def _flatten_padded_states(self, states_padded, key_padding_mask):
+        if isinstance(states_padded, dict):
+            return {k: flatten_padded(v, key_padding_mask) for k, v in states_padded.items()}
+        return flatten_padded(states_padded, key_padding_mask)
 
-        # Move to device (EpisodeBatch.to already moved lists; pad produces new tensors)
+    def train_sequence_policy(self, episode_batch: EpisodeBatch):
+        # Pad only fields needed for policy re-evaluation.
+        padded, key_padding_mask, _ = episode_batch.pad(fields=['states', 'actions'])
         states_padded = to_device(padded['states'], self.device)
         actions_padded = padded['actions'].to(self.device)
-        returns_padded = padded['returns'].to(self.device)
         key_padding_mask = key_padding_mask.to(self.device)
-        valid = ~key_padding_mask
 
-        # Normalize returns over valid (non-padded) steps
-        normalized_returns, _, _ = normalize_padded_returns(returns_padded, key_padding_mask)
-        self.logger.log_scalar("adv normalized max", normalized_returns[valid].max())
+        # Compute advantages/effective rewards from episode batch.
+        effective_reward = self.compute_advantage_ebatch(episode_batch)
+        if effective_reward.dim() == 2:
+            returns_flat = flatten_padded(effective_reward.unsqueeze(-1), key_padding_mask).squeeze(-1)
+        else:
+            returns_flat = effective_reward
+        returns_flat = returns_flat.to(self.device)
+        self.logger.log_scalar("adv normalized max", returns_flat.max())
 
-        # Log action stats over valid steps
-        self._log_training_stats(actions_padded[valid])
+        actions_flat = flatten_padded(actions_padded, key_padding_mask)
+        self._log_training_stats(actions_flat)
 
-        # Policy forward via sampler to construct distribution; evaluate on recorded actions
+        # Policy forward on padded trajectories and evaluate recorded actions.
         obs_for_policy = states_padded
         if isinstance(obs_for_policy, dict):
             obs_for_policy = dict(obs_for_policy)
             obs_for_policy['key_padding_mask'] = key_padding_mask
+
         _, _, dist = self.sampler(
             self.policy,
             obs_for_policy,
-                policy_kwargs=dict(episode_start=None),
+            policy_kwargs=dict(episode_start=None),
             actions=actions_padded,
             return_distribution=True,
         )
 
-        # Per-step log-probs and entropy, masked
         log_probs_seq = dist.log_prob(actions_padded)
         try:
             entropy_seq = dist.entropy()
         except NotImplementedError:
             entropy_seq = dist.base_dist.entropy()
 
-        # Flatten valid steps to 1D for existing train_policy API
         log_probs_flat = flatten_padded(log_probs_seq.unsqueeze(-1), key_padding_mask).squeeze(-1)
-        returns_flat = flatten_padded(normalized_returns.unsqueeze(-1), key_padding_mask).squeeze(-1)
         entropy_flat = flatten_padded(entropy_seq.unsqueeze(-1), key_padding_mask).squeeze(-1)
+        states_flat = self._flatten_padded_states(states_padded, key_padding_mask)
 
-        # Train with flattened tensors; avoid mu regularizer re-forward by not passing states
-        self.train_policy(log_probs_flat, returns_flat, entropy_flat, states_batch=None, actions=actions_padded)
+        self.train_policy(
+            log_probs_flat,
+            returns_flat,
+            entropy_flat,
+            states_batch=states_flat,
+            actions_batch=actions_flat,
+        )
 
     def learn_from_episodes(self, episodes):
         """
@@ -194,11 +202,9 @@ class ReinforceBase(Agent):
         """
         # Convert input into EpisodeBatch with returns
         episode_batch = self._prepare_episode_batch(episodes)
-
-        if self.is_sequence_model:
-            self.train_sequence_policy(episode_batch)
-        else:
-            self.train_flat_policy(episode_batch)
+        if episode_batch is None:
+            return
+        self.train_sequence_policy(episode_batch)
 
     def _prepare_episode_batch(self, episodes):
         if isinstance(episodes, EpisodeBatch):
@@ -214,38 +220,12 @@ class ReinforceBase(Agent):
     def _normalize_returns(self, returns_batch):
         return self._normalize_returns_running(returns_batch)
 
-    def train_flat_policy(self, episode_batch):
-        # Non-sequence fallback: flatten all steps across episodes
-        flat = episode_batch.flatten(fields=['states', 'actions'])
-        states_batch = to_device(flat['states'], self.device)
-        actions_batch = flat['actions'].to(self.device)
-
-        #effective_reward = self.compute_advantage_monte_carlo_ebatch(episode_batch)
-        effective_reward = self.compute_advantage_ebatch(episode_batch)
-        self.logger.log_scalar("adv normalized max", effective_reward.max())
-        self._log_training_stats(actions_batch)
-
-        # Recompute log-probs and entropy from current policy for consistency
-        _, log_probs, dist = self.sampler(self.policy, states_batch, actions=actions_batch)
-        if isinstance(dist, TransformedDistribution):
-            entropy = dist.base_dist.entropy()
-        else:
-            entropy = dist.entropy()
-        if log_probs.shape != effective_reward.shape:
-            log_probs = log_probs.reshape(effective_reward.shape)
-        if entropy.shape != effective_reward.shape:
-            entropy = entropy.reshape(effective_reward.shape)
-
-        self.train_policy(log_probs, effective_reward, entropy, states_batch, actions_batch=actions_batch)
-
     def compute_advantage_ebatch(self, episode_batch):
-        if self.is_sequence_model:
-            raise NotImplementedError("Not implemented for seq models")
-        # Non-sequence fallback: flatten all steps across episodes
-        flat = episode_batch.flatten(fields=['returns'])
-        returns_batch = flat['returns'].to(self.device)
-        # just normalise discounted returns
-        return self._normalize_returns_running(returns_batch)
+        padded, key_padding_mask, _ = episode_batch.pad(fields=['returns'])
+        key_padding_mask = key_padding_mask.to(self.device)
+        returns_padded = padded['returns'].to(self.device)
+        normalized_returns, _, _ = normalize_padded_returns(returns_padded, key_padding_mask)
+        return normalized_returns
 
     def _extract_episode_data(self, episodes) -> EpisodeBatch:
         """

@@ -51,23 +51,18 @@ class VPGBase(ReinforceBase):
     def learn_from_episodes(self, episodes):
         # Convert input into EpisodeBatch with returns
         episode_batch = self._prepare_episode_batch(episodes)
+        if episode_batch is None:
+            return
         # Non-sequence fallback: flatten all steps across episodes
-        flat = episode_batch.flatten(fields=['states', 'actions', 'returns'])
+        flat = episode_batch.flatten(fields=['states', 'returns'])
         states_batch = to_device(flat['states'], self.device)
-        actions_batch = to_device(flat['actions'], self.device)
         returns_batch = to_device(flat['returns'], self.device)
 
         # keep returns unnormalised - in advantage code we are substracting from
         # unnormalised rewards
         self.train_value(returns_batch, states_batch, value_epochs=3)
 
-        if self.is_sequence_model:
-            self.train_sequence_policy(episode_batch)
-        else:
-            self.train_flat_policy(episode_batch)
-
-    def compute_advantage_ebatch(self, episode_batch):
-        return self.compute_advantage_gae_ebatch(episode_batch)
+        self.train_sequence_policy(episode_batch)
 
     def compute_advantage_ebatch(self, episode_batch):
         return self.compute_advantage_gae_ebatch(episode_batch)
@@ -84,8 +79,6 @@ class VPGBase(ReinforceBase):
         actions_batch = to_device(pad['actions'], self.device)
         returns_batch = to_device(pad['returns'], self.device)
         advantages = self.compute_advantage_monte_carlo(states_batch, returns_batch, padding_mask)
-        if not self.is_sequence_model:
-            return flatten_padded(advantages, padding_mask)
         return advantages
 
     def compute_advantage_monte_carlo(self, states_batch, returns_batch, padding_mask, **kwargs):
@@ -119,8 +112,6 @@ class VPGBase(ReinforceBase):
         self.logger.log_scalar("Raw advantage mean:", advantage_mean.item())
         self.logger.log_scalar("Raw advantage std:", advantage_std.item())
         advantages = (advantages - advantage_mean) * (1 - padding_mask.to(advantages))  / (advantage_std + 1e-3)
-        if not self.is_sequence_model:
-            return flatten_padded(advantages, padding_mask)
         return advantages
 
     def train_value(self, returns, states_batch, value_epochs = 2,  mini_batch_size = 128):
@@ -145,6 +136,18 @@ class VPGBase(ReinforceBase):
                 torch.nn.utils.clip_grad_norm_(self.value.parameters(), 0.4)
                 self.optimizer_value.step()
         self.logger.log_scalar("value loss", value_loss)
+        
+        # explained variance
+        with torch.no_grad():
+            pred_values = self.value(states_batch).squeeze(-1)
+            residual = returns - pred_values
+            returns_var = returns.var(unbiased=False)
+            if returns_var > 1e-12:
+                explained_variance = 1.0 - residual.var(unbiased=False) / returns_var
+            else:
+                explained_variance = torch.tensor(0.0, device=returns.device)
+            self.logger.log_scalar("value explained variance", explained_variance)
+
 
     def load_state_dict(self, sd):
         super().load_state_dict(sd)
@@ -154,5 +157,3 @@ class VPGBase(ReinforceBase):
 
 class VPG(VPGBase, EpisodesPoolMixin):
     pass
-
-

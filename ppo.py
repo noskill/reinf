@@ -32,32 +32,27 @@ class PPOBase(VPGBase):
         self.hparams.update({'eps': self.eps})
         self.state_normalizer = RunningNorm()
         self.num_learning_epochs = num_learning_epochs
-        self.sequence_pad_fields = ['states', 'actions', 'returns', 'rewards', 'log_probs']
+        self.pad_fields = ['states', 'actions', 'returns', 'rewards', 'log_probs']
 
     def learn_from_episodes(self, episodes, num_minibatches=4):
-        """
-        Split orchestration similar to ReinforceBase: decide sequence vs flat
-        and delegate to dedicated methods.
-        """
         batch = self._prepare_episode_batch(episodes)
         if batch is None:
             return
-        self.train_sequence_policy(batch, num_minibatches=num_minibatches)
+        self.train_policy_batch(batch, num_minibatches=num_minibatches)
 
-    def _sequence_flatten_states(self, states_padded, key_padding_mask):
+    def _flatten_states(self, states_padded, key_padding_mask):
         if isinstance(states_padded, dict):
             return {k: flatten_padded(v, key_padding_mask) for k, v in states_padded.items()}
         return flatten_padded(states_padded, key_padding_mask)
 
-    def _sequence_build_policy_obs(self, states_padded, key_padding_mask):
+    def _build_policy_obs(self, states_padded, key_padding_mask):
         if isinstance(states_padded, dict):
             obs_for_policy = dict(states_padded)
             obs_for_policy['key_padding_mask'] = key_padding_mask
             return obs_for_policy
         return states_padded
 
-    def _sequence_update_policy(self, obs_for_policy, actions_padded, key_padding_mask,
-                                old_logp_flat, advantages_flat, num_minibatches):
+    def _update_policy(self, obs_for_policy, actions_padded, key_padding_mask, old_logp_flat, advantages_flat, num_minibatches):
         N = old_logp_flat.shape[0]
         if N == 0:
             return
@@ -96,8 +91,8 @@ class PPOBase(VPGBase):
                     mu=mu_mb,
                 )
 
-    def train_sequence_policy(self, episode_batch: EpisodeBatch, num_minibatches: int = 4):
-        padded, padding_mask, _ = episode_batch.pad(fields=self.sequence_pad_fields)
+    def train_policy_batch(self, episode_batch: EpisodeBatch, num_minibatches: int = 4):
+        padded, padding_mask, _ = episode_batch.pad(fields=self.pad_fields)
         padding_mask = padding_mask.to(self.device)
         states_padded = to_device(padded['states'], self.device)
         actions_padded = padded['actions'].to(self.device)
@@ -119,7 +114,7 @@ class PPOBase(VPGBase):
 
         self._log_training_stats(flatten_padded(actions_padded, padding_mask))
 
-        states_flat = self._sequence_flatten_states(states_padded, padding_mask)
+        states_flat = self._flatten_states(states_padded, padding_mask)
         returns_flat = flatten_padded(returns_padded.unsqueeze(-1), padding_mask).squeeze(-1)
         mini_batch_size = max(1, int(returns_flat.shape[0]) // max(1, num_minibatches))
         self.train_value(
@@ -130,8 +125,8 @@ class PPOBase(VPGBase):
         )
 
         self.policy.load_state_dict(self.policy_old.state_dict())
-        obs_for_policy = self._sequence_build_policy_obs(states_padded, padding_mask)
-        self._sequence_update_policy(
+        obs_for_policy = self._build_policy_obs(states_padded, padding_mask)
+        self._update_policy(
             obs_for_policy,
             actions_padded,
             padding_mask,
@@ -140,6 +135,9 @@ class PPOBase(VPGBase):
             num_minibatches,
         )
         self.policy_old.load_state_dict(self.policy.state_dict())
+
+    def train_sequence_policy(self, episode_batch: EpisodeBatch, num_minibatches: int = 4):
+        self.train_policy_batch(episode_batch, num_minibatches=num_minibatches)
 
     def train_policy(self, log_probs_old, advantages, entropy, log_probs_new, mu=None):
         """

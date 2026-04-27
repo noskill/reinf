@@ -86,8 +86,9 @@ class PPOD(PPOBase, PPODPool):
         super().__init__(policy, value, sampler, policy_lr=policy_lr,
                          num_envs=num_envs, discount=discount, device=device, logger=logger,
                          num_learning_epochs=num_learning_epochs, **kwargs)
-        if 'skill' not in self.sequence_pad_fields:
-            self.sequence_pad_fields = list(self.sequence_pad_fields) + ['skill']
+        if 'skill' not in self.pad_fields:
+            self.pad_fields = list(self.pad_fields) + ['skill']
+        self.sequence_pad_fields = self.pad_fields
 
         self.data_types = ['states', 'actions', 'log_probs', 'entropy', 'skill', 'rewards']
         self.p_drop = kwargs.get('p_drop', 0)
