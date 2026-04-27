@@ -41,11 +41,12 @@ class ReinforceBase(Agent):
         self.entropy_coef = entropy_coef
         self.entropy_thresh = 0.2
         super().__init__(logger=logger, **kwargs)
+        self.target_entropy = torch.tensor(2.0, dtype=torch.float16)
         self.hparams.update( {
             'policy_lr': policy_lr,
             'discount': discount,
             'entropy_coef': self.entropy_coef,
-            'entropy_thresh': self.entropy_thresh
+            'entropy_thresh': self.target_entropy
         })
         self.state_normalizer = None
         self.data_types = ['states', 'actions', 'log_probs', 'entropy', 'rewards']
@@ -219,6 +220,7 @@ class ReinforceBase(Agent):
         states_batch = to_device(flat['states'], self.device)
         actions_batch = flat['actions'].to(self.device)
 
+        #effective_reward = self.compute_advantage_monte_carlo(episode_batch)
         effective_reward = self.compute_advantage(episode_batch)
         self.logger.log_scalar("adv normalized max", effective_reward.max())
         self._log_training_stats(actions_batch)
@@ -410,18 +412,23 @@ class ReinforceBase(Agent):
         self.logger.log_scalar(f"policy grad std :", np.std(grads))
         self.optimizer_policy.step()
 
+    def compute_entropy_loss(self, entropy, device, dtype):
+        self.logger.log_scalar("entropy mean:", entropy.mean())
+        e_loss = F.relu(self.target_entropy.to(device, dtype) - entropy.to(device, dtype)).mean()
+        return e_loss
+
     def compute_loss(self, log_probs, returns, entropy=torch.zeros(1), states_batch=None, **kwargs):
         assert log_probs.shape == returns.shape, "Expected same shape for log_probs and returns!"
         assert log_probs.shape == entropy.shape, "Expected same shape for log_probs and entropy!"
         # Entropy loss to increase entropy
-        e_loss = -( entropy).to(log_probs).mean()
+        e_loss = self.compute_entropy_loss(entropy, log_probs.device, log_probs.dtype)
 
         # mu loss for normal distribution (continuous action space) - keep values not too extreme
         mu_loss = torch.tensor(0.0, device=self.device)
         if states_batch is not None and isinstance(self.sampler, NormalActionSampler):
             out = self.policy(states_batch, episode_start=None)
             mu, _ = self.sampler.split_out(out)
-            mu = torch.clamp(mu, -1e6, 1e6)
+            #mu = torch.clamp(mu, -1e6, 1e6)
             mu_loss = torch.mean(mu**2)
             self.logger.log_scalar("mu loss:", mu_loss.item())
 
@@ -429,8 +436,8 @@ class ReinforceBase(Agent):
         log_clamped = log_probs.clamp(-10, 10)
         policy_loss = -(log_clamped * returns).mean() + self.entropy_coef * e_loss + mu_loss * mu_coef
         self.logger.log_scalar("policy loss:", policy_loss.item())
-        self.logger.log_scalar(f"entropy mean :", entropy.mean())
-        self.logger.log_scalar(f"entropy loss :", e_loss)
+        self.logger.log_scalar(f"entropy mean:", entropy.mean())
+        self.logger.log_scalar(f"entropy loss:", e_loss)
         if not torch.isfinite(policy_loss):
             raise ValueError(f"Non-finite loss: {policy_loss.item()}")
         if policy_loss.abs() > 100:

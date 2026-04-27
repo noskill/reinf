@@ -176,7 +176,7 @@ class PPOBase(VPGBase):
         states_batch = to_device(flat['states'], self.device)
         actions_batch = flat['actions'].to(self.device)
         returns_batch = flat['returns'].to(self.device)
-        old_logp_batch = flat['log_probs'].to(self.device)
+        old_logp_batch = flat['log_probs'].to(self.device).detach()
 
         normalized_returns = self._normalize_returns(returns_batch)
         self._log_training_stats(actions_batch)
@@ -300,7 +300,6 @@ class PPOBase(VPGBase):
         Optionally apply a small mu regularization term for Normal policies.
         """
         self.optimizer_policy.zero_grad()
-
         # Shape alignment and checks
         for name, t in (('log_probs_old', log_probs_old), ('advantages', advantages), ('entropy', entropy), ('log_probs_new', log_probs_new)):
             assert t.dim() in (1, 2), f"{name} must be 1D or 2D, got {t.shape}"
@@ -317,10 +316,10 @@ class PPOBase(VPGBase):
             f"Shape mismatch: old {log_probs_old.shape}, new {log_probs_new.shape}, adv {advantages.shape}")
 
         # Entropy loss (thresholded)
-        m = (entropy < self.entropy_thresh)
-        e_loss = -(self.entropy_coef * entropy * m).to(log_probs_old).mean()
+        e_loss = self.compute_entropy_loss(entropy, log_probs_old.device, log_probs_old.dtype)
 
         # Optional mu regularizer
+        mu_coef = 0.001
         mu_loss = torch.tensor(0.0, device=self.device)
         if mu is not None:
             mu = torch.clamp(mu, -1e6, 1e6)
@@ -352,7 +351,7 @@ class PPOBase(VPGBase):
         if torch.isnan(policy_loss_ppo).any():
             import pdb; pdb.set_trace()
 
-        policy_loss = policy_loss_ppo.mean() + e_loss + mu_loss
+        policy_loss = policy_loss_ppo.mean() + self.entropy_coef * e_loss + mu_loss * mu_coef
         if policy_loss > 100:
             import pdb; pdb.set_trace()
 
