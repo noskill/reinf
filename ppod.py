@@ -461,46 +461,6 @@ class PPOD(PPOBase, PPODPool):
 
         self.train_discriminator(desc_obs_batch, desc_skills_batch, episode_lengths=desc_episode_lengths)
 
-    def _learn_epoch(self, states_batch, log_probs_batch, advantages_all,
-                     actions_batch, entropy_batch, num_minibatches, skills):
-        dataset = torch.utils.data.TensorDataset(
-            states_batch, log_probs_batch, advantages_all,
-            actions_batch, entropy_batch, skills)
-
-        batch_size = len(states_batch) // num_minibatches
-        data_loader = torch.utils.data.DataLoader(
-            dataset, batch_size=batch_size, shuffle=True)
-
-        for states_mb, log_probs_mb, adv_mb, actions_mb, entropy_mb, skills_mb in data_loader:
-            if len(states_mb) < max(batch_size // 2, 2):  # Skip too small batches
-                continue
-            # Use precomputed fixed advantages for PPO update
-            advantages = adv_mb
-
-            # Recompute new log-probs and entropy under current policy
-            _, logp_new_mb, dist = self.sampler(self.policy, states_mb, actions=actions_mb, return_distribution=True)
-            try:
-                entropy_new_mb = dist.entropy()
-            except NotImplementedError:
-                entropy_new_mb = dist.base_dist.entropy()
-
-            # Optional mu regularization term (Normal policies) via dist parameters
-            mu_mb = None
-            if isinstance(self.sampler, NormalActionSampler):
-                base = dist.base_dist if isinstance(dist, TransformedDistribution) else dist
-                base_normal = base.base_dist if hasattr(base, 'base_dist') else base
-                if hasattr(base_normal, 'loc'):
-                    mu_mb = base_normal.loc
-
-            # Train policy using precomputed new log-probs
-            self.train_policy(
-                log_probs_old=log_probs_mb,
-                advantages=advantages,
-                entropy=entropy_new_mb,
-                log_probs_new=logp_new_mb,
-                mu=mu_mb,
-            )
-
     def get_descriminator_input(self, obs, p_drop=0):
         """Build discriminator features from obs dict.
 

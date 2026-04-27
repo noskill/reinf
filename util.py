@@ -615,10 +615,10 @@ def normalize_padded_returns(returns, key_padding_mask):
         return
     r_valid = returns[valid]
     r_mean = r_valid.mean()
-    r_std = r_valid.std() + 1e-7
+    r_std = r_valid.std() + 1e-4
     normalized_returns = torch.zeros_like(returns)
     normalized_returns[valid] = (r_valid - r_mean) / r_std
-    return normalized_returns
+    return normalized_returns, r_mean, r_std
 
 
 def gae(gamma, lambda_discount, rewards, values):

@@ -7,7 +7,7 @@ import torch.nn.functional as F
 np = numpy
 from pool import EpisodesPoolMixin
 from reinforce import ReinforceBase
-from util import RunningNorm, EpisodeBatch, to_device, gae, flatten_padded
+from util import RunningNorm, EpisodeBatch, to_device, gae, flatten_padded, normalize_padded_returns
 
 
 class Value(nn.Module):
@@ -66,36 +66,47 @@ class VPGBase(ReinforceBase):
         else:
             self.train_flat_policy(episode_batch)
 
-    def compute_advantage(self, episode_batch):
-        return self.compute_advantage_gae(episode_batch)
+    def compute_advantage_ebatch(self, episode_batch):
+        return self.compute_advantage_gae_ebatch(episode_batch)
 
-    def compute_advantage_monte_carlo(self, episode_batch):
+    def compute_advantage_ebatch(self, episode_batch):
+        return self.compute_advantage_gae_ebatch(episode_batch)
+    
+    def compute_advantage(self, states_batch, returns_batch, rewards_batch, padding_mask):
+        return self.compute_advantage_gae(states_batch=states_batch, returns_batch=returns_batch,
+                                          rewards_batch=rewards_batch, padding_mask=padding_mask)
+
+    def compute_advantage_monte_carlo_ebatch(self, episode_batch):
         # Non-sequence fallback: flatten all steps across episodes
-        flat = episode_batch.flatten(fields=['states', 'actions', 'returns'])
-        states_batch = to_device(flat['states'], self.device)
-        actions_batch = to_device(flat['actions'], self.device)
-        returns_batch = to_device(flat['returns'], self.device)
+        pad, padding_mask, length = episode_batch.pad(fields=['states', 'actions', 'returns', 'rewards'])
+        # B,T
+        states_batch = to_device(pad['states'], self.device)
+        actions_batch = to_device(pad['actions'], self.device)
+        returns_batch = to_device(pad['returns'], self.device)
+        advantages = self.compute_advantage_monte_carlo(states_batch, returns_batch, padding_mask)
+        if not self.is_sequence_model:
+            return flatten_padded(advantages, padding_mask)
+        return advantages
 
+    def compute_advantage_monte_carlo(self, states_batch, returns_batch, padding_mask, **kwargs):
         # Policy Update
         with torch.no_grad():
             updated_values = self.value(states_batch).squeeze(-1)
 
-        # Normalize the returns
-        normalized_returns = self._normalize_returns(returns_batch)
-
-        advantages = normalized_returns - updated_values
-        advantage_std = advantages.std()
-        advantage_mean = advantages.mean()
+        advantages = returns_batch - updated_values
+        advantages, advantage_mean, advantage_std = normalize_padded_returns(advantages, padding_mask)
         self.logger.log_scalar("Raw advantage mean:", advantage_mean.item())
         self.logger.log_scalar("Raw advantage std:", advantage_std.item())
-        advantages = (advantages - advantage_mean) / (advantage_std + 1e-3)
         return advantages
 
-    def compute_advantage_gae(self, episode_batch):
+    def compute_advantage_gae_ebatch(self, episode_batch):
         pad, padding_mask, length = episode_batch.pad(fields=['states', 'actions', 'returns', 'rewards'])
         # B,T
         rewards_batch = to_device(pad['rewards'], self.device)
         states_batch = to_device(pad['states'], self.device)
+        return self.compute_advantage_gae(states_batch, rewards_batch, padding_mask)
+    
+    def compute_advantage_gae(self, states_batch, rewards_batch, padding_mask, **kwargs):
         # Policy Update
         with torch.no_grad():
             updated_values = self.value(states_batch).squeeze(-1)
@@ -114,19 +125,26 @@ class VPGBase(ReinforceBase):
 
     def train_value(self, returns, states_batch, value_epochs = 2,  mini_batch_size = 128):
         # Value Network Update
-        for epoch in range(value_epochs):
+        n_samples = int(returns.shape[0])
+        if n_samples == 0:
+            return None
 
-            indices = np.random.permutation(len(states_batch))
-            for start in range(0, len(states_batch), mini_batch_size):
+        mini_batch_size = max(1, int(mini_batch_size))
+        for _ in range(value_epochs):
+            indices = torch.randperm(n_samples, device=returns.device)
+            for start in range(0, n_samples, mini_batch_size):
                 self.optimizer_value.zero_grad()
-                end = start + mini_batch_size
-                batch_idx = indices[start:end]
-                pred_values = self.value(states_batch[batch_idx].detach()).squeeze(-1)
+                batch_idx = indices[start:start + mini_batch_size]
+                if isinstance(states_batch, dict):
+                    batch_states = {k: v[batch_idx].detach() for k, v in states_batch.items()}
+                else:
+                    batch_states = states_batch[batch_idx].detach()
+                pred_values = self.value(batch_states).squeeze(-1)
                 value_loss = F.mse_loss(pred_values, returns[batch_idx])
                 value_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.value.parameters(), 0.4)
                 self.optimizer_value.step()
-        self.logger.log_scalar(f"value loss",  value_loss)
+        self.logger.log_scalar("value loss", value_loss)
 
     def load_state_dict(self, sd):
         super().load_state_dict(sd)
@@ -136,6 +154,5 @@ class VPGBase(ReinforceBase):
 
 class VPG(VPGBase, EpisodesPoolMixin):
     pass
-
 
 
