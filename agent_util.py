@@ -155,7 +155,7 @@ def create_agent(args_cli, env_cfg, env, logger):
         action_dim = action_space.n
     else:
         action_dim = action_space.shape[0] * 2  # For mean and std in continuous actions
-
+    target_entropy = 0.75 * action_dim
     device = env_cfg.sim.device
     diayn_algorithms = ('ppodr', 'ppod', 'ppod_novel', 'ppodr_novel')
     uses_diayn = args_cli.algorithm in diayn_algorithms
@@ -201,7 +201,8 @@ def create_agent(args_cli, env_cfg, env, logger):
     discount = 0.99
     entropy_coef = 0.01
 
-    common_args = dict(state_extractor=state_extractor)
+    common_args = dict(state_extractor=state_extractor,
+                       target_entropy=target_entropy)
     if args_cli.algorithm == "ppo":
         policy, value = build_networks()
         num_learning_epochs = 4

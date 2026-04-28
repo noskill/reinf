@@ -456,7 +456,7 @@ class PPOD(PPOBase, PPODPool):
 
         is_sequence_model = hasattr(self.policy, 'temporal_decoder')
         if is_sequence_model:
-            self.train_sequence_policy(train_batch, num_minibatches=num_minibatches)
+            self.train_policy_batch(train_batch, num_minibatches=num_minibatches)
         else:
             self.train_flat_policy(train_batch, num_minibatches=num_minibatches)
 
@@ -701,7 +701,7 @@ class PPODRunning(PPOD):
 
         is_sequence_model = hasattr(self.policy, 'temporal_decoder')
         if is_sequence_model:
-            self.train_sequence_policy(train_batch, num_minibatches=num_minibatches)
+            self.train_policy_batch(train_batch, num_minibatches=num_minibatches)
         else:
             self.train_flat_policy(train_batch, num_minibatches=num_minibatches)
 

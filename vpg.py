@@ -61,8 +61,7 @@ class VPGBase(ReinforceBase):
         # keep returns unnormalised - in advantage code we are substracting from
         # unnormalised rewards
         self.train_value(returns_batch, states_batch, value_epochs=3)
-
-        self.train_sequence_policy(episode_batch)
+        self.train_policy_batch(episode_batch)
 
     def compute_advantage_ebatch(self, episode_batch):
         return self.compute_advantage_gae_ebatch(episode_batch)
@@ -108,10 +107,11 @@ class VPGBase(ReinforceBase):
 
         adv_sel = torch.masked_select(advantages, torch.logical_not(padding_mask))
         advantage_std = adv_sel.std()
+        advantage_std_clamped = advantage_std.clamp_min(1e-2)
         advantage_mean = adv_sel.mean()
         self.logger.log_scalar("Raw advantage mean:", advantage_mean.item())
         self.logger.log_scalar("Raw advantage std:", advantage_std.item())
-        advantages = (advantages - advantage_mean) * (1 - padding_mask.to(advantages))  / (advantage_std + 1e-3)
+        advantages = (advantages - advantage_mean) * (1 - padding_mask.to(advantages)) / advantage_std_clamped
         return advantages
 
     def train_value(self, returns, states_batch, value_epochs = 2,  mini_batch_size = 128):
@@ -131,7 +131,7 @@ class VPGBase(ReinforceBase):
                 else:
                     batch_states = states_batch[batch_idx].detach()
                 pred_values = self.value(batch_states).squeeze(-1)
-                value_loss = F.mse_loss(pred_values, returns[batch_idx])
+                value_loss = F.smooth_l1_loss(pred_values, returns[batch_idx])
                 value_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.value.parameters(), 0.4)
                 self.optimizer_value.step()

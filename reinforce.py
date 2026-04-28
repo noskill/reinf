@@ -23,8 +23,9 @@ class ReinforceBase(Agent):
         discount=0.99,
         device=torch.device("cpu"),
         logger=None,
-        entropy_coef=0.001,
+        entropy_coef=0.005,
         sequence_model=False,
+        target_entropy=2,
         **kwargs
     ):
         self.num_envs = num_envs
@@ -38,14 +39,15 @@ class ReinforceBase(Agent):
         self.version = 0
         self.create_optimizers(**kwargs)
         self.entropy_coef = entropy_coef
-        self.entropy_thresh = 0.2
+        self.entropy_thresh = 1
         super().__init__(logger=logger, **kwargs)
-        self.target_entropy = torch.tensor(2.0, dtype=torch.float16)
+        self.target_entropy = torch.tensor(target_entropy, dtype=torch.float16)
+        self.mu_coef = 0.001
         self.hparams.update( {
             'policy_lr': policy_lr,
             'discount': discount,
             'entropy_coef': self.entropy_coef,
-            'entropy_thresh': self.target_entropy
+            'entropy_thresh': target_entropy
         })
         self.state_normalizer = None
         self.data_types = ['states', 'actions', 'log_probs', 'entropy', 'rewards']
@@ -142,7 +144,7 @@ class ReinforceBase(Agent):
             return {k: flatten_padded(v, key_padding_mask) for k, v in states_padded.items()}
         return flatten_padded(states_padded, key_padding_mask)
 
-    def train_sequence_policy(self, episode_batch: EpisodeBatch):
+    def train_policy_batch(self, episode_batch: EpisodeBatch):
         # Pad only fields needed for policy re-evaluation.
         padded, key_padding_mask, _ = episode_batch.pad(fields=['states', 'actions'])
         states_padded = to_device(padded['states'], self.device)
@@ -204,7 +206,7 @@ class ReinforceBase(Agent):
         episode_batch = self._prepare_episode_batch(episodes)
         if episode_batch is None:
             return
-        self.train_sequence_policy(episode_batch)
+        self.train_policy_batch(episode_batch)
 
     def _prepare_episode_batch(self, episodes):
         if isinstance(episodes, EpisodeBatch):
@@ -335,25 +337,30 @@ class ReinforceBase(Agent):
         self.logger.log_scalar("entropy mean:", entropy.mean())
         e_loss = F.relu(self.target_entropy.to(device, dtype) - entropy.to(device, dtype)).mean()
         return e_loss
+    
+    def mu_loss(self, mu):
+        mu_loss = torch.mean(mu**2 * (mu.abs() > 2))
+        #mu_loss = F.smooth_l1_loss(mu, torch.zeros_like(mu), reduction='mean')
+        return mu_loss
+    
+    def compute_mu_loss(self, states_batch):
+        # mu loss for normal distribution (continuous action space) - keep values not too extreme
+        mu_loss = torch.tensor(0.0, device=self.device)
+        if states_batch is not None and isinstance(self.sampler, NormalActionSampler):
+            out = self.policy(states_batch, episode_start=None)
+            mu, _ = self.sampler.split_out(out)
+            mu_loss = self.mu_loss(mu)
+            self.logger.log_scalar("mu loss:", mu_loss.item())
+        return mu_loss
 
     def compute_loss(self, log_probs, returns, entropy=torch.zeros(1), states_batch=None, **kwargs):
         assert log_probs.shape == returns.shape, "Expected same shape for log_probs and returns!"
         assert log_probs.shape == entropy.shape, "Expected same shape for log_probs and entropy!"
         # Entropy loss to increase entropy
         e_loss = self.compute_entropy_loss(entropy, log_probs.device, log_probs.dtype)
-
-        # mu loss for normal distribution (continuous action space) - keep values not too extreme
-        mu_loss = torch.tensor(0.0, device=self.device)
-        if states_batch is not None and isinstance(self.sampler, NormalActionSampler):
-            out = self.policy(states_batch, episode_start=None)
-            mu, _ = self.sampler.split_out(out)
-            #mu = torch.clamp(mu, -1e6, 1e6)
-            mu_loss = torch.mean(mu**2)
-            self.logger.log_scalar("mu loss:", mu_loss.item())
-
-        mu_coef = 0.001
+        mu_loss = self.compute_mu_loss(states_batch)
         log_clamped = log_probs.clamp(-10, 10)
-        policy_loss = -(log_clamped * returns).mean() + self.entropy_coef * e_loss + mu_loss * mu_coef
+        policy_loss = -(log_clamped * returns).mean() + self.entropy_coef * e_loss + mu_loss * self.mu_coef
         self.logger.log_scalar("policy loss:", policy_loss.item())
         self.logger.log_scalar(f"entropy mean:", entropy.mean())
         self.logger.log_scalar(f"entropy loss:", e_loss)

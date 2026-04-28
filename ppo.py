@@ -136,9 +136,6 @@ class PPOBase(VPGBase):
         )
         self.policy_old.load_state_dict(self.policy.state_dict())
 
-    def train_sequence_policy(self, episode_batch: EpisodeBatch, num_minibatches: int = 4):
-        self.train_policy_batch(episode_batch, num_minibatches=num_minibatches)
-
     def train_policy(self, log_probs_old, advantages, entropy, log_probs_new, mu=None):
         """
         Compute PPO loss given precomputed log_probs_new (current policy)
@@ -165,11 +162,9 @@ class PPOBase(VPGBase):
         e_loss = self.compute_entropy_loss(entropy, log_probs_old.device, log_probs_old.dtype)
 
         # Optional mu regularizer
-        mu_coef = 0.001
         mu_loss = torch.tensor(0.0, device=self.device)
         if mu is not None:
-            mu = torch.clamp(mu, -1e6, 1e6)
-            mu_loss = 0.01 * torch.mean(mu**2 * (mu.abs() > 2))
+            mu_loss = self.mu_loss(mu)
             self.logger.log_scalar("mu loss:", mu_loss.item())
 
         # PPO clipped objective
@@ -197,7 +192,7 @@ class PPOBase(VPGBase):
         if torch.isnan(policy_loss_ppo).any():
             import pdb; pdb.set_trace()
 
-        policy_loss = policy_loss_ppo.mean() + self.entropy_coef * e_loss + mu_loss * mu_coef
+        policy_loss = policy_loss_ppo.mean() + self.entropy_coef * e_loss + mu_loss * self.mu_coef
         if policy_loss > 100:
             import pdb; pdb.set_trace()
 
