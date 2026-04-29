@@ -1,10 +1,7 @@
 from vpg import VPGBase
 import numpy
 import torch
-from torch.distributions import *
-import torch.nn as nn
-import torch.optim as optim
-import torch.nn.functional as F
+from torch.distributions import TransformedDistribution, Independent
 from sample import NormalActionSampler
 np = numpy
 from pool import EpisodesPoolMixin
@@ -52,44 +49,63 @@ class PPOBase(VPGBase):
             return obs_for_policy
         return states_padded
 
-    def _update_policy(self, obs_for_policy, actions_padded, key_padding_mask, old_logp_flat, advantages_flat, num_minibatches):
-        N = old_logp_flat.shape[0]
-        if N == 0:
+    def compute_distribution_params(self, observations, actions, key_padding_mask):
+        _, logp_new_padded, dist = self.sampler(
+            self.policy,
+            observations,
+            policy_kwargs=dict(episode_start=None),
+            actions=actions,
+            return_distribution=True,
+        )
+        try:
+            entropy_padded = dist.entropy()
+        except NotImplementedError:
+            entropy_padded = dist.base_dist.entropy()
+
+        logp_new_flat = flatten_padded(logp_new_padded.unsqueeze(-1), key_padding_mask).squeeze(-1)
+        entropy_flat = flatten_padded(entropy_padded.unsqueeze(-1), key_padding_mask).squeeze(-1)
+
+        mu_mb = None
+        if isinstance(self.sampler, NormalActionSampler):
+            base = dist.base_dist if isinstance(dist, TransformedDistribution) else dist
+            base_normal = base.base_dist if isinstance(base, Independent) else base
+            if hasattr(base_normal, 'loc'):
+                mu_padded = base_normal.loc  # [B,T,A]
+                mu_flat = flatten_padded(mu_padded, key_padding_mask)
+                mu_mb = mu_flat
+        return logp_new_flat, entropy_flat, mu_mb
+
+    def iterate_minibatches(
+        self,
+        obs,
+        num_minibatches,
+        B,
+        *args
+    ):
+        if B == 0:
             return
+
         for _ in range(self.num_learning_epochs):
-            perm = torch.randperm(N, device=self.device)
-            for mb in torch.split(perm, max(1, N // max(1, num_minibatches))):
-                _, logp_new_padded, dist = self.sampler(
-                    self.policy,
-                    obs_for_policy,
-                    policy_kwargs=dict(episode_start=None),
-                    actions=actions_padded,
-                    return_distribution=True,
-                )
-                try:
-                    entropy_padded = dist.entropy()
-                except NotImplementedError:
-                    entropy_padded = dist.base_dist.entropy()
+            perm = torch.randperm(B, device=self.device)
+            for mb in torch.split(perm, max(1, B // max(1, num_minibatches))):
+                mb_result = []
+                for v in args:
+                    assert v.shape[0] == B
+                    mb_result.append(v[mb])
+                if isinstance(obs, dict):
+                    mb_obs = {}
+                    for key, value in obs.items():
+                        if isinstance(value, torch.Tensor) and value.shape[0] == B:
+                            mb_obs[key] = value[mb]
+                        else:
+                            mb_obs[key] = value
+                else:
+                    mb_obs = obs[mb]
+                yield mb_obs, *mb_result
 
-                logp_new_flat = flatten_padded(logp_new_padded.unsqueeze(-1), key_padding_mask).squeeze(-1)
-                entropy_flat = flatten_padded(entropy_padded.unsqueeze(-1), key_padding_mask).squeeze(-1)
-
-                mu_mb = None
-                if isinstance(self.sampler, NormalActionSampler):
-                    base = dist.base_dist if isinstance(dist, TransformedDistribution) else dist
-                    base_normal = base.base_dist if isinstance(base, Independent) else base
-                    if hasattr(base_normal, 'loc'):
-                        mu_padded = base_normal.loc  # [B,T,A]
-                        mu_flat = flatten_padded(mu_padded, key_padding_mask)
-                        mu_mb = mu_flat[mb]
-
-                self.train_policy(
-                    log_probs_old=old_logp_flat[mb],
-                    advantages=advantages_flat[mb],
-                    entropy=entropy_flat[mb],
-                    log_probs_new=logp_new_flat[mb],
-                    mu=mu_mb,
-                )
+    def train_policy_batch_joint(self, episode_batch: EpisodeBatch, num_minibatches: int = 4):
+        """joint updates of value and policy"""
+        pass
 
     def train_policy_batch(self, episode_batch: EpisodeBatch, num_minibatches: int = 4):
         padded, padding_mask, _ = episode_batch.pad(fields=self.pad_fields)
@@ -102,15 +118,12 @@ class PPOBase(VPGBase):
 
         if old_logp_padded.dim() == 3 and old_logp_padded.shape[-1] == 1:
             old_logp_padded = old_logp_padded.squeeze(-1)
-        old_logp_flat = flatten_padded(old_logp_padded.unsqueeze(-1), padding_mask).squeeze(-1).detach()
 
         advantages = self.compute_advantage_gae(
             states_batch=states_padded,
             rewards_batch=rewards_padded,
             padding_mask=padding_mask,
         )
-        if advantages.dim() == 2:
-            advantages = flatten_padded(advantages.unsqueeze(-1), padding_mask).squeeze(-1)
 
         self._log_training_stats(flatten_padded(actions_padded, padding_mask))
 
@@ -126,23 +139,29 @@ class PPOBase(VPGBase):
 
         self.policy.load_state_dict(self.policy_old.state_dict())
         obs_for_policy = self._build_policy_obs(states_padded, padding_mask)
-        self._update_policy(
-            obs_for_policy,
-            actions_padded,
-            padding_mask,
-            old_logp_flat,
-            advantages,
-            num_minibatches,
-        )
+        for minibatch in self.iterate_minibatches(
+                obs_for_policy,
+                num_minibatches,
+                actions_padded.shape[0],
+                actions_padded,
+                padding_mask,
+                old_logp_padded,
+                advantages):
+            mb_obs, mb_actions, mb_padding, mb_old_logp, mb_advantages = minibatch
+            logp_new_flat, entropy_flat, mu_mb = self.compute_distribution_params(
+                    mb_obs,
+                    mb_actions,
+                    mb_padding,
+                )
+            mb_old_logp_flat = flatten_padded(mb_old_logp.unsqueeze(-1), mb_padding).squeeze(-1).detach()
+            advantages_flat = flatten_padded(mb_advantages.unsqueeze(-1), mb_padding).squeeze(-1)
+            if mb_old_logp_flat.numel() == 0:
+                continue
+            self.train_policy(mb_old_logp_flat, advantages_flat, entropy_flat, logp_new_flat, mu=mu_mb)
+   
         self.policy_old.load_state_dict(self.policy.state_dict())
 
-    def train_policy(self, log_probs_old, advantages, entropy, log_probs_new, mu=None):
-        """
-        Compute PPO loss given precomputed log_probs_new (current policy)
-        and log_probs_old (behavior policy) along with advantages and entropy.
-        Optionally apply a small mu regularization term for Normal policies.
-        """
-        self.optimizer_policy.zero_grad()
+    def policy_loss(self,  log_probs_old, advantages, entropy, log_probs_new, mu=None):
         # Shape alignment and checks
         for name, t in (('log_probs_old', log_probs_old), ('advantages', advantages), ('entropy', entropy), ('log_probs_new', log_probs_new)):
             assert t.dim() in (1, 2), f"{name} must be 1D or 2D, got {t.shape}"
@@ -195,6 +214,20 @@ class PPOBase(VPGBase):
         policy_loss = policy_loss_ppo.mean() + self.entropy_coef * e_loss + mu_loss * self.mu_coef
         if policy_loss > 100:
             import pdb; pdb.set_trace()
+        self.logger.log_scalar("entropy mean:", entropy.mean())
+        self.logger.log_scalar("entropy loss:", e_loss)
+        self.logger.log_scalar("policy loss:", policy_loss.item())
+        return policy_loss
+
+    def train_policy(self, log_probs_old, advantages, entropy, log_probs_new, mu=None):
+        """
+        Compute PPO loss given precomputed log_probs_new (current policy)
+        and log_probs_old (behavior policy) along with advantages and entropy.
+        Optionally apply a small mu regularization term for Normal policies.
+        """
+        self.optimizer_policy.zero_grad()
+        
+        policy_loss = self.policy_loss(log_probs_old, advantages, entropy, log_probs_new, mu=mu)
 
         policy_loss.backward()
         # Gradient clipping
@@ -215,11 +248,9 @@ class PPOBase(VPGBase):
                 "policy_first_layer_grad_norm",
                 first_layer.weight.grad.norm().item()
             )
-        self.logger.log_scalar("entropy mean:", entropy.mean())
-        self.logger.log_scalar("entropy loss:", e_loss)
+
 
         self.optimizer_policy.step()
-        self.logger.log_scalar("policy loss:", policy_loss.item())
 
     def get_policy_for_action(self):
         return self.policy_old

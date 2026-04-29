@@ -7,7 +7,7 @@ import torch.nn.functional as F
 np = numpy
 from pool import EpisodesPoolMixin
 from reinforce import ReinforceBase
-from util import RunningNorm, EpisodeBatch, to_device, gae, flatten_padded, normalize_padded_returns
+from util import RunningNorm, EpisodeBatch, to_device, gae, normalize_padded_returns
 
 
 class Value(nn.Module):
@@ -114,6 +114,11 @@ class VPGBase(ReinforceBase):
         advantages = (advantages - advantage_mean) * (1 - padding_mask.to(advantages)) / advantage_std_clamped
         return advantages
 
+    def value_loss(self, states_batch, returns):
+        pred_values = self.value(states_batch).squeeze(-1)
+        value_loss = F.smooth_l1_loss(pred_values, returns)
+        return value_loss
+
     def train_value(self, returns, states_batch, value_epochs = 2,  mini_batch_size = 128):
         # Value Network Update
         n_samples = int(returns.shape[0])
@@ -127,11 +132,10 @@ class VPGBase(ReinforceBase):
                 self.optimizer_value.zero_grad()
                 batch_idx = indices[start:start + mini_batch_size]
                 if isinstance(states_batch, dict):
-                    batch_states = {k: v[batch_idx].detach() for k, v in states_batch.items()}
+                    batch_states = {k: v[batch_idx]for k, v in states_batch.items()}
                 else:
-                    batch_states = states_batch[batch_idx].detach()
-                pred_values = self.value(batch_states).squeeze(-1)
-                value_loss = F.smooth_l1_loss(pred_values, returns[batch_idx])
+                    batch_states = states_batch[batch_idx]
+                value_loss = self.value_loss(batch_states, returns[batch_idx])
                 value_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.value.parameters(), 0.4)
                 self.optimizer_value.step()
