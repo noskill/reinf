@@ -254,23 +254,25 @@ class LlamaModel(nn.Module):
             cos, sin = self.rotary_emb(hidden_states, position_ids)
             position_embeddings = (cos, sin)
 
-        # --- ATTENTION MASK (training causal mask when no cache) ---
+        # --- ATTENTION MASK ---
         attn_mask = None
         if past_key_values is None:
-            # Build a standard causal mask for [B, T, H] sequences
             B, T, _ = hidden_states.shape
-            # 0 on and below diagonal, -inf above
-            causal = torch.full((T, T), float('-inf'), device=hidden_states.device, dtype=hidden_states.dtype)
-            causal = torch.triu(causal, diagonal=1)
-            window = attention_window if attention_window is not None else self.config.attention_window
-            if window is not None and window > 0:
-                i = torch.arange(T, device=hidden_states.device).view(T, 1)
-                j = torch.arange(T, device=hidden_states.device).view(1, T)
-                too_old = (i - j) >= window
-                window_mask = torch.where(too_old, torch.full_like(causal, float('-inf')), torch.zeros_like(causal))
-                causal = causal + window_mask
-            # Shape to [1, 1, T, T] so it broadcasts over batch and heads
-            attn_mask = causal.view(1, 1, T, T)
+
+            # Keep causal masking only when RoPE is enabled.
+            # For unordered mixed-token inputs (RoPE off), use non-causal attention.
+            if self.rotary_emb is not None:
+                causal = torch.full((T, T), float('-inf'), device=hidden_states.device, dtype=hidden_states.dtype)
+                causal = torch.triu(causal, diagonal=1)
+                window = attention_window if attention_window is not None else self.config.attention_window
+                if window is not None and window > 0:
+                    i = torch.arange(T, device=hidden_states.device).view(T, 1)
+                    j = torch.arange(T, device=hidden_states.device).view(1, T)
+                    too_old = (i - j) >= window
+                    window_mask = torch.where(too_old, torch.full_like(causal, float('-inf')), torch.zeros_like(causal))
+                    causal = causal + window_mask
+                attn_mask = causal.view(1, 1, T, T)
+
             # Add optional key padding mask: [B, T] where True means PADDED
             if key_padding_mask is not None:
                 kpm = key_padding_mask
@@ -283,7 +285,7 @@ class LlamaModel(nn.Module):
                 neg_inf = torch.full_like(zeros, float('-inf'))
                 # kpm=True indicates padded positions -> disallow attending to them (add -inf)
                 pad_mask = torch.where(kpm.view(B, 1, 1, T), neg_inf, zeros)
-                attn_mask = attn_mask + pad_mask
+                attn_mask = pad_mask if attn_mask is None else (attn_mask + pad_mask)
 
         # --- LAYER LOOP ---
         for layer in self.layers:
