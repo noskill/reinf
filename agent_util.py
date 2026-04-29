@@ -153,9 +153,13 @@ def create_agent(args_cli, env_cfg, env, logger):
 
     if isinstance(action_space, gym.spaces.Discrete):
         action_dim = action_space.n
+        e_action_dim = action_dim
     else:
         action_dim = action_space.shape[0] * 2  # For mean and std in continuous actions
-    target_entropy = 0.75 * action_dim
+        e_action_dim = action_space.shape[0]
+    target_entropy = 0.75 * e_action_dim
+    if e_action_dim == 1:
+        target_entropy = 0.4
     device = env_cfg.sim.device
     diayn_algorithms = ('ppodr', 'ppod', 'ppod_novel', 'ppodr_novel')
     uses_diayn = args_cli.algorithm in diayn_algorithms
@@ -199,7 +203,7 @@ def create_agent(args_cli, env_cfg, env, logger):
     disc_lr = args_cli.disc_lr if args_cli.disc_lr is not None else disc_lr_default
 
     discount = 0.99
-    entropy_coef = 0.01
+    entropy_coef = 0.02
 
     common_args = dict(state_extractor=state_extractor,
                        target_entropy=target_entropy)

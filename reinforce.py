@@ -52,6 +52,7 @@ class ReinforceBase(Agent):
         self.state_normalizer = None
         self.data_types = ['states', 'actions', 'log_probs', 'entropy', 'rewards']
         self.is_sequence_model = sequence_model
+        self.log_hparams()
 
     def create_optimizers(self, **kwargs):
         self.optimizer_policy = optim.Adam(self.policy.parameters(), lr=self.policy_lr)
