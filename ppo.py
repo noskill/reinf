@@ -1,6 +1,7 @@
 from vpg import VPGBase
 import numpy
 import torch
+from torch import optim
 from torch.distributions import TransformedDistribution, Independent
 from sample import NormalActionSampler
 np = numpy
@@ -23,13 +24,31 @@ class PPOBase(VPGBase):
     def __init__(self, policy, value, sampler, policy_lr=0.0001, value_lr=0.001, num_envs=8, discount=0.99, device=torch.device('cpu'), logger=None, num_learning_epochs=4, clip_param=None, **kwargs):
         super().__init__(policy, value, sampler, policy_lr=policy_lr,
                     num_envs=num_envs, discount=discount,
-                    device=device, logger=logger, **kwargs)
+                    device=device, logger=logger, num_learning_epochs=num_learning_epochs, **kwargs)
         self.policy_old = copy.deepcopy(self.policy)
         self.eps = float(clip_param) if clip_param is not None else 0.2
         self.hparams.update({'eps': self.eps})
         self.state_normalizer = RunningNorm()
-        self.num_learning_epochs = num_learning_epochs
         self.pad_fields = ['states', 'actions', 'returns', 'rewards', 'log_probs']
+
+    def create_optimizers(self, **kwargs):
+        if kwargs.get('joint', False):
+            # Create a single optimizer over policy+value params.
+            # Deduplicate parameters in case modules are shared.
+            seen = set()
+            joint_params = []
+            for parameter in list(self.policy.parameters()) + list(self.value.parameters()):
+                parameter_id = id(parameter)
+                if parameter_id in seen:
+                    continue
+                seen.add(parameter_id)
+                joint_params.append(parameter)
+            self.optimizer_policy = optim.Adam(joint_params, lr=self.policy_lr)
+            self.optimizer_value = self.optimizer_policy
+            return
+        super().create_optimizers()
+        self.optimizer_value = optim.Adam(self.value.parameters(),
+                                          lr=self.value_lr, weight_decay=self.weight_decay_value)
 
     def learn_from_episodes(self, episodes, num_minibatches=4):
         batch = self._prepare_episode_batch(episodes)
@@ -75,39 +94,9 @@ class PPOBase(VPGBase):
                 mu_mb = mu_flat
         return logp_new_flat, entropy_flat, mu_mb
 
-    def iterate_minibatches(
-        self,
-        obs,
-        num_minibatches,
-        B,
-        *args
-    ):
-        if B == 0:
-            return
-
-        for _ in range(self.num_learning_epochs):
-            perm = torch.randperm(B, device=self.device)
-            for mb in torch.split(perm, max(1, B // max(1, num_minibatches))):
-                mb_result = []
-                for v in args:
-                    assert v.shape[0] == B
-                    mb_result.append(v[mb])
-                if isinstance(obs, dict):
-                    mb_obs = {}
-                    for key, value in obs.items():
-                        if isinstance(value, torch.Tensor) and value.shape[0] == B:
-                            mb_obs[key] = value[mb]
-                        else:
-                            mb_obs[key] = value
-                else:
-                    mb_obs = obs[mb]
-                yield mb_obs, *mb_result
 
     def train_policy_batch_joint(self, episode_batch: EpisodeBatch, num_minibatches: int = 4):
         """joint updates of value and policy"""
-        pass
-
-    def train_policy_batch(self, episode_batch: EpisodeBatch, num_minibatches: int = 4):
         padded, padding_mask, _ = episode_batch.pad(fields=self.pad_fields)
         padding_mask = padding_mask.to(self.device)
         states_padded = to_device(padded['states'], self.device)
@@ -127,22 +116,104 @@ class PPOBase(VPGBase):
 
         self._log_training_stats(flatten_padded(actions_padded, padding_mask))
 
+        self.policy.load_state_dict(self.policy_old.state_dict())
+        obs_for_policy = self._build_policy_obs(states_padded, padding_mask)
+        for minibatch in self.iterate_minibatches(
+                num_minibatches,
+                actions_padded.shape[0],
+                obs_for_policy,
+                actions_padded,
+                padding_mask,
+                old_logp_padded,
+                advantages,
+                returns_padded):
+
+            mb_obs, mb_actions, mb_padding, mb_old_logp, mb_advantages, ret_mb = minibatch
+            logp_new_flat, entropy_flat, mu_mb = self.compute_distribution_params(
+                    mb_obs,
+                    mb_actions,
+                    mb_padding,
+                )
+            mb_old_logp_flat = flatten_padded(mb_old_logp.unsqueeze(-1), mb_padding).squeeze(-1).detach()
+            advantages_flat = flatten_padded(mb_advantages.unsqueeze(-1), mb_padding).squeeze(-1)
+            if mb_old_logp_flat.numel() == 0:
+                continue
+            self.optimizer_policy.zero_grad()
+
+            mb_returns_flat = flatten_padded(ret_mb.unsqueeze(-1), mb_padding).squeeze(-1)
+            if isinstance(mb_obs, dict):
+                mb_value_obs = {k: v for k, v in mb_obs.items() if k != 'key_padding_mask'}
+            else:
+                mb_value_obs = mb_obs
+            mb_value_obs_flat = self._flatten_states(mb_value_obs, mb_padding)
+            value_loss = self.value_loss(mb_value_obs_flat, mb_returns_flat)
+
+            policy_loss = self.policy_loss(
+                mb_old_logp_flat,
+                advantages_flat,
+                entropy_flat,
+                logp_new_flat,
+                mu=mu_mb,
+            )
+
+            joint_loss = policy_loss + value_loss
+            joint_loss.backward()
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1)
+            torch.nn.utils.clip_grad_norm_(self.value.parameters(), 0.4)
+            self.log_grads()
+            self.optimizer_policy.step()
+
+        self.policy_old.load_state_dict(self.policy.state_dict())
+
+    def train_policy_batch(self, episode_batch: EpisodeBatch, num_minibatches: int = 4):
+        padded, padding_mask, _ = episode_batch.pad(fields=self.pad_fields)
+        padding_mask = padding_mask.to(self.device)
+        states_padded = to_device(padded['states'], self.device)
+        actions_padded = padded['actions'].to(self.device)
+        returns_padded = padded['returns'].to(self.device)
+        old_logp_padded = padded['log_probs'].to(self.device)
+        rewards_padded = padded['rewards'].to(self.device)
+
+        if old_logp_padded.dim() == 3 and old_logp_padded.shape[-1] == 1:
+            old_logp_padded = old_logp_padded.squeeze(-1)
+
         states_flat = self._flatten_states(states_padded, padding_mask)
         returns_flat = flatten_padded(returns_padded.unsqueeze(-1), padding_mask).squeeze(-1)
-        mini_batch_size = max(1, int(returns_flat.shape[0]) // max(1, num_minibatches))
+        self._log_training_stats(flatten_padded(actions_padded, padding_mask))
+
+        # if int(os.getenv('TRAIN_VALUE_BEFORE', 0)) == 0:
+        #     advantages = self.compute_advantage_gae(
+        #         states_batch=states_padded,
+        #         rewards_batch=rewards_padded,
+        #         padding_mask=padding_mask,
+        #     )
+        #     self.train_value(
+        #         returns_flat,
+        #         states_flat,
+        #         value_epochs=2,
+        #         num_minibatches=num_minibatches
+        #     )
+        # else:
         self.train_value(
             returns_flat,
             states_flat,
             value_epochs=2,
-            mini_batch_size=mini_batch_size,
+            num_minibatches=num_minibatches
         )
+        advantages = self.compute_advantage_gae(
+            states_batch=states_padded,
+            rewards_batch=rewards_padded,
+            padding_mask=padding_mask,
+        )
+
 
         self.policy.load_state_dict(self.policy_old.state_dict())
         obs_for_policy = self._build_policy_obs(states_padded, padding_mask)
         for minibatch in self.iterate_minibatches(
-                obs_for_policy,
                 num_minibatches,
                 actions_padded.shape[0],
+                obs_for_policy,
                 actions_padded,
                 padding_mask,
                 old_logp_padded,
@@ -157,8 +228,15 @@ class PPOBase(VPGBase):
             advantages_flat = flatten_padded(mb_advantages.unsqueeze(-1), mb_padding).squeeze(-1)
             if mb_old_logp_flat.numel() == 0:
                 continue
-            self.train_policy(mb_old_logp_flat, advantages_flat, entropy_flat, logp_new_flat, mu=mu_mb)
-   
+            self.optimizer_policy.zero_grad()
+            policy_loss = self.policy_loss(mb_old_logp_flat, advantages_flat, entropy_flat, logp_new_flat, mu=mu_mb)
+            policy_loss.backward()
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1)
+            self.log_grads()
+
+            self.optimizer_policy.step()
+
         self.policy_old.load_state_dict(self.policy.state_dict())
 
     def policy_loss(self,  log_probs_old, advantages, entropy, log_probs_new, mu=None):
@@ -219,20 +297,7 @@ class PPOBase(VPGBase):
         self.logger.log_scalar("policy loss:", policy_loss.item())
         return policy_loss
 
-    def train_policy(self, log_probs_old, advantages, entropy, log_probs_new, mu=None):
-        """
-        Compute PPO loss given precomputed log_probs_new (current policy)
-        and log_probs_old (behavior policy) along with advantages and entropy.
-        Optionally apply a small mu regularization term for Normal policies.
-        """
-        self.optimizer_policy.zero_grad()
-        
-        policy_loss = self.policy_loss(log_probs_old, advantages, entropy, log_probs_new, mu=mu)
-
-        policy_loss.backward()
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1)
-
+    def log_grads(self):
         # Log gradients
         grads = []
         for name, param in self.policy.named_parameters():
@@ -248,9 +313,6 @@ class PPOBase(VPGBase):
                 "policy_first_layer_grad_norm",
                 first_layer.weight.grad.norm().item()
             )
-
-
-        self.optimizer_policy.step()
 
     def get_policy_for_action(self):
         return self.policy_old

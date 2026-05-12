@@ -26,7 +26,7 @@ class Value(nn.Module):
 
 class VPGBase(ReinforceBase):
     def __init__(self, policy, value, sampler, policy_lr=0.0001, value_lr=0.001, num_envs=8,
-                 discount=0.99, device=torch.device('cpu'), logger=None, entropy_coef=0.01, **kwargs):
+                 discount=0.99, device=torch.device('cpu'), logger=None, entropy_coef=0.01, num_learning_epochs=4, **kwargs):
         self.value = value
         self.value_lr = value_lr
         self.weight_decay_value = 0
@@ -42,6 +42,7 @@ class VPGBase(ReinforceBase):
             'lambda_discount': self.lambda_discount
         })
         self.state_normalizer = RunningNorm()
+        self.num_learning_epochs = num_learning_epochs
 
     def create_optimizers(self, **kwargs):
         super().create_optimizers()
@@ -65,7 +66,7 @@ class VPGBase(ReinforceBase):
 
     def compute_advantage_ebatch(self, episode_batch):
         return self.compute_advantage_gae_ebatch(episode_batch)
-    
+
     def compute_advantage(self, states_batch, returns_batch, rewards_batch, padding_mask):
         return self.compute_advantage_gae(states_batch=states_batch, returns_batch=returns_batch,
                                           rewards_batch=rewards_batch, padding_mask=padding_mask)
@@ -97,7 +98,7 @@ class VPGBase(ReinforceBase):
         rewards_batch = to_device(pad['rewards'], self.device)
         states_batch = to_device(pad['states'], self.device)
         return self.compute_advantage_gae(states_batch, rewards_batch, padding_mask)
-    
+
     def compute_advantage_gae(self, states_batch, rewards_batch, padding_mask, **kwargs):
         # Policy Update
         with torch.no_grad():
@@ -117,30 +118,28 @@ class VPGBase(ReinforceBase):
     def value_loss(self, states_batch, returns):
         pred_values = self.value(states_batch).squeeze(-1)
         value_loss = F.smooth_l1_loss(pred_values, returns)
+        self.logger.log_scalar("value loss", value_loss)
         return value_loss
 
-    def train_value(self, returns, states_batch, value_epochs = 2,  mini_batch_size = 128):
+    def train_value(self, returns, states_batch, value_epochs = 2,  num_minibatches=2):
         # Value Network Update
         n_samples = int(returns.shape[0])
         if n_samples == 0:
             return None
 
-        mini_batch_size = max(1, int(mini_batch_size))
-        for _ in range(value_epochs):
-            indices = torch.randperm(n_samples, device=returns.device)
-            for start in range(0, n_samples, mini_batch_size):
-                self.optimizer_value.zero_grad()
-                batch_idx = indices[start:start + mini_batch_size]
-                if isinstance(states_batch, dict):
-                    batch_states = {k: v[batch_idx]for k, v in states_batch.items()}
-                else:
-                    batch_states = states_batch[batch_idx]
-                value_loss = self.value_loss(batch_states, returns[batch_idx])
-                value_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.value.parameters(), 0.4)
-                self.optimizer_value.step()
-        self.logger.log_scalar("value loss", value_loss)
-        
+        for minibatch in self.iterate_minibatches(
+                num_minibatches,
+                returns.shape[0],
+                returns,
+                states_batch,
+           ):
+            self.optimizer_value.zero_grad()
+            ret_mb, batch_states = minibatch
+            value_loss = self.value_loss(batch_states, ret_mb)
+            value_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.value.parameters(), 0.4)
+            self.optimizer_value.step()
+
         # explained variance
         with torch.no_grad():
             pred_values = self.value(states_batch).squeeze(-1)
@@ -152,6 +151,33 @@ class VPGBase(ReinforceBase):
                 explained_variance = torch.tensor(0.0, device=returns.device)
             self.logger.log_scalar("value explained variance", explained_variance)
 
+    def iterate_minibatches(
+        self,
+        num_minibatches,
+        B,
+        *args
+    ):
+        if B == 0:
+            return
+
+        for _ in range(self.num_learning_epochs):
+            perm = torch.randperm(B, device=self.device)
+            for mb in torch.split(perm, max(1, B // max(1, num_minibatches))):
+                mb_result = []
+                for obs in args:
+                    if isinstance(obs, dict):
+                        mb_obs = {}
+                        for key, value in obs.items():
+                            if isinstance(value, torch.Tensor) and value.shape[0] == B:
+                                mb_obs[key] = value[mb]
+                            else:
+                                mb_obs[key] = value
+                        mb_result.append(mb_obs)
+                    else:
+                        assert obs.shape[0] == B
+                        mb_result.append(obs[mb])
+
+                yield tuple(mb_result)
 
     def load_state_dict(self, sd):
         super().load_state_dict(sd)
