@@ -516,3 +516,14 @@ total reward is error before + lp = error before + (error before - error after)
 
 now using sliding window instead of full batches for cpc loss
 added computation of maze coverage to rl maze env
+
+
+## Fri Apr 24 10:04:13 AM UTC 2026
+
+maybe one-step cpc error would work best for reward computation
+
+# Sun Apr 26 10:28:02 PM UTC 2026
+
+update ppo and vpg and reinforce impl
+
+need to add GAE to vpg and ppo
