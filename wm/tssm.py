@@ -249,7 +249,6 @@ class TSSMDiscretePredictor(DiscreteLatentPredictorBase):
         self,
         obs,
         attention_window=None,
-        return_state=False,
         episode_start=None,
     ):
         need_aux = episode_start is None
@@ -262,5 +261,5 @@ class TSSMDiscretePredictor(DiscreteLatentPredictorBase):
         return {
             "preds": outputs,
             "aux": aux_inputs if need_aux else None,
-            "state": last_state if return_state else None,
+            "state": last_state
         }

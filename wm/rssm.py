@@ -9,6 +9,8 @@ from torch import nn
 
 from base import DiscreteLatentPredictorBase
 from transformer import LlamaRMSNorm
+
+
 class RSSMDiscretePredictor(DiscreteLatentPredictorBase):
     def __init__(
         self,
@@ -226,5 +228,5 @@ class RSSMDiscretePredictor(DiscreteLatentPredictorBase):
         return {
             "preds": outputs,
             "aux": aux_inputs if need_aux else None,
-            "state": last_state if return_state else None,
+            "state": last_state
         }

@@ -19,7 +19,8 @@ import torch
 from agent_utils_wm import MAZE_WM_MODEL_DEFAULTS, add_create_model_args, extract_create_model_args
 from log import Logger
 from sample import DiscreteActionSampler
-from wm_joint_agent import JointWMReinforce, WMActionHeadPolicy, create_maze_world_model
+from wm_joint_agent import JointWMReinforce, create_maze_world_model, JointWMPPO
+from policy_head import WMActionHeadPolicy, WMValueHeadPolicy
 
 
 THIS_DIR = Path(__file__).resolve().parent
@@ -209,16 +210,22 @@ def main():
         heading_smoothing=args.wm_heading_smoothing,
         sensor_max_bin=args.wm_sensor_max_bin,
     )
+    policy_input_dim = int(wm_model_args.hidden_size)
     policy_module = WMActionHeadPolicy(
-        wm_model=wm_model,
         action_table=base_env.action_table,
         device=torch.device(args.device),
-        backprop_through_wm=args.policy_backprop_through_wm,
+        input_dim=policy_input_dim
+    )
+    
+    value = WMValueHeadPolicy(
+        device=torch.device(args.device),
+        input_dim=policy_input_dim
     )
 
 
-    agent = JointWMReinforce(
+    agent = JointWMPPO(
         policy=policy_module,
+        value=value,
         sampler=DiscreteActionSampler(),
         policy_lr=args.policy_lr,
         num_envs=env.num_envs,

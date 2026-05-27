@@ -2,12 +2,12 @@ WORLD MODELS
 World models are models that infer world state from observations and predict how this state evolves given actions. This allows to train policy in virtual episodes.
 Here we describe to prominent models Dreamer v3 and TWISTER and their components.
 
-https://arxiv.org/pdf/1807.03748 
+https://arxiv.org/pdf/1807.03748
 https://arxiv.org/pdf/2503.04416
 
 Key components of DREAMER/TWISTER
 
-ht =Fϕ​(ht-1,zt-1​,at−1​)  - context encoder e.g. RNN or transformer. 
+ht =Fϕ​(ht-1,zt-1​,at−1​)  - context encoder e.g. RNN or transformer.
 zt ∼ qϕ(zt | ot)  - observation encoder, models distribution of z_t given only current observation ot e.g. VAE encoder in dreamer v3 its zt ∼ qϕ(* | ot, ht) .
 zt ∼ dϕ(zt | ht) - dynamics predictor: models distribution of world state given context. Virtually this predicts how world changes given previous state and action at-1which encoded in ht
 st = {ht, zt} - concatenation of context and world state.
@@ -27,19 +27,19 @@ It is also possible to learn other useful signals such as rewards and episode te
 
 Action Conditioned (AC-CPC)
 This is TWISTER component that is responsible for et= u (zt)training.
-This is an architecture that allows compressing high-dimensional observations into useful representations. 
+This is an architecture that allows compressing high-dimensional observations into useful representations.
 
 
-RSSM stands for Recurrent State-Space Model. This is a part of dreamer that constitutes the world model. In TWISTER it is TSSM - transformer instead of recurrent model.  
+RSSM stands for Recurrent State-Space Model. This is a part of dreamer that constitutes the world model. In TWISTER it is TSSM - transformer instead of recurrent model.
 There are two key differences:
 Dreamer updates distribution zt ∼ dϕ(* | ht) to match different encoder: zt ∼ qϕ(* | ot, ht).
-This is very similar to recursive Bayesian estimation or Bayesian filtering, very similar to the inference in the hidden-markov model. Unlike TWISTER which uses zt ∼ qϕ(* | ot) 
-AC-CPC/TWISTER contrastive loss for embeddings additionally to reconstructive loss in Dreamer. 
+This is very similar to recursive Bayesian estimation or Bayesian filtering, very similar to the inference in the hidden-markov model. Unlike TWISTER which uses zt ∼ qϕ(* | ot)
+AC-CPC/TWISTER contrastive loss for embeddings additionally to reconstructive loss in Dreamer.
 
 Another minor difference decoder in dreamer is ot ∼ pϕ(ot | st)
 
 Having said that it helps to concatenate many observations ot or use dreamer style encoder  qϕ(zt | ot, ht) for AC-CPC.
-Both methods are reported to work best with discrete distribution of world states  zt.  though can be used with different distributions. 
+Both methods are reported to work best with discrete distribution of world states  zt.  though can be used with different distributions.
 
 
 conceptually:

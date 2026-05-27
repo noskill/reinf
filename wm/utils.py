@@ -12,6 +12,8 @@ from torch import nn
 
 def sg(x: torch.Tensor) -> torch.Tensor:
     return x.detach()
+
+
 def make_probe_head(in_dim: int, out_dim: int, hidden_dim: int, num_layers: int) -> nn.Module:
     """Build probe head with configurable depth (number of Linear layers)."""
     layers = int(num_layers)
@@ -33,6 +35,8 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
 def masked_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     # mask: True for padded -> ignore
     valid = ~mask

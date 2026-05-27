@@ -201,12 +201,14 @@ def create_agent(args_cli, env_cfg, env, logger):
     policy_lr = args_cli.policy_lr if args_cli.policy_lr is not None else policy_lr_default
     value_lr = args_cli.value_lr if args_cli.value_lr is not None else value_lr_default
     disc_lr = args_cli.disc_lr if args_cli.disc_lr is not None else disc_lr_default
+    exp_adv = args_cli.exp_adv
 
     discount = 0.99
     entropy_coef = 0.02
 
     common_args = dict(state_extractor=state_extractor,
-                       target_entropy=target_entropy)
+                       target_entropy=target_entropy,
+                       exp_adv=exp_adv)
     if args_cli.algorithm == "ppo":
         policy, value = build_networks()
         num_learning_epochs = 4

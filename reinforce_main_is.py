@@ -34,6 +34,7 @@ parser.add_argument("--n-episodes", type=int, default=1500, help="number of epis
 parser.add_argument("--disc-lr", type=float, default=None, help="learning rate of descriminator in DIAYN")
 parser.add_argument("--policy-lr", type=float, default=None, help="learning rate of policy function")
 parser.add_argument("--value-lr", type=float, default=None, help="learning rate of value function")
+parser.add_argument("--exp-adv", default=False, action="store_true", help="use exponential advantage scaling")
 parser.set_defaults(flatten_obs=True)
 # Let AppLauncher add its own CLI args.
 AppLauncher.add_app_launcher_args(parser)

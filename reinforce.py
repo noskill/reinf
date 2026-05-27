@@ -18,14 +18,13 @@ class ReinforceBase(Agent):
         policy,
         sampler,
         policy_lr=0.001,
-        value_lr=0.001,
         num_envs=8,
         discount=0.99,
         device=torch.device("cpu"),
         logger=None,
         entropy_coef=0.005,
-        sequence_model=False,
         target_entropy=2,
+        exp_adv=False,
         **kwargs
     ):
         self.num_envs = num_envs
@@ -43,15 +42,18 @@ class ReinforceBase(Agent):
         super().__init__(logger=logger, **kwargs)
         self.target_entropy = torch.tensor(target_entropy, dtype=torch.float16)
         self.mu_coef = 0.001
+        self.exp_adv_scale_coeff = 0.5
         self.hparams.update( {
             'policy_lr': policy_lr,
             'discount': discount,
             'entropy_coef': self.entropy_coef,
-            'entropy_thresh': target_entropy
+            'entropy_thresh': target_entropy,
+            'exp_adv_scale_coeff': self.exp_adv_scale_coeff,
+            'exp_adv': 'exp_adv'
         })
+        self.exp_adv_scale = exp_adv
         self.state_normalizer = None
         self.data_types = ['states', 'actions', 'log_probs', 'entropy', 'rewards']
-        self.is_sequence_model = sequence_model
         self.log_hparams()
 
     def create_optimizers(self, **kwargs):
@@ -228,6 +230,8 @@ class ReinforceBase(Agent):
         key_padding_mask = key_padding_mask.to(self.device)
         returns_padded = padded['returns'].to(self.device)
         normalized_returns, _, _ = normalize_padded_returns(returns_padded, key_padding_mask)
+        if self.exp_adv_scale:
+            return torch.exp(normalized_returns / self.exp_adv_scale_coeff)
         return normalized_returns
 
     def _extract_episode_data(self, episodes) -> EpisodeBatch:

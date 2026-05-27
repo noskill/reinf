@@ -33,7 +33,6 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         probe_layers: int = 2,
         contrastive_dim: int = 0,
         contrastive_steps: int = 1,
-        detach_action_heads: bool = True,
     ):
         super().__init__()
         self.backbone = LlamaModel(config)
@@ -49,7 +48,6 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         self.probe_layers = int(probe_layers)
         self.contrastive_dim = int(contrastive_dim)
         self.contrastive_steps = int(contrastive_steps)
-        self.detach_action_heads = bool(detach_action_heads)
         if self.probe_hidden_dim < 0:
             raise ValueError("probe_hidden_dim must be >= 0")
         if self.probe_layers < 1:
@@ -190,7 +188,7 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         # State probes (current-step location/heading) read detached state.
         h_probe = h.detach()
         # Action heads use detached or live state based on constructor setting.
-        action_feat = h_probe if self.detach_action_heads else h
+        action_feat = h_probe
         loc_x = self.loc_x_head(h_probe)
         loc_y = self.loc_y_head(h_probe)
         heading = self.heading_head(h_probe)
@@ -208,7 +206,6 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
     def forward(
         self,
         obs,
-        return_state=False,
         episode_start=None,
     ):
         need_aux = episode_start is None
@@ -220,7 +217,7 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         return {
             "preds": preds,
             "aux": aux_inputs if need_aux else None,
-            "state": last_state if return_state else None,
+            "state": last_state,
         }
 
 
@@ -244,7 +241,6 @@ class RNNPredictor(TransformerBaseline):
         state_norm: str = "none",
         contrastive_dim: int = 0,
         contrastive_steps: int = 1,
-        detach_action_heads: bool = True,
     ):
         super().__init__(
             config,
@@ -262,7 +258,6 @@ class RNNPredictor(TransformerBaseline):
             probe_layers=probe_layers,
             contrastive_dim=contrastive_dim,
             contrastive_steps=contrastive_steps,
-            detach_action_heads=detach_action_heads,
         )
         self.state_norm = str(state_norm)
         if self.state_norm not in {"none", "layernorm", "rmsnorm"}:
@@ -351,7 +346,7 @@ class RNNPredictor(TransformerBaseline):
         # State probes (current-step location/heading) read detached state.
         h_probe = h.detach()
         # Action heads use detached or live state based on constructor setting.
-        action_feat = h_probe if self.detach_action_heads else h
+        action_feat = h_probe
         loc_x = self.loc_x_head(h_probe)
         loc_y = self.loc_y_head(h_probe)
         heading = self.heading_head(h_probe)
