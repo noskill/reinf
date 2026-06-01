@@ -137,7 +137,7 @@ def main():
         "--log-dir",
         type=str,
         default=None,
-        help="TensorBoard log directory (default: logs/wm_train/<save_path_stem>).",
+        help="TensorBoard log directory (default: logs/runs/wm_train/<save_path_stem>).",
     )
     parser.add_argument("--sensor-weight", type=float, default=1.0)
     parser.add_argument("--loc-weight", type=float, default=1.0)
@@ -178,7 +178,7 @@ def main():
 
     set_seed(args.seed)
     save_stem = os.path.splitext(os.path.basename(args.save_path))[0]
-    log_dir = args.log_dir or os.path.join("logs", "wm_train", save_stem)
+    log_dir = args.log_dir or os.path.join("logs", "runs/wm_train", save_stem)
     logger = Logger(log_dir=log_dir)
 
     episodes = load_episodes(args.data, max_episodes=args.max_episodes)

@@ -500,7 +500,7 @@ def main():
                 "key_padding_mask": kpm,
             }
 
-            out = model(obs_batch, return_state=True)
+            out = model(obs_batch)
             h_prev = None
             z_prev_flat = None
             if isinstance(model, (RSSMDiscretePredictor, TSSMDiscretePredictor)):

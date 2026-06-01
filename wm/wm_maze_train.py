@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
 import shlex
@@ -21,6 +22,7 @@ from log import Logger
 from sample import DiscreteActionSampler
 from wm_joint_agent import JointWMReinforce, create_maze_world_model, JointWMPPO
 from policy_head import WMActionHeadPolicy, WMValueHeadPolicy
+from util import copy_python_sources
 
 
 THIS_DIR = Path(__file__).resolve().parent
@@ -110,6 +112,12 @@ def parse_args():
     parser.add_argument("--policy-lr", type=float, default=3e-4)
     parser.add_argument("--discount", type=float, default=0.99)
     parser.add_argument("--entropy-coef", type=float, default=0.01)
+    parser.add_argument(
+        "--target-entropy",
+        type=float,
+        default=None,
+        help="Policy entropy target. Default: 0.5 * log(action_dim).",
+    )
     parser.set_defaults(policy_backprop_through_wm=True)
     parser.add_argument(
         "--policy-backprop-through-wm",
@@ -130,6 +138,13 @@ def parse_args():
     parser.add_argument("--wm-updates-per-policy", type=int, default=1)
     parser.add_argument("--wm-replay-capacity", type=int, default=2048)
     parser.add_argument("--wm-train-episodes", type=int, default=64)
+    parser.add_argument("--wm-divergence-novelty-coef", type=float, default=0.0)
+    parser.add_argument(
+        "--wm-fixed",
+        action="store_true",
+        default=False,
+        help="Freeze world model updates and train policy/value only.",
+    )
     add_create_model_args(
         parser,
         arg_prefix="wm",
@@ -160,7 +175,13 @@ def main():
     run_dir = args.experiment_dir or default_experiment_dir(args.experiment_name)
     checkpoint_dir = os.path.join(run_dir, "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
-    save_run_args(args, run_dir)
+    copy_python_sources(str(THIS_DIR), run_dir)
+    lockfile_path = os.path.join(run_dir, "lock.file")
+    if os.path.exists(lockfile_path):
+        print(f"lockfile exists {lockfile_path}")
+        return
+    with open(lockfile_path, "w", encoding="utf-8"):
+        pass
 
     if args.render and args.num_envs != 1:
         raise ValueError("--render requires --num-envs 1")
@@ -179,6 +200,12 @@ def main():
         device=args.device,
     )
     env = MazeTrainerEnvAdapter(base_env)
+    action_dim = int(base_env.action_space_n)
+    target_entropy = args.target_entropy
+    if target_entropy is None:
+        target_entropy = 0.5 * math.log(action_dim)
+    args.target_entropy = float(target_entropy)
+    save_run_args(args, run_dir)
 
     logger = Logger(run_dir)
     if args.wm_contrastive_dim <= 0:
@@ -235,11 +262,14 @@ def main():
         action_table=base_env.action_table,
         device=torch.device(args.device),
         entropy_coef=args.entropy_coef,
+        target_entropy=args.target_entropy,
         intrinsic_reward_scale=args.intrinsic_reward_scale,
         env_reward_scale=args.env_reward_scale,
         wm_updates_per_policy=args.wm_updates_per_policy,
         wm_replay_capacity=args.wm_replay_capacity,
         wm_train_episodes=args.wm_train_episodes,
+        wm_divergence_novelty_coef=args.wm_divergence_novelty_coef,
+        wm_fixed=args.wm_fixed,
         sensor_max_bin=args.wm_sensor_max_bin,
         maze_dim=maze_dim,
         wm_weight_decay=args.wm_weight_decay,

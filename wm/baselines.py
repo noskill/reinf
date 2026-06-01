@@ -201,7 +201,7 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
             aux_inputs["contrastive_pred_emb_steps"] = self._project_contrastive_pred_steps(h, actions)
 
         preds = (pred_sensor, loc_x, loc_y, heading, turn, step)
-        return preds, aux_inputs, h[:, -1, :]
+        return preds, aux_inputs, h, h[:, -1, :]
 
     def forward(
         self,
@@ -209,7 +209,7 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         episode_start=None,
     ):
         need_aux = episode_start is None
-        preds, aux_inputs, last_state = self._forward_core(
+        preds, aux_inputs, state_seq, last_state = self._forward_core(
             obs,
             episode_start=episode_start,
             need_aux=need_aux,
@@ -218,6 +218,8 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
             "preds": preds,
             "aux": aux_inputs if need_aux else None,
             "state": last_state,
+            "state_last": last_state,
+            "state_seq": state_seq,
         }
 
 
@@ -359,7 +361,7 @@ class RNNPredictor(TransformerBaseline):
             aux_inputs["contrastive_pred_emb_steps"] = self._project_contrastive_pred_steps(h, actions)
 
         preds = (pred_sensor, loc_x, loc_y, heading, turn, step)
-        return preds, aux_inputs, h[:, -1, :]
+        return preds, aux_inputs, h, h[:, -1, :]
 
     def window_iterate(self, x, h0):
         all_h_chunks = []

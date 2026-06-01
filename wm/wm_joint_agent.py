@@ -16,6 +16,7 @@ from baselines import TransformerBaseline
 from pool import EpisodesOldPoolMixin
 from reinforce import Reinforce
 from ppo import PPO
+from util import RunningNorm
 from utils import make_label_smoothing_table, make_soft_table
 
 
@@ -103,9 +104,11 @@ class BaseWMOnPolicy:
         intrinsic_reward_scale: float = 1.0,
         env_reward_scale: float = 1.0,
         wm_updates_per_policy: int = 1,
+        wm_fixed: bool = False,
         wm_replay_capacity: int = 2048,
         wm_train_episodes: int = 64,
         wm_stability_coef: float = 1e-4,
+        wm_divergence_novelty_coef: float = 0.0,
         sensor_max_bin: int = 64,
         maze_dim: int = 10,
         **kwargs
@@ -115,9 +118,11 @@ class BaseWMOnPolicy:
         self.intrinsic_reward_scale = float(intrinsic_reward_scale)
         self.env_reward_scale = float(env_reward_scale)
         self.wm_updates_per_policy = int(wm_updates_per_policy)
+        self.wm_fixed = bool(wm_fixed)
         self.wm_replay_capacity = int(wm_replay_capacity)
         self.wm_train_episodes = int(wm_train_episodes)
         self.wm_stability_coef = float(wm_stability_coef)
+        self.wm_divergence_novelty_coef = float(wm_divergence_novelty_coef)
         self.sensor_max_bin = int(sensor_max_bin)
         self.maze_dim = int(maze_dim)
 
@@ -145,6 +150,19 @@ class BaseWMOnPolicy:
         self.action_step_ids = torch.tensor(step_ids, dtype=torch.long, device=self.device)
         self.action_cont_table = torch.stack([self._turn_vals, self._step_vals], dim=-1)
         self.action_dim = int(self.action_cont_table.shape[-1])
+        self._divergence_running_norm = RunningNorm(device=self.device)
+        self._episode_novelty_running_norm = RunningNorm(device=self.device)
+        self.hparams.update({
+            "wm_updates_per_policy": self.wm_updates_per_policy,
+            "wm_fixed": self.wm_fixed,
+            "wm_replay_capacity": self.wm_replay_capacity,
+            "wm_train_episodes": self.wm_train_episodes,
+            "wm_stability_coef": self.wm_stability_coef,
+            "wm_divergence_novelty_coef": self.wm_divergence_novelty_coef,
+            "intrinsic_reward_scale": self.intrinsic_reward_scale,
+            "env_reward_scale": self.env_reward_scale,
+        })
+        self.log_hparams()
         self.create_wm_optimizers(**kwargs)
 
     def create_wm_optimizers(self, **kwargs):
@@ -225,7 +243,7 @@ class BaseWMOnPolicy:
 
     def process_states(self, state, episode_start):
         wm_out = self.call_wm(state, episode_start)
-        wm_state = wm_out.get("state")
+        wm_state = wm_out["state_last"]
         return wm_state.detach()
 
     def get_action(self, state, episode_start):
@@ -262,12 +280,15 @@ class BaseWMOnPolicy:
 
         self.add_transition_batch(policy_states, actions, log_probs, entropy)
         wm_states = {
-            "sensor": state["sensor"],
-            "heading_idx": state["heading_idx"],
-            "location": state["location"],
-            "policy_state": policy_states,
+            "sensor": state["sensor"].detach().to("cpu"),
+            "heading_idx": state["heading_idx"].detach().to("cpu"),
+            "location": state["location"].detach().to("cpu"),
+            "policy_state": policy_states.detach().to("cpu"),
         }
-        self._wm_pool.add_transition_batch(wm_states, actions, torch.zeros_like(log_probs), torch.zeros_like(entropy))
+        actions_cpu = actions.detach().to("cpu")
+        log_probs_cpu = torch.zeros_like(log_probs).detach().to("cpu")
+        entropy_cpu = torch.zeros_like(entropy).detach().to("cpu")
+        self._wm_pool.add_transition_batch(wm_states, actions_cpu, log_probs_cpu, entropy_cpu)
         self.record_sampled_actions(actions)
         return actions
 
@@ -275,7 +296,7 @@ class BaseWMOnPolicy:
         env_rewards = self.env_reward_scale * rewards
         for env_idx in range(self.num_envs):
             self.add_reward(env_idx, env_rewards[env_idx])
-            self._wm_pool.add_reward(env_idx, env_rewards[env_idx])
+            self._wm_pool.add_reward(env_idx, env_rewards[env_idx].detach().to("cpu"))
         self.process_dones(dones)
         self._wm_pool.process_dones(dones)
   
@@ -287,21 +308,36 @@ class BaseWMOnPolicy:
         replay_episodes = self._sample_replay_episodes()
         obs_mix, targets_mix, _ = self._build_wm_batch(wm_new_episodes + replay_episodes)
         obs_new, targets_new, _ = self._build_wm_batch(wm_new_episodes)
-        wm_updates = max(1, self.wm_updates_per_policy)
+        wm_updates = 0 if self.wm_fixed else max(1, self.wm_updates_per_policy)
+        wm_updates_for_logging = max(1, wm_updates)
         wm_loss_sums: Dict[str, float] = {}
         wm_metric_sums: Dict[str, float] = {}
         total_loss_sum = 0.0
         wm_loss_sum = 0.0
 
-        self.wm_model.train()
+        if self.wm_fixed:
+            self.wm_model.eval()
+        else:
+            self.wm_model.train()
         self.policy.train()
         cpc_error_before = self._evaluate_step_cpc_error_no_grad(self.wm_model, obs_new, targets_new)
-        old_state = None
-        if self.wm_stability_coef > 0.0:
-            with torch.no_grad():
-                state_out = self.wm_model(obs_new)
-                old_state = state_out["state"]
-                old_state = old_state.detach()
+        with torch.no_grad():
+            state_out = self.wm_model(obs_new)
+            old_state_seq = state_out["state_seq"].detach()
+        divergence_novelty = self._compute_state_divergence_novelty(
+            state_seq=old_state_seq,
+            key_padding_mask=obs_new["key_padding_mask"],
+        )
+        episode_novelty = self._compute_episode_novelty(
+            state_seq=old_state_seq,
+            key_padding_mask=obs_new["key_padding_mask"],
+        )
+        novelty_signal = 0.5 * (divergence_novelty + episode_novelty)
+        self._log_novelty_vs_distance_from_start(
+            novelty_signal=novelty_signal,
+            wm_episodes=wm_new_episodes,
+            key_padding_mask=obs_new["key_padding_mask"],
+        )
 
         for _ in range(wm_updates):
             # World-model update on mixed dataset.
@@ -317,12 +353,12 @@ class BaseWMOnPolicy:
             wm_loss_base = self._compute_wm_total_loss(wm_loss_results)
             wm_stability_loss = torch.tensor(0.0, dtype=torch.float32, device=self.device)
             wm_state_drift = torch.tensor(0.0, dtype=torch.float32, device=self.device)
-            if old_state is not None:
+            if self.wm_stability_coef > 0.0:
                 state_out = self.wm_model(obs_new)
-                new_state = state_out["state"]
+                new_state = state_out["state_seq"]
                 wm_stability_loss, wm_state_drift = self._compute_state_stability_loss(
                     new_state=new_state,
-                    old_state=old_state,
+                    old_state=old_state_seq,
                     key_padding_mask=obs_new["key_padding_mask"],
                 )
             wm_loss = wm_loss_base + self.wm_stability_coef * wm_stability_loss
@@ -340,18 +376,22 @@ class BaseWMOnPolicy:
                 wm_metric_sums[key] = wm_metric_sums.get(key, 0.0) + self._as_scalar(value)
             wm_metric_sums["state_drift"] = wm_metric_sums.get("state_drift", 0.0) + self._as_scalar(wm_state_drift)
 
-        cpc_error_after = self._evaluate_step_cpc_error_no_grad(self.wm_model, obs_new, targets_new)
-        lp_rewards_new = cpc_error_before - cpc_error_after
-        self.logger.log_scalar("reward/lp_mean", lp_rewards_new.detach().mean().cpu().item())
-        self.logger.log_scalar("reward/surprise_mean", cpc_error_before.detach().mean().cpu().item() * 0.001)
-        reward_with_surprise = lp_rewards_new + cpc_error_before * 0.001
-        intrinsic_rewards = self.intrinsic_reward_scale * reward_with_surprise
-        for ep_idx, episode in enumerate(policy_episodes[: intrinsic_rewards.shape[0]]):
-            max_t = min(len(episode) - 1, intrinsic_rewards.shape[1])
-            for t in range(max_t):
-                transition = episode[t]
-                updated_reward = torch.as_tensor(transition[4], dtype=torch.float32, device=self.device) + intrinsic_rewards[ep_idx, t]
-                episode[t] = (transition[0], transition[1], transition[2], transition[3], updated_reward)
+        if wm_updates > 0:
+            cpc_error_after = self._evaluate_step_cpc_error_no_grad(self.wm_model, obs_new, targets_new)
+        else:
+            cpc_error_after = cpc_error_before
+        intrinsic_rewards = self._compute_intrinsic_rewards(
+            cpc_error_before=cpc_error_before,
+            cpc_error_after=cpc_error_after,
+            key_padding_mask=obs_new["key_padding_mask"],
+            divergence_novelty=divergence_novelty,
+            episode_novelty=episode_novelty,
+            policy_episodes=policy_episodes,
+        )
+        self._log_intrinsic_vs_episode_coverage(
+            intrinsic_rewards=intrinsic_rewards,
+            wm_episodes=wm_new_episodes,
+        )
 
         episode_batch = self._prepare_episode_batch(policy_episodes)
         self.train_policy_batch(episode_batch)
@@ -362,13 +402,14 @@ class BaseWMOnPolicy:
         self._wm_pool.clear_completed()
         scalar_sums = {
             "joint/loss_total": total_loss_sum,
-            "reward/intrinsic_mean": float(intrinsic_rewards.mean().detach().cpu()) * wm_updates,
+            "reward/intrinsic_mean": float(intrinsic_rewards.mean().detach().cpu()) * wm_updates_for_logging,
             "wm/loss/total": wm_loss_sum,
         }
         extra_scalars = {
+            "wm/fixed": float(self.wm_fixed),
+            "wm/actual_updates": float(wm_updates),
             "wm/replay_size": float(len(self._wm_pool.episode_pool)),
             "wm/replay_sampled_episodes": float(len(replay_episodes)),
-            "wm/stability_coef": float(self.wm_stability_coef),
             "wm/policy_sampled_episodes": float(len(policy_episodes)),
             "wm/joint_sampled_episodes": float(len(wm_new_episodes) + len(replay_episodes)),
             "wm/joint_sampled_transitions": float(
@@ -377,7 +418,7 @@ class BaseWMOnPolicy:
             ),
         }
         self._log_update_stats(
-            updates=wm_updates,
+            updates=wm_updates_for_logging,
             scalar_sums=scalar_sums,
             extra_scalars=extra_scalars,
             wm_loss_sums=wm_loss_sums,
@@ -386,6 +427,223 @@ class BaseWMOnPolicy:
         )
 
         return True
+
+    def _compute_intrinsic_rewards(
+        self,
+        *,
+        cpc_error_before: torch.Tensor,
+        cpc_error_after: torch.Tensor,
+        key_padding_mask: torch.Tensor,
+        divergence_novelty: torch.Tensor,
+        episode_novelty: torch.Tensor,
+        policy_episodes,
+    ) -> torch.Tensor:
+        lp_rewards_new = cpc_error_before - cpc_error_after
+        valid = ~key_padding_mask
+        self.logger.log_scalar("reward/lp_mean", lp_rewards_new.detach().mean().cpu().item())
+        self.logger.log_scalar("reward/surprise_mean", cpc_error_before.detach().mean().cpu().item() * 0.001)
+        reward_with_surprise = lp_rewards_new + cpc_error_before * 0.001
+        novelty_signal = 0.5 * (divergence_novelty + episode_novelty)
+        self.logger.log_scalar("reward/novelty_signal_mean", self._masked_mean(novelty_signal, valid))
+        novelty_coef_effective = torch.tensor(
+            self.wm_divergence_novelty_coef, dtype=reward_with_surprise.dtype, device=reward_with_surprise.device
+        )
+        if valid.any():
+            base_abs = reward_with_surprise[valid].abs().mean()
+            novelty_abs = novelty_signal[valid].abs().mean()
+            novelty_scale = (base_abs / (novelty_abs + 1e-6)).clamp(0.1, 10.0)
+            novelty_coef_effective = novelty_coef_effective * novelty_scale
+            self.logger.log_scalar("reward/novelty_scale", novelty_scale.detach().cpu().item())
+            self.logger.log_scalar("reward/lp_surprise_abs_mean", base_abs.detach().cpu().item())
+            self.logger.log_scalar(
+                "reward/novelty_contrib_abs_mean",
+                (novelty_coef_effective * novelty_signal[valid]).abs().mean().detach().cpu().item(),
+            )
+        self.logger.log_scalar("reward/novelty_coef_effective", novelty_coef_effective.detach().cpu().item())
+        reward_with_surprise = reward_with_surprise + novelty_coef_effective * novelty_signal
+        intrinsic_rewards = self.intrinsic_reward_scale * reward_with_surprise
+        self._log_first_last_window_means(
+            values=intrinsic_rewards,
+            valid_mask=valid,
+            metric_prefix="reward/intrinsic",
+        )
+
+        for ep_idx, episode in enumerate(policy_episodes[: intrinsic_rewards.shape[0]]):
+            max_t = min(len(episode) - 1, intrinsic_rewards.shape[1])
+            for t in range(max_t):
+                transition = episode[t]
+                updated_reward = torch.as_tensor(transition[4], dtype=torch.float32, device=self.device) + intrinsic_rewards[ep_idx, t]
+                episode[t] = (transition[0], transition[1], transition[2], transition[3], updated_reward)
+
+        return intrinsic_rewards
+
+    @staticmethod
+    def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> float:
+        if mask.any():
+            return values[mask].detach().mean().cpu().item()
+        return 0.0
+
+    @staticmethod
+    def _first_last_window_masks(valid_mask: torch.Tensor, window_size: int = 20) -> Tuple[torch.Tensor, torch.Tensor]:
+        time_idx = torch.arange(valid_mask.shape[1], device=valid_mask.device).unsqueeze(0)
+        first_window = min(window_size, valid_mask.shape[1])
+        last_window_start = max(0, valid_mask.shape[1] - window_size)
+        first_mask = valid_mask & (time_idx < first_window)
+        last_mask = valid_mask & (time_idx >= last_window_start)
+        return first_mask, last_mask
+
+    def _log_first_last_window_means(
+        self,
+        *,
+        values: torch.Tensor,
+        valid_mask: torch.Tensor,
+        metric_prefix: str,
+        window_size: int = 20,
+    ) -> Tuple[float, float]:
+        first_mask, last_mask = self._first_last_window_masks(valid_mask, window_size=window_size)
+        first_mean = self._masked_mean(values, first_mask)
+        last_mean = self._masked_mean(values, last_mask)
+        if self.logger is not None:
+            self.logger.log_scalar(f"{metric_prefix}_first{window_size}_mean", first_mean)
+            self.logger.log_scalar(f"{metric_prefix}_last{window_size}_mean", last_mean)
+        return first_mean, last_mean
+
+    def _log_intrinsic_vs_episode_coverage(
+        self,
+        *,
+        intrinsic_rewards: torch.Tensor,
+        wm_episodes,
+        log_name='intrinsic'
+    ) -> None:
+        if self.logger is None:
+            return
+        max_rows = min(len(wm_episodes), int(intrinsic_rewards.shape[0]))
+        if max_rows <= 0:
+            return
+        reward_sums = []
+        coverage_vals = []
+        max_cells = float(self.maze_dim * self.maze_dim)
+        for ep_idx in range(max_rows):
+            episode = wm_episodes[ep_idx]
+            ep_len = min(len(episode) - 1, int(intrinsic_rewards.shape[1]))
+            if ep_len <= 0:
+                continue
+            reward_sum = intrinsic_rewards[ep_idx, :ep_len].detach().sum().cpu().item()
+            visited = set()
+            for t in range(min(len(episode), ep_len + 1)):
+                state_t = episode[t][0]
+                loc_t = state_t["location"]
+                if isinstance(loc_t, torch.Tensor):
+                    x = int(loc_t[0].item())
+                    y = int(loc_t[1].item())
+                else:
+                    x = int(loc_t[0])
+                    y = int(loc_t[1])
+                visited.add((x, y))
+            coverage = len(visited) / max_cells
+            reward_sums.append(reward_sum)
+            coverage_vals.append(coverage)
+        if not reward_sums:
+            return
+        rewards_t = torch.tensor(reward_sums, dtype=torch.float32, device=self.device)
+        coverage_t = torch.tensor(coverage_vals, dtype=torch.float32, device=self.device)
+        if rewards_t.numel() >= 2:
+            rewards_c = rewards_t - rewards_t.mean()
+            coverage_c = coverage_t - coverage_t.mean()
+            denom = rewards_c.norm() * coverage_c.norm()
+            if denom > 0:
+                corr = (rewards_c * coverage_c).sum() / denom
+            else:
+                corr = torch.tensor(0.0, dtype=torch.float32, device=self.device)
+        else:
+            corr = torch.tensor(0.0, dtype=torch.float32, device=self.device)
+        self.logger.log_scalar("reward/intrinsic_episode_sum_mean", rewards_t.mean().item())
+        self.logger.log_scalar("episode/location_coverage_mean", coverage_t.mean().item())
+        self.logger.log_scalar("reward/intrinsic_vs_episode_coverage_corr", corr.item())
+
+    def _log_novelty_vs_distance_from_start(
+        self,
+        *,
+        novelty_signal: torch.Tensor,
+        wm_episodes,
+        key_padding_mask: torch.Tensor,
+    ) -> None:
+        max_rows = min(len(wm_episodes), int(novelty_signal.shape[0]))
+        if max_rows <= 0:
+            return
+        max_len = int(novelty_signal.shape[1])
+        distance = torch.zeros((max_rows, max_len), dtype=torch.float32, device=self.device)
+        valid = torch.zeros((max_rows, max_len), dtype=torch.bool, device=self.device)
+        for ep_idx in range(max_rows):
+            episode = wm_episodes[ep_idx]
+            ep_len = min(len(episode) - 1, max_len)
+            if ep_len <= 0:
+                continue
+            loc_start = episode[0][0]["location"]
+            if isinstance(loc_start, torch.Tensor):
+                x0 = float(loc_start[0].item())
+                y0 = float(loc_start[1].item())
+            else:
+                x0 = float(loc_start[0])
+                y0 = float(loc_start[1])
+            for t in range(ep_len):
+                loc_t = episode[t][0]["location"]
+                if isinstance(loc_t, torch.Tensor):
+                    xt = float(loc_t[0].item())
+                    yt = float(loc_t[1].item())
+                else:
+                    xt = float(loc_t[0])
+                    yt = float(loc_t[1])
+                dx = xt - x0
+                dy = yt - y0
+                distance[ep_idx, t] = (dx * dx + dy * dy) ** 0.5
+            valid[ep_idx, :ep_len] = True
+
+        valid = valid & (~key_padding_mask[:max_rows, :max_len])
+        if not valid.any():
+            return
+
+        novelty_valid = novelty_signal[:max_rows, :max_len][valid].to(torch.float32)
+        distance_valid = distance[valid].to(torch.float32)
+        if novelty_valid.numel() >= 2:
+            novelty_centered = novelty_valid - novelty_valid.mean()
+            distance_centered = distance_valid - distance_valid.mean()
+            denom_step = novelty_centered.norm() * distance_centered.norm()
+            if denom_step > 0:
+                step_corr = (novelty_centered * distance_centered).sum() / denom_step
+            else:
+                step_corr = torch.tensor(0.0, dtype=torch.float32, device=self.device)
+        else:
+            step_corr = torch.tensor(0.0, dtype=torch.float32, device=self.device)
+        self.logger.log_scalar("reward/novelty_vs_distance_from_start_step_corr", step_corr.item())
+        self.logger.log_scalar("episode/distance_from_start_mean", distance_valid.mean().item())
+        self._log_first_last_window_means(
+            values=distance,
+            valid_mask=valid,
+            metric_prefix="episode/distance_from_start",
+        )
+
+        novelty_episode_means = []
+        distance_episode_means = []
+        for ep_idx in range(max_rows):
+            episode_valid = valid[ep_idx]
+            if not episode_valid.any():
+                continue
+            novelty_episode_means.append(novelty_signal[ep_idx][episode_valid].mean())
+            distance_episode_means.append(distance[ep_idx][episode_valid].mean())
+        if len(novelty_episode_means) >= 2:
+            novelty_episode = torch.stack(novelty_episode_means).to(torch.float32)
+            distance_episode = torch.stack(distance_episode_means).to(torch.float32)
+            novelty_episode = novelty_episode - novelty_episode.mean()
+            distance_episode = distance_episode - distance_episode.mean()
+            denom_episode = novelty_episode.norm() * distance_episode.norm()
+            if denom_episode > 0:
+                episode_corr = (novelty_episode * distance_episode).sum() / denom_episode
+            else:
+                episode_corr = torch.tensor(0.0, dtype=torch.float32, device=self.device)
+        else:
+            episode_corr = torch.tensor(0.0, dtype=torch.float32, device=self.device)
+        self.logger.log_scalar("reward/novelty_vs_distance_from_start_episode_corr", episode_corr.item())
 
     def _log_update_stats(
         self,
@@ -461,6 +719,99 @@ class BaseWMOnPolicy:
         valid = per_step_valid
         out[valid] = per_step_loss[valid].to(out.dtype)
         return out
+
+    def _compute_state_divergence_novelty(
+        self,
+        *,
+        state_seq: torch.Tensor,
+        key_padding_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        center = state_seq.mean(dim=0, keepdim=True)
+        dist = (state_seq - center).pow(2).sum(dim=-1).sqrt()
+        valid = ~key_padding_mask
+        valid_f = valid.to(dist.dtype)
+        novelty_raw = dist * valid_f
+        novelty = torch.zeros_like(novelty_raw)
+        if valid.any():
+            novelty_valid = self._divergence_running_norm(novelty_raw[valid].reshape(-1, 1)).reshape(-1)
+            novelty_valid = novelty_valid.clamp_min(0.0)
+            novelty[valid] = novelty_valid.to(novelty.dtype)
+
+        if self.logger is not None:
+            divergence_raw_mean = self._masked_mean(novelty_raw, valid)
+            self._log_first_last_window_means(
+                values=novelty_raw,
+                valid_mask=valid,
+                metric_prefix="reward/divergence_raw",
+            )
+            self.logger.log_scalar("reward/divergence_raw_mean", divergence_raw_mean)
+            divergence_mean = self._masked_mean(novelty, valid)
+            self._log_first_last_window_means(
+                values=novelty,
+                valid_mask=valid,
+                metric_prefix="reward/divergence",
+            )
+            self.logger.log_scalar("reward/divergence_mean", divergence_mean)
+
+        return novelty
+
+    def _compute_episode_novelty(
+        self,
+        *,
+        state_seq: torch.Tensor,
+        key_padding_mask: torch.Tensor,
+        delta: int = 10,
+        num_lags: int = 6,
+    ) -> torch.Tensor:
+        valid = ~key_padding_mask
+        batch_size, seq_len, _ = state_seq.shape
+        novelty_raw = torch.zeros((batch_size, seq_len), dtype=state_seq.dtype, device=state_seq.device)
+        novelty_count = torch.zeros_like(novelty_raw)
+
+        for lag_idx in range(1, num_lags + 1):
+            lag = lag_idx * delta
+            if lag >= seq_len:
+                break
+            curr = state_seq[:, lag:, :]
+            prev = state_seq[:, :-lag, :]
+            dist = (curr - prev).pow(2).sum(dim=-1).sqrt()
+            valid_pair = valid[:, lag:] & valid[:, :-lag]
+            valid_pair_f = valid_pair.to(dist.dtype)
+            novelty_raw[:, lag:] += dist * valid_pair_f
+            novelty_count[:, lag:] += valid_pair_f
+
+        has_novelty = novelty_count > 0
+        novelty_raw = torch.where(
+            has_novelty,
+            novelty_raw / novelty_count.clamp_min(1.0),
+            torch.zeros_like(novelty_raw),
+        )
+
+        novelty = torch.zeros_like(novelty_raw)
+        valid_novelty = has_novelty & valid
+        if valid_novelty.any():
+            novelty_valid = self._episode_novelty_running_norm(
+                novelty_raw[valid_novelty].reshape(-1, 1)
+            ).reshape(-1)
+            novelty_valid = novelty_valid.clamp_min(0.0)
+            novelty[valid_novelty] = novelty_valid.to(novelty.dtype)
+
+        episode_novelty_raw_mean = self._masked_mean(novelty_raw, valid_novelty)
+        self._log_first_last_window_means(
+            values=novelty_raw,
+            valid_mask=valid_novelty,
+            metric_prefix="reward/episode_novelty_raw",
+        )
+        self.logger.log_scalar("reward/episode_novelty_raw_mean", episode_novelty_raw_mean)
+        episode_novelty_mean = self._masked_mean(novelty, valid_novelty)
+        self._log_first_last_window_means(
+            values=novelty,
+            valid_mask=valid_novelty,
+            metric_prefix="reward/episode_novelty",
+        )
+        self.logger.log_scalar("reward/episode_novelty_mean", episode_novelty_mean)
+
+        return novelty
 
     def _compute_state_stability_loss(
         self,
@@ -687,4 +1038,3 @@ class _WMEpisodePool(EpisodesOldPoolMixin):
         else:
             idx = random.randint(0, self.pool_size - 1)
             self.episode_pool[idx] = episode
-

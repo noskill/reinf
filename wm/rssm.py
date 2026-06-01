@@ -208,18 +208,18 @@ class RSSMDiscretePredictor(DiscreteLatentPredictorBase):
             if obs_hat is not None:
                 aux_inputs["obs_hat"] = obs_hat
 
+        state_seq = feat
         last_state = torch.cat([h_prev, z_prev_flat], dim=-1)
-        return outputs, aux_inputs, last_state
+        return outputs, aux_inputs, state_seq, last_state
 
     def forward(
         self,
         obs,
         attention_window=None,
-        return_state=False,
         episode_start=None,
     ):
         need_aux = episode_start is None
-        outputs, aux_inputs, last_state = self._forward_core(
+        outputs, aux_inputs, state_seq, last_state = self._forward_core(
             obs,
             attention_window=attention_window,
             episode_start=episode_start,
@@ -228,5 +228,7 @@ class RSSMDiscretePredictor(DiscreteLatentPredictorBase):
         return {
             "preds": outputs,
             "aux": aux_inputs if need_aux else None,
-            "state": last_state
+            "state": last_state,
+            "state_last": last_state,
+            "state_seq": state_seq,
         }

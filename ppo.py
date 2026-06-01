@@ -21,7 +21,7 @@ class PPOBase(VPGBase):
       log_probs_new (and optional mu for Normal policies) to avoid re-forward
       duplication and ease maintenance.
     """
-    def __init__(self, policy, value, sampler, policy_lr=0.0001, value_lr=0.001, num_envs=8, discount=0.999, device=torch.device('cpu'), logger=None, num_learning_epochs=4, clip_param=None, **kwargs):
+    def __init__(self, policy, value, sampler, policy_lr=0.0001, value_lr=0.001, num_envs=8, discount=0.99, device=torch.device('cpu'), logger=None, num_learning_epochs=4, clip_param=None, **kwargs):
         super().__init__(policy, value, sampler, policy_lr=policy_lr,
                     num_envs=num_envs, discount=discount,
                     device=device, logger=logger, num_learning_epochs=num_learning_epochs, **kwargs)
@@ -93,6 +93,7 @@ class PPOBase(VPGBase):
                 mu_flat = flatten_padded(mu_padded, key_padding_mask)
                 mu_mb = mu_flat
         return logp_new_flat, entropy_flat, mu_mb
+
 
     def train_policy_batch_joint(self, episode_batch: EpisodeBatch, num_minibatches: int = 4):
         """joint updates of value and policy"""
@@ -176,6 +177,7 @@ class PPOBase(VPGBase):
 
         if old_logp_padded.dim() == 3 and old_logp_padded.shape[-1] == 1:
             old_logp_padded = old_logp_padded.squeeze(-1)
+
         states_flat = self._flatten_states(states_padded, padding_mask)
         returns_flat = flatten_padded(returns_padded.unsqueeze(-1), padding_mask).squeeze(-1)
         self._log_training_stats(flatten_padded(actions_padded, padding_mask))
@@ -204,6 +206,7 @@ class PPOBase(VPGBase):
             rewards_batch=rewards_padded,
             padding_mask=padding_mask,
         )
+
 
         self.policy.load_state_dict(self.policy_old.state_dict())
         obs_for_policy = self._build_policy_obs(states_padded, padding_mask)

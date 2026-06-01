@@ -1,6 +1,7 @@
 import os
 import time
 import sys
+import pickle
 from typing import Union
 import gymnasium as gym
 import torch
@@ -199,7 +200,16 @@ class OnPolicyTrainer:
         torch.save(checkpoint, path)
 
     def load_checkpoint(self, path):
-        checkpoint = torch.load(path)
+        try:
+            checkpoint = torch.load(path, map_location="cpu")
+        except pickle.UnpicklingError:
+            checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+        if not isinstance(checkpoint, dict) or "agent_state" not in checkpoint:
+            raise ValueError(
+                f"Unsupported checkpoint format: {path}. "
+                "Expected on-policy checkpoint with key 'agent_state'. "
+                "For pretrained world-model weights, use '--wm-load-path <path>' and omit '--checkpoint'."
+            )
         self.agent.load_state_dict(checkpoint['agent_state'])
         self.agent.logger.episode_count = checkpoint['episode']
         self.seed = checkpoint['seed']

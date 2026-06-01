@@ -307,7 +307,7 @@ class RunningNorm:
 
         # Calculate mean and std using unified API
         batch_mean = self._mean(x)
-        batch_std = self._std(x) + self.epsilon
+        batch_std = self._maximum(self._std(x), self.min_std)
 
         # Update running mean and std
         if self.mean is None:
@@ -318,6 +318,7 @@ class RunningNorm:
             self.std = self.momentum * self.std + (1 - self.momentum) * batch_std
             if not 0.2 < self.std:
                 print('std is low ' + str(self.std)) # sanity check
+        self.std = self._maximum(self.std, self.min_std)
 
         # Normalize
         normalized = (x - self.mean) / (self.std + self.epsilon)
