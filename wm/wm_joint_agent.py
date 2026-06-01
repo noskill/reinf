@@ -557,9 +557,9 @@ class BaseWMOnPolicy:
                 corr = torch.tensor(0.0, dtype=torch.float32, device=self.device)
         else:
             corr = torch.tensor(0.0, dtype=torch.float32, device=self.device)
-        self.logger.log_scalar("reward/intrinsic_episode_sum_mean", rewards_t.mean().item())
+        self.logger.log_scalar(f"reward/{log_name}_episode_sum_mean", rewards_t.mean().item())
         self.logger.log_scalar("episode/location_coverage_mean", coverage_t.mean().item())
-        self.logger.log_scalar("reward/intrinsic_vs_episode_coverage_corr", corr.item())
+        self.logger.log_scalar(f"reward/{log_name}_vs_episode_coverage_corr", corr.item())
 
     def _log_novelty_vs_distance_from_start(
         self,
