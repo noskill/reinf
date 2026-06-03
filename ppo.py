@@ -207,6 +207,23 @@ class PPOBase(VPGBase):
             padding_mask=padding_mask,
         )
 
+        advantages_mc = self.compute_advantage_monte_carlo(
+            states_batch=states_padded,
+            returns_batch=returns_padded,
+            padding_mask=padding_mask,
+        )
+
+
+        lengths = episode_batch.lengths.to(advantages.device)
+        episode_batch.data["advantages_gae"] = [
+            advantages[i, : lengths[i]].detach()
+            for i in range(advantages.shape[0])
+        ]
+
+        episode_batch.data["advantages_mc"] = [
+            advantages_mc[i, : lengths[i]].detach()
+            for i in range(advantages_mc.shape[0])
+        ]
 
         self.policy.load_state_dict(self.policy_old.state_dict())
         obs_for_policy = self._build_policy_obs(states_padded, padding_mask)
