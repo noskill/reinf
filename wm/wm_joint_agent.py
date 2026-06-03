@@ -396,6 +396,20 @@ class BaseWMOnPolicy:
         episode_batch = self._prepare_episode_batch(policy_episodes)
         self.train_policy_batch(episode_batch)
 
+        advantages, _, _ = episode_batch.pad(fields=['advantages_gae', 'advantages_mc'])
+        advantages_gae = advantages['advantages_gae']
+        self._log_intrinsic_vs_episode_coverage(
+            intrinsic_rewards=advantages_gae,
+            wm_episodes=wm_new_episodes,
+            log_name='advantages_gae'
+        )
+        advantages_mc = advantages['advantages_mc']
+        self._log_intrinsic_vs_episode_coverage(
+            intrinsic_rewards=advantages_mc,
+            wm_episodes=wm_new_episodes,
+            log_name='advantages_mc'
+        )
+
         self.print_episode_stats(self.get_completed_episodes())
         self.version += 1
         self.clear_completed()
@@ -445,22 +459,7 @@ class BaseWMOnPolicy:
         reward_with_surprise = lp_rewards_new + cpc_error_before * 0.001
         novelty_signal = 0.5 * (divergence_novelty + episode_novelty)
         self.logger.log_scalar("reward/novelty_signal_mean", self._masked_mean(novelty_signal, valid))
-        novelty_coef_effective = torch.tensor(
-            self.wm_divergence_novelty_coef, dtype=reward_with_surprise.dtype, device=reward_with_surprise.device
-        )
-        if valid.any():
-            base_abs = reward_with_surprise[valid].abs().mean()
-            novelty_abs = novelty_signal[valid].abs().mean()
-            novelty_scale = (base_abs / (novelty_abs + 1e-6)).clamp(0.1, 10.0)
-            novelty_coef_effective = novelty_coef_effective * novelty_scale
-            self.logger.log_scalar("reward/novelty_scale", novelty_scale.detach().cpu().item())
-            self.logger.log_scalar("reward/lp_surprise_abs_mean", base_abs.detach().cpu().item())
-            self.logger.log_scalar(
-                "reward/novelty_contrib_abs_mean",
-                (novelty_coef_effective * novelty_signal[valid]).abs().mean().detach().cpu().item(),
-            )
-        self.logger.log_scalar("reward/novelty_coef_effective", novelty_coef_effective.detach().cpu().item())
-        reward_with_surprise = reward_with_surprise + novelty_coef_effective * novelty_signal
+        reward_with_surprise = reward_with_surprise + self.wm_divergence_novelty_coef * novelty_signal
         intrinsic_rewards = self.intrinsic_reward_scale * reward_with_surprise
         self._log_first_last_window_means(
             values=intrinsic_rewards,
@@ -733,9 +732,14 @@ class BaseWMOnPolicy:
         novelty_raw = dist * valid_f
         novelty = torch.zeros_like(novelty_raw)
         if valid.any():
-            novelty_valid = self._divergence_running_norm(novelty_raw[valid].reshape(-1, 1)).reshape(-1)
-            novelty_valid = novelty_valid.clamp_min(0.0)
+            # novelty_valid = self._divergence_running_norm(novelty_raw[valid].reshape(-1, 1)).reshape(-1)
+            novelty_valid = novelty_raw[valid]
             novelty[valid] = novelty_valid.to(novelty.dtype)
+            divergence_raw_valid = novelty_raw[valid].to(torch.float32)
+            self.logger.log_scalar("reward/divergence_raw_batch_std", divergence_raw_valid.std(unbiased=False).item())
+            self.logger.log_scalar("reward/divergence_raw_batch_p50", torch.quantile(divergence_raw_valid, 0.50).item())
+            self.logger.log_scalar("reward/divergence_raw_batch_p90", torch.quantile(divergence_raw_valid, 0.90).item())
+            self.logger.log_scalar("reward/divergence_raw_batch_p99", torch.quantile(divergence_raw_valid, 0.99).item())
 
         if self.logger is not None:
             divergence_raw_mean = self._masked_mean(novelty_raw, valid)
@@ -790,10 +794,10 @@ class BaseWMOnPolicy:
         novelty = torch.zeros_like(novelty_raw)
         valid_novelty = has_novelty & valid
         if valid_novelty.any():
-            novelty_valid = self._episode_novelty_running_norm(
-                novelty_raw[valid_novelty].reshape(-1, 1)
-            ).reshape(-1)
-            novelty_valid = novelty_valid.clamp_min(0.0)
+            # novelty_valid = self._episode_novelty_running_norm(
+            #     novelty_raw[valid_novelty].reshape(-1, 1)
+            # ).reshape(-1)
+            novelty_valid = novelty_raw[valid_novelty]
             novelty[valid_novelty] = novelty_valid.to(novelty.dtype)
 
         episode_novelty_raw_mean = self._masked_mean(novelty_raw, valid_novelty)
