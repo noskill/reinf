@@ -201,7 +201,14 @@ class PPOBase(VPGBase):
             value_epochs=2,
             num_minibatches=num_minibatches
         )
-        advantages = self.compute_advantage_gae(
+
+        advantages = self.compute_advantage(states_batch=states_padded,
+            rewards_batch=rewards_padded,
+            returns_batch=returns_padded,
+            padding_mask=padding_mask
+        )
+        # for logging/debug
+        advantages_gae = self.compute_advantage_gae(
             states_batch=states_padded,
             rewards_batch=rewards_padded,
             padding_mask=padding_mask,
@@ -214,10 +221,10 @@ class PPOBase(VPGBase):
         )
 
 
-        lengths = episode_batch.lengths.to(advantages.device)
+        lengths = episode_batch.lengths.to(advantages_gae.device)
         episode_batch.data["advantages_gae"] = [
-            advantages[i, : lengths[i]].detach()
-            for i in range(advantages.shape[0])
+            advantages_gae[i, : lengths[i]].detach()
+            for i in range(advantages_gae.shape[0])
         ]
 
         episode_batch.data["advantages_mc"] = [
