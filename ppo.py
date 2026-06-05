@@ -108,11 +108,36 @@ class PPOBase(VPGBase):
         if old_logp_padded.dim() == 3 and old_logp_padded.shape[-1] == 1:
             old_logp_padded = old_logp_padded.squeeze(-1)
 
-        advantages = self.compute_advantage_gae(
+        advantages = self.compute_advantage(states_batch=states_padded,
+            rewards_batch=rewards_padded,
+            returns_batch=returns_padded,
+            padding_mask=padding_mask
+        )
+        # for logging/debug
+        advantages_gae = self.compute_advantage_gae(
             states_batch=states_padded,
             rewards_batch=rewards_padded,
             padding_mask=padding_mask,
         )
+
+        advantages_mc = self.compute_advantage_monte_carlo(
+            states_batch=states_padded,
+            returns_batch=returns_padded,
+            padding_mask=padding_mask,
+        )
+
+
+        lengths = episode_batch.lengths.to(advantages_gae.device)
+        episode_batch.data["advantages_gae"] = [
+            advantages_gae[i, : lengths[i]].detach()
+            for i in range(advantages_gae.shape[0])
+        ]
+
+        episode_batch.data["advantages_mc"] = [
+            advantages_mc[i, : lengths[i]].detach()
+            for i in range(advantages_mc.shape[0])
+        ]
+
 
         self._log_training_stats(flatten_padded(actions_padded, padding_mask))
 

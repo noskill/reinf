@@ -419,6 +419,16 @@ def flatten_padded(x: torch.Tensor, key_padding_mask: torch.Tensor) -> torch.Ten
     return x.reshape(B * T, *x.shape[2:])[valid]
 
 
+def unflatten_padded(flat, key_padding_mask, fill_value=0.0, dtype=torch.float16):
+    valid = ~key_padding_mask
+    out_shape = (*key_padding_mask.shape, *flat.shape[1:])
+    if not torch.is_tensor(flat):
+        flat = torch.tensor(flat, dtype=dtype)
+    out = flat.new_full(out_shape, fill_value)
+    out[valid] = flat
+    return out
+
+
 def compute_returns_list(rewards_list: List[torch.Tensor], gamma: float, bootstrap: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
     """
     Compute discounted returns per episode. Each rewards tensor is [T].

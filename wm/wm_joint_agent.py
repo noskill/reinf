@@ -18,6 +18,8 @@ from reinforce import Reinforce
 from ppo import PPO
 from util import RunningNorm
 from utils import make_label_smoothing_table, make_soft_table
+from util import RunningNorm, EpisodeBatch, to_device, gae, normalize_padded_returns, flatten_padded, unflatten_padded
+from clustering import SmartClusteringNovelty
 
 
 def create_maze_world_model(
@@ -164,6 +166,7 @@ class BaseWMOnPolicy:
         })
         self.log_hparams()
         self.create_wm_optimizers(**kwargs)
+        self.clustering = SmartClusteringNovelty(adaptation_frequency=100_000)
 
     def create_wm_optimizers(self, **kwargs):
         self.wm_optimizer = torch.optim.AdamW(
@@ -196,7 +199,7 @@ class BaseWMOnPolicy:
                 dtype=self.action_cont_table.dtype,
                 device=self.action_cont_table.device,
             )
-        self._prev_actions = self.action_cont_table[actions].to(self._prev_actions.dtype).detach()  
+        self._prev_actions = self.action_cont_table[actions].to(self._prev_actions.dtype).detach()
 
     def call_wm(self, state, episode_start):
         if not isinstance(state, dict):
@@ -299,7 +302,7 @@ class BaseWMOnPolicy:
             self._wm_pool.add_reward(env_idx, env_rewards[env_idx].detach().to("cpu"))
         self.process_dones(dones)
         self._wm_pool.process_dones(dones)
-  
+
         if not self.should_learn():
             return False
         policy_episodes = [ep for ep in self.get_train_episodes() if len(ep) >= 2]
@@ -322,14 +325,15 @@ class BaseWMOnPolicy:
         self.policy.train()
         cpc_error_before = self._evaluate_step_cpc_error_no_grad(self.wm_model, obs_new, targets_new)
         with torch.no_grad():
-            state_out = self.wm_model(obs_new)
-            old_state_seq = state_out["state_seq"].detach()
+            state_out_fixed = self.wm_model(obs_new)
+            old_state_seq = state_out_fixed["state_seq"].detach()
+            embs = state_out_fixed['aux']['contrastive_tgt_emb']
         divergence_novelty = self._compute_state_divergence_novelty(
-            state_seq=old_state_seq,
+            state_seq=embs,
             key_padding_mask=obs_new["key_padding_mask"],
         )
         episode_novelty = self._compute_episode_novelty(
-            state_seq=old_state_seq,
+            state_seq=embs,
             key_padding_mask=obs_new["key_padding_mask"],
         )
         novelty_signal = 0.5 * (divergence_novelty + episode_novelty)
@@ -380,6 +384,18 @@ class BaseWMOnPolicy:
             cpc_error_after = self._evaluate_step_cpc_error_no_grad(self.wm_model, obs_new, targets_new)
         else:
             cpc_error_after = cpc_error_before
+
+        flat_emb = flatten_padded(embs, obs_new["key_padding_mask"]).detach()
+        cluster_dist_novelty = unflatten_padded(self.clustering(flat_emb),
+                                                obs_new["key_padding_mask"], dtype=embs.dtype).to(embs)
+        self.clustering.update(flat_emb)
+
+        print("emb std mean", flat_emb.std(dim=0).mean().item())
+        print("emb norm mean/std", flat_emb.norm(dim=1).mean().item(), flat_emb.norm(dim=1).std().item())
+        print("pairwise sample dist", torch.pdist(flat_emb[torch.randperm(len(flat_emb), device=flat_emb.device)[:512]]).mean().item())
+         
+        emb_pred_error = self.embedding_prediction_error(state_out_fixed['aux'], 
+                                                         obs_new["key_padding_mask"], metric="cosine", horizon_discount=0.75)
         intrinsic_rewards = self._compute_intrinsic_rewards(
             cpc_error_before=cpc_error_before,
             cpc_error_after=cpc_error_after,
@@ -387,6 +403,8 @@ class BaseWMOnPolicy:
             divergence_novelty=divergence_novelty,
             episode_novelty=episode_novelty,
             policy_episodes=policy_episodes,
+            cluster_dist_novelty=cluster_dist_novelty,
+            embedding_prediction_error=emb_pred_error,
         )
         self._log_intrinsic_vs_episode_coverage(
             intrinsic_rewards=intrinsic_rewards,
@@ -394,7 +412,7 @@ class BaseWMOnPolicy:
         )
 
         episode_batch = self._prepare_episode_batch(policy_episodes)
-        self.train_policy_batch(episode_batch)
+        self.train_policy_batch_joint(episode_batch)
 
         advantages, _, _ = episode_batch.pad(fields=['advantages_gae', 'advantages_mc'])
         advantages_gae = advantages['advantages_gae']
@@ -451,21 +469,42 @@ class BaseWMOnPolicy:
         divergence_novelty: torch.Tensor,
         episode_novelty: torch.Tensor,
         policy_episodes,
+        cluster_dist_novelty,
+        embedding_prediction_error,
     ) -> torch.Tensor:
         lp_rewards_new = cpc_error_before - cpc_error_after
         valid = ~key_padding_mask
-        self.logger.log_scalar("reward/lp_mean", lp_rewards_new.detach().mean().cpu().item())
-        self.logger.log_scalar("reward/surprise_mean", cpc_error_before.detach().mean().cpu().item() * 0.001)
-        reward_with_surprise = lp_rewards_new + cpc_error_before * 0.001
+
+        lp_surprise = lp_rewards_new + cpc_error_before * 0.001
         novelty_signal = 0.5 * (divergence_novelty + episode_novelty)
-        self.logger.log_scalar("reward/novelty_signal_mean", self._masked_mean(novelty_signal, valid))
-        reward_with_surprise = reward_with_surprise + self.wm_divergence_novelty_coef * novelty_signal
-        intrinsic_rewards = self.intrinsic_reward_scale * reward_with_surprise
-        self._log_first_last_window_means(
-            values=intrinsic_rewards,
-            valid_mask=valid,
-            metric_prefix="reward/intrinsic",
-        )
+
+        # normal - sum of all rewards
+        #reward = lp_surprise + self.wm_divergence_novelty_coef * novelty_signal
+        # just lp
+        #reward = lp_rewards_new
+
+        # just surprise
+        #reward = cpc_error_before
+
+        # per-batch divergence
+        #reward = divergence_novelty
+
+        # per-episode divergence
+        # reward = episode_novelty
+
+        # clustering-based
+        # reward = cluster_dist_novelty
+
+        #embedding_prediction_error
+        reward = embedding_prediction_error
+
+        reward_next = reward[:, 1:]
+        reward_curr = reward[:, :-1]
+        reward_progress = torch.zeros_like(reward)
+        reward_progress[:, 1:] = reward_next - reward_curr
+        # per-step improvment
+        # reward = reward_progress
+        intrinsic_rewards = self.intrinsic_reward_scale * reward
 
         for ep_idx, episode in enumerate(policy_episodes[: intrinsic_rewards.shape[0]]):
             max_t = min(len(episode) - 1, intrinsic_rewards.shape[1])
@@ -474,6 +513,13 @@ class BaseWMOnPolicy:
                 updated_reward = torch.as_tensor(transition[4], dtype=torch.float32, device=self.device) + intrinsic_rewards[ep_idx, t]
                 episode[t] = (transition[0], transition[1], transition[2], transition[3], updated_reward)
 
+        self.logger.log_scalar("reward/lp_mean", lp_rewards_new.detach().mean().cpu().item())
+        self.logger.log_scalar("reward/surprise_mean", cpc_error_before.detach().mean().cpu().item() * 0.001)
+        self.logger.log_scalar("reward/novelty_signal_mean", self._masked_mean(novelty_signal, valid))
+        self._log_first_last_window_means(
+            values=intrinsic_rewards,
+            valid_mask=valid,
+            metric_prefix="reward/intrinsic")
         return intrinsic_rewards
 
     @staticmethod
@@ -728,8 +774,7 @@ class BaseWMOnPolicy:
         center = state_seq.mean(dim=0, keepdim=True)
         dist = (state_seq - center).pow(2).sum(dim=-1).sqrt()
         valid = ~key_padding_mask
-        valid_f = valid.to(dist.dtype)
-        novelty_raw = dist * valid_f
+        novelty_raw = dist * valid
         novelty = torch.zeros_like(novelty_raw)
         if valid.any():
             # novelty_valid = self._divergence_running_norm(novelty_raw[valid].reshape(-1, 1)).reshape(-1)
@@ -959,6 +1004,86 @@ class BaseWMOnPolicy:
         if wm_opt_state is not None:
             self.wm_optimizer.load_state_dict(wm_opt_state)
 
+    def compute_advantage(self, states_batch, returns_batch, rewards_batch, padding_mask):
+        #return self.compute_advantage_gae(states_batch, rewards_batch, padding_mask)
+        # return self.compute_advantage_monte_carlo(states_batch, returns_batch, padding_mask)
+        return self.return_advantage(returns_batch, padding_mask)
+
+    def return_advantage(self, returns_batch, padding_mask):
+        advantages = returns_batch
+        adv_sel = torch.masked_select(advantages, torch.logical_not(padding_mask))
+        advantage_std = adv_sel.std()
+        advantage_std_clamped = advantage_std.clamp_min(1e-2)
+        advantage_mean = adv_sel.mean()
+        self.logger.log_scalar("Raw advantage_ret mean:", advantage_mean.item())
+        self.logger.log_scalar("Raw advantage_ret std:", advantage_std.item())
+        return returns_batch / advantage_std_clamped
+
+    def compute_advantage_gae(self, states_batch, rewards_batch, padding_mask, **kwargs):
+        """
+        normal gae but no normalisation
+        """
+        # Policy Update
+        with torch.no_grad():
+            updated_values = self.value(states_batch).squeeze(-1)
+            updated_values = updated_values * (1 - padding_mask.float())
+        advantages = gae(self.discount, self.lambda_discount, rewards_batch, updated_values)
+
+        adv_sel = torch.masked_select(advantages, torch.logical_not(padding_mask))
+        advantage_std = adv_sel.std()
+        advantage_std_clamped = advantage_std.clamp_min(1e-2)
+        advantage_mean = adv_sel.mean()
+        self.logger.log_scalar("Raw advantagegae mean:", advantage_mean.item())
+        self.logger.log_scalar("Raw advantagegae std:", advantage_std.item())
+        return advantages / advantage_std_clamped
+
+    def compute_advantage_monte_carlo(self, states_batch, returns_batch, padding_mask, **kwargs):
+        """
+        normal mc-advantage, but no normalisation
+        """
+        # Policy Update
+        with torch.no_grad():
+            updated_values = self.value(states_batch).squeeze(-1)
+
+        advantages = returns_batch - updated_values
+        adv_sel = torch.masked_select(advantages, torch.logical_not(padding_mask))
+        advantage_std = adv_sel.std()
+        advantage_std_clamped = advantage_std.clamp_min(1e-2)
+        advantage_mean = adv_sel.mean()
+        self.logger.log_scalar("Raw advantagemc mean:", advantage_mean.item())
+        self.logger.log_scalar("Raw advantagemc std:", advantage_std.item())
+        return advantages / advantage_std_clamped
+
+    def embedding_prediction_error(aux, key_padding_mask, metric="cosine", horizon_discount=0.75):
+        pred_steps = aux["contrastive_pred_emb_steps"]
+        tgt_emb = aux["contrastive_tgt_emb"]
+
+        B, T = key_padding_mask.shape
+        out = torch.zeros((B, T), device=tgt_emb.device, dtype=tgt_emb.dtype)
+        weight = torch.zeros((B, T), device=tgt_emb.device, dtype=tgt_emb.dtype)
+
+        norm_denom = sum(float(horizon_discount) ** k for k in range(len(pred_steps)))
+
+        for k, pred in enumerate(pred_steps):
+            offset = k + 1
+            target = tgt_emb[:, offset:, :]
+            valid = (~key_padding_mask[:, :-offset]) & (~key_padding_mask[:, offset:])
+
+            if metric == "cosine":
+                pred_n = F.normalize(pred, dim=-1)
+                target_n = F.normalize(target, dim=-1)
+                err = 1.0 - (pred_n * target_n).sum(dim=-1)
+            else:
+                err = (pred - target).pow(2).mean(dim=-1)
+
+            w = (float(horizon_discount) ** k) / norm_denom
+            out[:, :-offset][valid] += w * err[valid]
+            weight[:, :-offset][valid] += w
+
+        valid_out = weight > 0
+        out[valid_out] = out[valid_out] / weight[valid_out]
+        return out
+
 
 class JointWMReinforce(BaseWMOnPolicy, Reinforce):
     """Reinforce agent with joint AC-CPC world-model updates."""
@@ -993,17 +1118,17 @@ class JointWMReinforce(BaseWMOnPolicy, Reinforce):
 
 class JointWMPPO(BaseWMOnPolicy, PPO):
     """Reinforce agent with joint AC-CPC world-model updates."""
-    def __init__(self, policy, 
-                 value, 
-                 sampler, 
-                 policy_lr=0.0001, 
-                 value_lr=0.001, num_envs=8, 
-                 discount=0.999, 
+    def __init__(self, policy,
+                 value,
+                 sampler,
+                 policy_lr=0.0001,
+                 value_lr=0.001, num_envs=8,
+                 discount=0.999,
                  device=torch.device('cpu'),
-                 logger=None, 
-                 num_learning_epochs=4, 
+                 logger=None,
+                 num_learning_epochs=4,
                  entropy_coef=0.005,
-                 clip_param=None, 
+                 clip_param=None,
                  exp_adv=None,
                  target_entropy=2,
                  **kwargs):
