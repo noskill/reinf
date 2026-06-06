@@ -1,4 +1,5 @@
 import numpy as np
+import numpy
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.metrics import silhouette_score, calinski_harabasz_score
 from util import RunningNorm
@@ -20,6 +21,8 @@ class SmartClusteringNovelty:
         self.running_norm = RunningNorm(momentum=running_momentum)
         self.max_clusters = 300
         self.min_clusters = 300
+        self.weights = numpy.zeros(self.n_clusters)
+        self.momentum = running_momentum
 
     def update(self, states_batch):
         """
@@ -154,9 +157,22 @@ class SmartClusteringNovelty:
         )  # shape (n, num_clusters)
 
         # The novelty reward is based on the minimum distance.
-        min_distances = np.min(distances, axis=1)
+        assigned = np.argmin(distances, axis=1)
+        min_distances = distances[np.arange(len(states)), assigned]
 
-        # Normalize the novelty reward using the running normalization.
-        normalized_rewards = self.running_norm(min_distances)
-        clipped_result = np.clip(normalized_rewards, -3.0, 3.0)
-        return min_distances * self.reward_scale
+        weights = numpy.zeros_like(self.weights)
+        np.add.at(weights, assigned, 1)
+        weights /= (weights.sum() + 0.000001)
+
+        if self.weights.max() <= 0.0:
+            visit_reward = numpy.ones_like(min_distances)
+        else:
+            inverse = 1 - (self.weights / self.weights.max())
+            visit_reward = inverse[assigned]
+        dist_reward = min_distances / (min_distances.mean() + 1e-8)
+        reward = visit_reward
+        reward = visit_reward * dist_reward
+        clipped = np.clip(reward, -3.0, 3.0)
+
+        self.weights = self.weights * self.momentum + (1 - self.momentum) * weights
+        return clipped * self.reward_scale

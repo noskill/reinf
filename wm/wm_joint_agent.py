@@ -390,12 +390,14 @@ class BaseWMOnPolicy:
                                                 obs_new["key_padding_mask"], dtype=embs.dtype).to(embs)
         self.clustering.update(flat_emb)
 
-        print("emb std mean", flat_emb.std(dim=0).mean().item())
-        print("emb norm mean/std", flat_emb.norm(dim=1).mean().item(), flat_emb.norm(dim=1).std().item())
-        print("pairwise sample dist", torch.pdist(flat_emb[torch.randperm(len(flat_emb), device=flat_emb.device)[:512]]).mean().item())
-         
-        emb_pred_error = self.embedding_prediction_error(state_out_fixed['aux'], 
-                                                         obs_new["key_padding_mask"], metric="cosine", horizon_discount=0.75)
+        self.logger.log_scalar("emb std mean", flat_emb.std(dim=0).mean().item())
+        self.logger.log_scalar("emb norm mean/std", flat_emb.norm(dim=1).mean().item())
+        self.logger.log_scalar("pairwise sample dist", torch.pdist(flat_emb[torch.randperm(len(flat_emb), device=flat_emb.device)[:512]]).mean().item())
+
+        emb_pred_error = self.embedding_prediction_error(state_out_fixed['aux'],
+                                                         key_padding_mask=obs_new["key_padding_mask"],
+                                                         metric="cosine",
+                                                         horizon_discount=0.75)
         intrinsic_rewards = self._compute_intrinsic_rewards(
             cpc_error_before=cpc_error_before,
             cpc_error_after=cpc_error_after,
@@ -493,10 +495,10 @@ class BaseWMOnPolicy:
         # reward = episode_novelty
 
         # clustering-based
-        # reward = cluster_dist_novelty
+        reward = cluster_dist_novelty
 
         #embedding_prediction_error
-        reward = embedding_prediction_error
+        # reward = embedding_prediction_error
 
         reward_next = reward[:, 1:]
         reward_curr = reward[:, :-1]
@@ -1004,56 +1006,57 @@ class BaseWMOnPolicy:
         if wm_opt_state is not None:
             self.wm_optimizer.load_state_dict(wm_opt_state)
 
-    def compute_advantage(self, states_batch, returns_batch, rewards_batch, padding_mask):
-        #return self.compute_advantage_gae(states_batch, rewards_batch, padding_mask)
-        # return self.compute_advantage_monte_carlo(states_batch, returns_batch, padding_mask)
-        return self.return_advantage(returns_batch, padding_mask)
+    # def compute_advantage(self, states_batch, returns_batch, rewards_batch, padding_mask):
+    #     #return self.compute_advantage_gae(states_batch, rewards_batch, padding_mask)
+    #     # return self.compute_advantage_monte_carlo(states_batch, returns_batch, padding_mask)
+    #     # return self.return_advantage(returns_batch, padding_mask)
+    #
+    # def return_advantage(self, returns_batch, padding_mask):
+    #     advantages = returns_batch
+    #     adv_sel = torch.masked_select(advantages, torch.logical_not(padding_mask))
+    #     advantage_std = adv_sel.std()
+    #     advantage_std_clamped = advantage_std.clamp_min(1e-2)
+    #     advantage_mean = adv_sel.mean()
+    #     self.logger.log_scalar("Raw advantage_ret mean:", advantage_mean.item())
+    #     self.logger.log_scalar("Raw advantage_ret std:", advantage_std.item())
+    #     return returns_batch / advantage_std_clamped
+    #
+    # def compute_advantage_gae(self, states_batch, rewards_batch, padding_mask, **kwargs):
+    #     """
+    #     normal gae but no normalisation
+    #     """
+    #     # Policy Update
+    #     with torch.no_grad():
+    #         updated_values = self.value(states_batch).squeeze(-1)
+    #         updated_values = updated_values * (1 - padding_mask.float())
+    #     advantages = gae(self.discount, self.lambda_discount, rewards_batch, updated_values)
+    #
+    #     adv_sel = torch.masked_select(advantages, torch.logical_not(padding_mask))
+    #     advantage_std = adv_sel.std()
+    #     advantage_std_clamped = advantage_std.clamp_min(1e-2)
+    #     advantage_mean = adv_sel.mean()
+    #     self.logger.log_scalar("Raw advantagegae mean:", advantage_mean.item())
+    #     self.logger.log_scalar("Raw advantagegae std:", advantage_std.item())
+    #     return advantages / advantage_std_clamped
+    #
+    # def compute_advantage_monte_carlo(self, states_batch, returns_batch, padding_mask, **kwargs):
+    #     """
+    #     normal mc-advantage, but no normalisation
+    #     """
+    #     # Policy Update
+    #     with torch.no_grad():
+    #         updated_values = self.value(states_batch).squeeze(-1)
+    #
+    #     advantages = returns_batch - updated_values
+    #     adv_sel = torch.masked_select(advantages, torch.logical_not(padding_mask))
+    #     advantage_std = adv_sel.std()
+    #     advantage_std_clamped = advantage_std.clamp_min(1e-2)
+    #     advantage_mean = adv_sel.mean()
+    #     self.logger.log_scalar("Raw advantagemc mean:", advantage_mean.item())
+    #     self.logger.log_scalar("Raw advantagemc std:", advantage_std.item())
+    #     return advantages / advantage_std_clamped
 
-    def return_advantage(self, returns_batch, padding_mask):
-        advantages = returns_batch
-        adv_sel = torch.masked_select(advantages, torch.logical_not(padding_mask))
-        advantage_std = adv_sel.std()
-        advantage_std_clamped = advantage_std.clamp_min(1e-2)
-        advantage_mean = adv_sel.mean()
-        self.logger.log_scalar("Raw advantage_ret mean:", advantage_mean.item())
-        self.logger.log_scalar("Raw advantage_ret std:", advantage_std.item())
-        return returns_batch / advantage_std_clamped
-
-    def compute_advantage_gae(self, states_batch, rewards_batch, padding_mask, **kwargs):
-        """
-        normal gae but no normalisation
-        """
-        # Policy Update
-        with torch.no_grad():
-            updated_values = self.value(states_batch).squeeze(-1)
-            updated_values = updated_values * (1 - padding_mask.float())
-        advantages = gae(self.discount, self.lambda_discount, rewards_batch, updated_values)
-
-        adv_sel = torch.masked_select(advantages, torch.logical_not(padding_mask))
-        advantage_std = adv_sel.std()
-        advantage_std_clamped = advantage_std.clamp_min(1e-2)
-        advantage_mean = adv_sel.mean()
-        self.logger.log_scalar("Raw advantagegae mean:", advantage_mean.item())
-        self.logger.log_scalar("Raw advantagegae std:", advantage_std.item())
-        return advantages / advantage_std_clamped
-
-    def compute_advantage_monte_carlo(self, states_batch, returns_batch, padding_mask, **kwargs):
-        """
-        normal mc-advantage, but no normalisation
-        """
-        # Policy Update
-        with torch.no_grad():
-            updated_values = self.value(states_batch).squeeze(-1)
-
-        advantages = returns_batch - updated_values
-        adv_sel = torch.masked_select(advantages, torch.logical_not(padding_mask))
-        advantage_std = adv_sel.std()
-        advantage_std_clamped = advantage_std.clamp_min(1e-2)
-        advantage_mean = adv_sel.mean()
-        self.logger.log_scalar("Raw advantagemc mean:", advantage_mean.item())
-        self.logger.log_scalar("Raw advantagemc std:", advantage_std.item())
-        return advantages / advantage_std_clamped
-
+    @staticmethod
     def embedding_prediction_error(aux, key_padding_mask, metric="cosine", horizon_discount=0.75):
         pred_steps = aux["contrastive_pred_emb_steps"]
         tgt_emb = aux["contrastive_tgt_emb"]
