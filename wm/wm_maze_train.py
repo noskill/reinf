@@ -201,6 +201,7 @@ def main():
     )
     env = MazeTrainerEnvAdapter(base_env)
     action_dim = int(base_env.action_space_n)
+    sensor_dim = 3
     target_entropy = args.target_entropy
     if target_entropy is None:
         target_entropy = 0.5 * math.log(action_dim)

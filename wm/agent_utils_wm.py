@@ -46,6 +46,8 @@ _MODEL_ARG_DEFAULTS = {
     "probe_hidden_dim": 256,
     "probe_layers": 2,
     "obs_latent_dim": 64,
+    "action_latent_dim": 16,
+    "sensor_latent_dim": 64,
 }
 
 MAZE_WM_MODEL_DEFAULTS = {
@@ -58,6 +60,8 @@ MAZE_WM_MODEL_DEFAULTS = {
     "intermediate": 704,
     "attention_dropout": 0.0,
     "obs_latent_dim": 64,
+    "action_latent_dim": 16,
+    "sensor_latent_dim": 64,
     "probe_hidden_dim": 128,
     "probe_layers": 2,
     "contrastive_dim": 64,
@@ -97,6 +101,8 @@ _MODEL_ARG_FIELDS = (
     "probe_hidden_dim",
     "probe_layers",
     "obs_latent_dim",
+    "action_latent_dim",
+    "sensor_latent_dim",
     "load_path",
 )
 
@@ -334,6 +340,20 @@ def add_create_model_args(
         default=resolved_defaults["obs_latent_dim"],
     )
     parser.add_argument(
+        _arg_option(arg_prefix, "action_latent_dim"),
+        dest=_arg_dest(arg_prefix, "action_latent_dim"),
+        type=int,
+        default=resolved_defaults["action_latent_dim"],
+        help="Latent size for action encoder used by WM backbones.",
+    )
+    parser.add_argument(
+        _arg_option(arg_prefix, "sensor_latent_dim"),
+        dest=_arg_dest(arg_prefix, "sensor_latent_dim"),
+        type=int,
+        default=resolved_defaults["sensor_latent_dim"],
+        help="Latent size for sensor encoder used by WM backbones.",
+    )
+    parser.add_argument(
         _arg_option(arg_prefix, "sensor_mode"),
         dest=_arg_dest(arg_prefix, "sensor_mode"),
         type=str,
@@ -385,6 +405,7 @@ def create_model(
     *,
     input_dim: int,
     sensor_dim: int,
+    action_dim: int,
     sensor_bins,
     loc_x_bins: int,
     loc_y_bins: int,
@@ -392,7 +413,6 @@ def create_model(
     turn_bins: int,
     step_bins: int,
     obs_dim: int,
-    action_dim: int,
     active_attention_window,
     model_config_extra: Dict,
 ):
@@ -416,14 +436,15 @@ def create_model(
             cfg,
             sensor_mode=args.sensor_mode,
             sensor_dim=sensor_dim,
+            action_dim=action_dim,
             sensor_bins=sensor_bins if args.sensor_mode == "categorical" else None,
             loc_x_bins=loc_x_bins,
             loc_y_bins=loc_y_bins,
             heading_dim=heading_dim,
             turn_bins=turn_bins,
             step_bins=step_bins,
-            obs_dim=obs_dim,
-            obs_latent_dim=args.obs_latent_dim,
+            action_latent_dim=args.action_latent_dim,
+            sensor_latent_dim=args.sensor_latent_dim,
             probe_hidden_dim=args.probe_hidden_dim,
             probe_layers=args.probe_layers,
             contrastive_dim=args.contrastive_dim,
@@ -434,6 +455,8 @@ def create_model(
         model_config_extra["probe_layers"] = args.probe_layers
         model_config_extra["contrastive_dim"] = args.contrastive_dim
         model_config_extra["contrastive_steps"] = args.contrastive_steps
+        model_config_extra["action_latent_dim"] = args.action_latent_dim
+        model_config_extra["sensor_latent_dim"] = args.sensor_latent_dim
     elif args.model_type == "rnn":
         if args.sensor_mode != "categorical":
             raise ValueError("model-type=rnn currently supports --sensor-mode categorical only")
@@ -452,14 +475,15 @@ def create_model(
             cfg,
             sensor_mode=args.sensor_mode,
             sensor_dim=sensor_dim,
+            action_dim=action_dim,
             sensor_bins=sensor_bins if args.sensor_mode == "categorical" else None,
             loc_x_bins=loc_x_bins,
             loc_y_bins=loc_y_bins,
             heading_dim=heading_dim,
             turn_bins=turn_bins,
             step_bins=step_bins,
-            obs_dim=obs_dim,
-            obs_latent_dim=args.obs_latent_dim,
+            action_latent_dim=args.action_latent_dim,
+            sensor_latent_dim=args.sensor_latent_dim,
             probe_hidden_dim=args.probe_hidden_dim,
             probe_layers=args.probe_layers,
             state_norm=args.rnn_state_norm,
@@ -475,6 +499,8 @@ def create_model(
             "state_norm": args.rnn_state_norm,
             "contrastive_dim": args.contrastive_dim,
             "contrastive_steps": args.contrastive_steps,
+            "action_latent_dim": args.action_latent_dim,
+            "sensor_latent_dim": args.sensor_latent_dim,
         }
     elif args.model_type == "rssm-discrete":
         model = RSSMDiscretePredictor(

@@ -6,7 +6,7 @@ from util import RunningNorm
 
 
 class SmartClusteringNovelty:
-    def __init__(self, initial_clusters=300, adaptation_frequency=600_000, running_momentum=0.8, reward_scale=0.1):
+    def __init__(self, initial_clusters=6000, adaptation_frequency=200_000, running_momentum=0.99, reward_scale=0.1):
         self.n_clusters = initial_clusters
         self.adaptation_frequency = adaptation_frequency
         self.state_buffer = []
@@ -19,10 +19,12 @@ class SmartClusteringNovelty:
         self.reward_scale = reward_scale
         print('reward scale novelty ' + str(reward_scale))
         self.running_norm = RunningNorm(momentum=running_momentum)
-        self.max_clusters = 300
-        self.min_clusters = 300
-        self.weights = numpy.zeros(self.n_clusters)
+        self.max_clusters = initial_clusters
+        self.min_clusters = initial_clusters
+        self.weights = numpy.zeros(self.n_clusters, dtype=numpy.float64)
         self.momentum = running_momentum
+        self.freeze_after_fit = False
+        self.last_stats = {}
 
     def update(self, states_batch):
         """
@@ -48,16 +50,17 @@ class SmartClusteringNovelty:
             buffer_array = np.array(self.state_buffer)
             self.model.fit(buffer_array)
             self.is_fitted = True
+            self._reset_counts_from_buffer(buffer_array)
             print("[SmartClusteringNovelty] Initial fitting done.")
             return
 
         # Regular incremental update
-        if self.is_fitted:
+        if self.is_fitted and not self.freeze_after_fit:
             self.model.partial_fit(states_batch)
 
         # Periodically adjust the cluster count using the silhouette method
         # This check ensures adaptation runs only once per adaptation_frequency steps.
-        if self.steps % self.adaptation_frequency < len(states_batch):
+        if self.is_fitted and not self.freeze_after_fit and self.steps % self.adaptation_frequency < len(states_batch):
             self.adapt_cluster_count()
             self.steps = 0
 
@@ -66,6 +69,10 @@ class SmartClusteringNovelty:
         Adapt the number of clusters using silhouette analysis.
         """
         if len(self.state_buffer) < self.n_clusters * 2:
+            return
+
+        self.model._counts = np.ones(self.n_clusters, dtype=self.model.cluster_centers_.dtype)
+        if self.n_clusters == self.min_clusters and self.n_clusters == self.max_clusters:
             return
 
         buffer_array = np.array(self.state_buffer)
@@ -115,6 +122,7 @@ class SmartClusteringNovelty:
             self.n_clusters = best_k
             self.model = MiniBatchKMeans(n_clusters=self.n_clusters, batch_size=self.batch_size)
             self.model.fit(buffer_array)
+            self._reset_counts_from_buffer(buffer_array)
         else:
             print(f"[SmartClusteringNovelty] Keeping cluster count at {self.n_clusters} (silhouette score: {best_score:.3f})")
 
@@ -128,6 +136,20 @@ class SmartClusteringNovelty:
             self.model = MiniBatchKMeans(n_clusters=self.n_clusters, batch_size=self.batch_size)
             self.model.fit(buffer_array)
             self.is_fitted = True
+            self._reset_counts_from_buffer(buffer_array)
+
+    def _resize_count_buffers(self):
+        self.weights = numpy.zeros(self.n_clusters, dtype=numpy.float64)
+
+    def _reset_counts_from_buffer(self, buffer_array):
+        self._resize_count_buffers()
+        if len(buffer_array) == 0:
+            return
+        assigned = self.model.predict(buffer_array)
+        weights = numpy.zeros_like(self.weights)
+        numpy.add.at(weights, assigned, 1.0)
+        total = max(float(weights.sum()), 1.0)
+        self.weights = weights / total
 
     def __call__(self, states):
         return self.compute_novelty_reward(states)
@@ -159,20 +181,35 @@ class SmartClusteringNovelty:
         # The novelty reward is based on the minimum distance.
         assigned = np.argmin(distances, axis=1)
         min_distances = distances[np.arange(len(states)), assigned]
-
-        weights = numpy.zeros_like(self.weights)
-        np.add.at(weights, assigned, 1)
-        weights /= (weights.sum() + 0.000001)
-
+        
         if self.weights.max() <= 0.0:
             visit_reward = numpy.ones_like(min_distances)
         else:
-            inverse = 1 - (self.weights / self.weights.max())
+            inverse = 1.0 - (self.weights / self.weights.max())
             visit_reward = inverse[assigned]
-        dist_reward = min_distances / (min_distances.mean() + 1e-8)
+        dist_norm = min_distances / (min_distances.mean() + 1e-8)
+        dist_reward = np.clip(dist_norm - 1.0, 0.0, 1.0)
         reward = visit_reward
-        reward = visit_reward * dist_reward
+        reward = visit_reward + dist_reward * 0.3
         clipped = np.clip(reward, -3.0, 3.0)
 
-        self.weights = self.weights * self.momentum + (1 - self.momentum) * weights
+        batch_counts = numpy.zeros_like(self.weights)
+        np.add.at(batch_counts, assigned, 1.0)
+        batch_weights = batch_counts / (batch_counts.sum() + 1e-6)
+        self.weights = self.weights * self.momentum + (1 - self.momentum) * batch_weights
+
+        probs = self.weights[self.weights > 0.0] / self.weights.sum()
+        assignment_probs = batch_counts / max(float(batch_counts.sum()), 1.0)
+        assignment_nonzero = assignment_probs[assignment_probs > 0.0]
+        self.last_stats = {
+            "used_clusters_batch": int((batch_counts > 0.0).sum()),
+            "assignment_entropy": float(-(assignment_nonzero * numpy.log(assignment_nonzero)).sum()) if assignment_nonzero.size else 0.0,
+            "top1_mass": float(self.weights.max()) if self.weights.size else 0.0,
+            "weight_nonzero": int((self.weights > 0.0).sum()),
+            "weight_entropy": float(-(probs * numpy.log(probs)).sum()) if probs.size else 0.0,
+            "min_distance_mean": float(min_distances.mean()) if min_distances.size else 0.0,
+            "min_distance_std": float(min_distances.std()) if min_distances.size else 0.0,
+            "reward_mean": float(clipped.mean()) if clipped.size else 0.0,
+            "reward_max": float(clipped.max()) if clipped.size else 0.0,
+        }
         return clipped * self.reward_scale

@@ -57,9 +57,10 @@ def create_maze_world_model(
         else None
     )
     model_config_extra: Dict = {}
+    input_dim = int(model_args.sensor_latent_dim) + int(model_args.action_latent_dim)
     model = create_model(
         model_args,
-        input_dim=5,  # 3 sensor + 2 action
+        input_dim=input_dim,
         sensor_dim=3,
         sensor_bins=sensor_bins,
         loc_x_bins=int(maze_dim),
@@ -324,6 +325,7 @@ class BaseWMOnPolicy:
             self.wm_model.train()
         self.policy.train()
         cpc_error_before = self._evaluate_step_cpc_error_no_grad(self.wm_model, obs_new, targets_new)
+        sensor_error_before = self._evaluate_step_sensor_error_no_grad(self.wm_model, obs_new, targets_new)
         with torch.no_grad():
             state_out_fixed = self.wm_model(obs_new)
             old_state_seq = state_out_fixed["state_seq"].detach()
@@ -382,17 +384,29 @@ class BaseWMOnPolicy:
 
         if wm_updates > 0:
             cpc_error_after = self._evaluate_step_cpc_error_no_grad(self.wm_model, obs_new, targets_new)
+            sensor_error_after = self._evaluate_step_sensor_error_no_grad(self.wm_model, obs_new, targets_new)
         else:
             cpc_error_after = cpc_error_before
+            sensor_error_after = sensor_error_before
 
         flat_emb = flatten_padded(embs, obs_new["key_padding_mask"]).detach()
         cluster_dist_novelty = unflatten_padded(self.clustering(flat_emb),
                                                 obs_new["key_padding_mask"], dtype=embs.dtype).to(embs)
         self.clustering.update(flat_emb)
+        for key, value in getattr(self.clustering, "last_stats", {}).items():
+            self.logger.log_scalar(f"cluster/{key}", value)
 
-        self.logger.log_scalar("emb std mean", flat_emb.std(dim=0).mean().item())
-        self.logger.log_scalar("emb norm mean/std", flat_emb.norm(dim=1).mean().item())
-        self.logger.log_scalar("pairwise sample dist", torch.pdist(flat_emb[torch.randperm(len(flat_emb), device=flat_emb.device)[:512]]).mean().item())
+        emb_sample = flat_emb
+        if flat_emb.shape[0] > 4096:
+            sample_idx = torch.randperm(flat_emb.shape[0], device=flat_emb.device)[:4096]
+            emb_sample = flat_emb[sample_idx]
+        emb_pairwise_dist = torch.pdist(emb_sample.to(torch.float32))
+        self.logger.log_scalar("emb/std_dim_mean", flat_emb.std(dim=0, unbiased=False).mean().item())
+        self.logger.log_scalar("emb/std_dim_max", flat_emb.std(dim=0, unbiased=False).max().item())
+        self.logger.log_scalar("emb/norm_mean", flat_emb.norm(dim=1).mean().item())
+        self.logger.log_scalar("emb/norm_std", flat_emb.norm(dim=1).std(unbiased=False).item())
+        self.logger.log_scalar("euclidean/emb_dist_mean", emb_pairwise_dist.mean().item())
+        self.logger.log_scalar("euclidean/emb_dist_std", emb_pairwise_dist.std(unbiased=False).item())
 
         emb_pred_error = self.embedding_prediction_error(state_out_fixed['aux'],
                                                          key_padding_mask=obs_new["key_padding_mask"],
@@ -401,6 +415,8 @@ class BaseWMOnPolicy:
         intrinsic_rewards = self._compute_intrinsic_rewards(
             cpc_error_before=cpc_error_before,
             cpc_error_after=cpc_error_after,
+            sensor_error_before=sensor_error_before,
+            sensor_error_after=sensor_error_after,
             key_padding_mask=obs_new["key_padding_mask"],
             divergence_novelty=divergence_novelty,
             episode_novelty=episode_novelty,
@@ -467,6 +483,8 @@ class BaseWMOnPolicy:
         *,
         cpc_error_before: torch.Tensor,
         cpc_error_after: torch.Tensor,
+        sensor_error_before: torch.Tensor,
+        sensor_error_after: torch.Tensor,
         key_padding_mask: torch.Tensor,
         divergence_novelty: torch.Tensor,
         episode_novelty: torch.Tensor,
@@ -475,6 +493,8 @@ class BaseWMOnPolicy:
         embedding_prediction_error,
     ) -> torch.Tensor:
         lp_rewards_new = cpc_error_before - cpc_error_after
+        sensor_lp_rewards_new = sensor_error_before - sensor_error_after
+        sensor_lp_rewards_pos = sensor_lp_rewards_new.clamp_min(0.0)
         valid = ~key_padding_mask
 
         lp_surprise = lp_rewards_new + cpc_error_before * 0.001
@@ -495,10 +515,20 @@ class BaseWMOnPolicy:
         # reward = episode_novelty
 
         # clustering-based
-        reward = cluster_dist_novelty
+        #reward = cluster_dist_novelty
+
+        # sensor prediction learning progress
+        # reward = sensor_lp_rewards_pos
+
+        # sensor prediction surprise
+        # reward = sensor_error_before
 
         #embedding_prediction_error
         # reward = embedding_prediction_error
+
+
+        # lp + divergence
+        reward = sensor_lp_rewards_pos + self.wm_divergence_novelty_coef * divergence_novelty + 0.02 * sensor_error_before
 
         reward_next = reward[:, 1:]
         reward_curr = reward[:, :-1]
@@ -517,6 +547,9 @@ class BaseWMOnPolicy:
 
         self.logger.log_scalar("reward/lp_mean", lp_rewards_new.detach().mean().cpu().item())
         self.logger.log_scalar("reward/surprise_mean", cpc_error_before.detach().mean().cpu().item() * 0.001)
+        self.logger.log_scalar("reward/sensor_lp_mean", self._masked_mean(sensor_lp_rewards_new, valid))
+        self.logger.log_scalar("reward/sensor_lp_pos_mean", self._masked_mean(sensor_lp_rewards_pos, valid))
+        self.logger.log_scalar("reward/sensor_surprise_mean", self._masked_mean(sensor_error_before, valid))
         self.logger.log_scalar("reward/novelty_signal_mean", self._masked_mean(novelty_signal, valid))
         self._log_first_last_window_means(
             values=intrinsic_rewards,
@@ -773,11 +806,18 @@ class BaseWMOnPolicy:
         state_seq: torch.Tensor,
         key_padding_mask: torch.Tensor,
     ) -> torch.Tensor:
-        center = state_seq.mean(dim=0, keepdim=True)
-        dist = (state_seq - center).pow(2).sum(dim=-1).sqrt()
         valid = ~key_padding_mask
-        novelty_raw = dist * valid
-        novelty = torch.zeros_like(novelty_raw)
+        batch_size, step_size, _ = state_seq.shape
+        ids = torch.arange(batch_size, device=state_seq.device).unsqueeze(1).expand(batch_size, step_size)
+        flat_seq = flatten_padded(state_seq, key_padding_mask)
+        flat_ids = flatten_padded(ids.unsqueeze(2), key_padding_mask)
+        dist = torch.cdist(flat_seq, flat_seq)
+        # id_dist = torch.abs(flat_ids.unsqueeze(1) - flat_ids.unsqueeze(0))
+        same_batch_mask = torch.cdist(flat_ids.float(), flat_ids.float(), p=1) == 0
+        dist[same_batch_mask] = float('inf')
+        min_cross_batch_dist, min_indices = torch.min(dist, dim=1)
+        novelty = unflatten_padded(min_cross_batch_dist, key_padding_mask)
+        novelty_raw = novelty
         if valid.any():
             # novelty_valid = self._divergence_running_norm(novelty_raw[valid].reshape(-1, 1)).reshape(-1)
             novelty_valid = novelty_raw[valid]
@@ -883,6 +923,52 @@ class BaseWMOnPolicy:
         stability_loss = diff.pow(2).mean()
         drift_mean = diff.norm(dim=-1).mean()
         return stability_loss, drift_mean
+
+    def _evaluate_step_sensor_error_no_grad(
+        self,
+        wm_model,
+        obs: Dict[str, torch.Tensor],
+        targets: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        was_training = wm_model.training
+        wm_model.eval()
+        with torch.no_grad():
+            forward_out = wm_model(obs)
+            pred_sensor = forward_out["preds"][0]
+            sensor_error = self._compute_step_sensor_error_from_preds(
+                wm_model,
+                pred_sensor=pred_sensor,
+                targets=targets,
+            ).to(torch.float32)
+        if was_training:
+            wm_model.train()
+        return sensor_error
+
+    @staticmethod
+    def _compute_step_sensor_error_from_preds(
+        wm_model,
+        *,
+        pred_sensor,
+        targets: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        key_padding_mask = targets["key_padding_mask"]
+        if getattr(wm_model, "sensor_mode", "categorical") == "categorical":
+            cfg = wm_model.config
+            pred_l, pred_f, pred_r = pred_sensor
+            idx = targets["y_sensor_idx"].clamp(min=0)
+            if cfg.sensor_min_idx is not None:
+                idx = (idx - cfg.sensor_min_idx.view(1, 1, -1)).clamp(min=0)
+            idx_l = idx[..., 0].clamp(max=cfg.sensor_tables[0].shape[0] - 1)
+            idx_f = idx[..., 1].clamp(max=cfg.sensor_tables[1].shape[0] - 1)
+            idx_r = idx[..., 2].clamp(max=cfg.sensor_tables[2].shape[0] - 1)
+            error = (
+                -(cfg.sensor_tables[0][idx_l] * F.log_softmax(pred_l, dim=-1)).sum(dim=-1)
+                -(cfg.sensor_tables[1][idx_f] * F.log_softmax(pred_f, dim=-1)).sum(dim=-1)
+                -(cfg.sensor_tables[2][idx_r] * F.log_softmax(pred_r, dim=-1)).sum(dim=-1)
+            )
+        else:
+            error = (pred_sensor - targets["y_sensor"]).pow(2).mean(dim=-1)
+        return error.masked_fill(key_padding_mask, 0.0)
 
     def _evaluate_step_cpc_error_no_grad(self, wm_model, obs: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> torch.Tensor:
         was_training = wm_model.training

@@ -241,9 +241,12 @@ def main():
     logger.log_scalar("config/epochs", float(args.epochs), step=0)
     logger.log_scalar("config/lr", float(args.lr), step=0)
     logger.log_scalar("config/weight_decay", float(args.weight_decay), step=0)
-
+    model_args = extract_create_model_args(args, device=args.device)
+    sensor_latent_dim = int(model_args.sensor_latent_dim)
+    action_latent_dim = int(model_args.action_latent_dim)
     input_obs_dim = sequences[0].obs_cont.shape[-1]
-    input_dim = input_obs_dim + sequences[0].action_cont.shape[-1]
+    input_dim = sensor_latent_dim + action_latent_dim
+    action_dim = sequences[0].action_cont.shape[-1]
     obs_dim = input_obs_dim
     sensor_dim = 3
     sensor_min_idx = torch.tensor(stats.sensor_min, dtype=torch.long, device=args.device)
@@ -255,7 +258,6 @@ def main():
     turn_bins = len(stats.turn_to_idx)
     step_bins = len(stats.step_to_idx)
     action_dim = int(sequences[0].action_cont.shape[-1])
-    model_args = extract_create_model_args(args, device=args.device)
     active_attention_window = (
         model_args.attention_window
         if (model_args.attention_window is not None and model_args.attention_window > 0)

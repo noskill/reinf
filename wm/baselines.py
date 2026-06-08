@@ -21,14 +21,15 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         *,
         sensor_mode: str,
         sensor_dim: int,
+        action_dim: int,
         sensor_bins: Optional[np.ndarray],
         loc_x_bins: int,
         loc_y_bins: int,
         heading_dim: int,
         turn_bins: int,
         step_bins: int,
-        obs_dim: int,
-        obs_latent_dim: int,
+        action_latent_dim: int,
+        sensor_latent_dim: int,
         probe_hidden_dim: int = 256,
         probe_layers: int = 2,
         contrastive_dim: int = 0,
@@ -41,7 +42,10 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         self.turn_bins = turn_bins
         self.step_bins = step_bins
         self.input_size = config.input_size
-        self.action_dim = int(config.input_size - sensor_dim)
+        self.action_latent_dim = action_latent_dim
+        self.sensor_latent_dim = sensor_latent_dim
+        self.sensor_dim = sensor_dim
+        self.action_dim = action_dim
         if self.action_dim <= 0:
             raise ValueError("action_dim inferred from config.input_size - sensor_dim must be > 0")
         self.probe_hidden_dim = int(probe_hidden_dim)
@@ -66,12 +70,9 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         self.loc_x_head = make_probe_head(config.hidden_size, loc_x_bins, self.probe_hidden_dim, self.probe_layers)
         self.loc_y_head = make_probe_head(config.hidden_size, loc_y_bins, self.probe_hidden_dim, self.probe_layers)
         self.heading_head = make_probe_head(config.hidden_size, heading_dim, self.probe_hidden_dim, self.probe_layers)
-        self.action_encoder = nn.Sequential(
-            nn.Linear(self.action_dim, obs_latent_dim),
-            nn.ReLU(),
-            nn.Linear(obs_latent_dim, obs_latent_dim),
-        )
-        self.obs_fuse = nn.Linear(config.hidden_size + obs_latent_dim, config.hidden_size)
+        self.action_encoder = make_probe_head(self.action_dim, self.action_latent_dim, self.probe_hidden_dim, 2)
+        self.sensor_encoder = make_probe_head(self.sensor_dim, self.sensor_latent_dim, self.probe_hidden_dim, 2)
+        self.obs_fuse = nn.Linear(config.hidden_size + self.action_latent_dim, config.hidden_size)
         self.turn_head = nn.Linear(config.hidden_size, turn_bins)
         self.step_head = nn.Linear(config.hidden_size, step_bins)
         self.contrastive_target_head: Optional[nn.Module] = None
@@ -85,7 +86,7 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
             self.contrastive_action_heads = nn.ModuleList(
                 [
                     nn.Sequential(
-                        nn.Linear(config.hidden_size + h * self.action_dim, config.hidden_size),
+                        nn.Linear(config.hidden_size + h * self.action_latent_dim, config.hidden_size),
                         nn.ReLU(),
                         nn.Linear(config.hidden_size, self.contrastive_dim),
                     )
@@ -163,7 +164,9 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
             else:
                 self.reset_cache(episode_start_t)
 
-        x = torch.cat([sensor, prev_actions], dim=-1)
+        prev_action_latent = self.action_encoder(prev_actions)
+        sensor_latent = self.sensor_encoder(sensor)
+        x = torch.cat([sensor_latent, prev_action_latent], dim=-1)
         if x.shape[-1] != self.input_size:
             raise ValueError(f"Expected input_size {self.input_size}, got {x.shape[-1]}")
 
@@ -198,7 +201,7 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         if need_aux:
             aux_inputs = {}
             aux_inputs["contrastive_tgt_emb"] = self._project_contrastive_target_h(h)
-            aux_inputs["contrastive_pred_emb_steps"] = self._project_contrastive_pred_steps(h, actions)
+            aux_inputs["contrastive_pred_emb_steps"] = self._project_contrastive_pred_steps(h, action_latent)
 
         preds = (pred_sensor, loc_x, loc_y, heading, turn, step)
         return preds, aux_inputs, h, h[:, -1, :]
@@ -236,8 +239,9 @@ class RNNPredictor(TransformerBaseline):
         heading_dim: int,
         turn_bins: int,
         step_bins: int,
-        obs_dim: int,
-        obs_latent_dim: int,
+        action_dim: int,
+        action_latent_dim: int,
+        sensor_latent_dim: int,
         probe_hidden_dim: int = 256,
         probe_layers: int = 2,
         state_norm: str = "none",
@@ -254,8 +258,9 @@ class RNNPredictor(TransformerBaseline):
             heading_dim=heading_dim,
             turn_bins=turn_bins,
             step_bins=step_bins,
-            obs_dim=obs_dim,
-            obs_latent_dim=obs_latent_dim,
+            action_dim=action_dim,
+            action_latent_dim=action_latent_dim,
+            sensor_latent_dim=sensor_latent_dim,
             probe_hidden_dim=probe_hidden_dim,
             probe_layers=probe_layers,
             contrastive_dim=contrastive_dim,
@@ -325,7 +330,9 @@ class RNNPredictor(TransformerBaseline):
         else:
             h0 = None
 
-        x = torch.cat([sensor, prev_actions], dim=-1)
+        prev_action_latent = self.action_encoder(prev_actions)
+        sensor_latent = self.sensor_encoder(sensor)
+        x = torch.cat([sensor_latent, prev_action_latent], dim=-1)
         if x.shape[-1] != self.input_size:
             raise ValueError(f"Expected input_size {self.input_size}, got {x.shape[-1]}")
 
@@ -358,7 +365,7 @@ class RNNPredictor(TransformerBaseline):
         if need_aux:
             aux_inputs = {}
             aux_inputs["contrastive_tgt_emb"] = self._project_contrastive_target_h(h)
-            aux_inputs["contrastive_pred_emb_steps"] = self._project_contrastive_pred_steps(h, actions)
+            aux_inputs["contrastive_pred_emb_steps"] = self._project_contrastive_pred_steps(h, action_latent)
 
         preds = (pred_sensor, loc_x, loc_y, heading, turn, step)
         return preds, aux_inputs, h, h[:, -1, :]
@@ -370,21 +377,21 @@ class RNNPredictor(TransformerBaseline):
         for i in range(0, x.size(1), window_size):
             # Slice the current sequence window
             x_chunk = x[:, i : i + window_size, :]
-            
+
             # Forward pass: current hidden state flows in
             # h_chunk: (batch, window_size, hidden_size)
             # h_current: (num_layers, batch, hidden_size)
             h_chunk, h_current = self.backbone(x_chunk, h_current)
-            
+
             # Store output chunk for the final 'h' result
             all_h_chunks.append(h_chunk)
-        
+
             # --- CRITICAL STEP FOR BACKPROP RESTRICTION ---
             # This detaches the hidden state from the graph.
             # Gradients will NOT flow from the next window back into this one.
-            h_current = h_current.detach() 
+            h_current = h_current.detach()
             # ----------------------------------------------
-        
+
         # 3. Reconstruct the full 'h' and 'h_n'
         # h will have shape (batch, 2048, hidden_size)
         h = torch.cat(all_h_chunks, dim=1)
