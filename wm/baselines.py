@@ -34,6 +34,7 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         probe_layers: int = 2,
         contrastive_dim: int = 0,
         contrastive_steps: int = 1,
+        cpc_context_dim=128,
     ):
         super().__init__()
         self.backbone = LlamaModel(config)
@@ -72,6 +73,7 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         self.heading_head = make_probe_head(config.hidden_size, heading_dim, self.probe_hidden_dim, self.probe_layers)
         self.action_encoder = make_probe_head(self.action_dim, self.action_latent_dim, self.probe_hidden_dim, 2)
         self.sensor_encoder = make_probe_head(self.sensor_dim, self.sensor_latent_dim, self.probe_hidden_dim, 2)
+        self.contrastive_context = nn.Linear(config.hidden_size, cpc_context_dim)
         self.obs_fuse = nn.Linear(config.hidden_size + self.action_latent_dim, config.hidden_size)
         self.turn_head = nn.Linear(config.hidden_size, turn_bins)
         self.step_head = nn.Linear(config.hidden_size, step_bins)
@@ -79,18 +81,18 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         self.contrastive_action_heads: Optional[nn.ModuleList] = None
         if self.contrastive_dim > 0:
             self.contrastive_target_head = nn.Sequential(
-                nn.Linear(config.hidden_size, config.hidden_size),
+                nn.Linear(cpc_context_dim, config.hidden_size),
                 nn.ReLU(),
                 nn.Linear(config.hidden_size, self.contrastive_dim),
             )
             self.contrastive_action_heads = nn.ModuleList(
                 [
                     nn.Sequential(
-                        nn.Linear(config.hidden_size + h * self.action_latent_dim, config.hidden_size),
+                        nn.Linear(cpc_context_dim + s * self.action_latent_dim, config.hidden_size),
                         nn.ReLU(),
                         nn.Linear(config.hidden_size, self.contrastive_dim),
                     )
-                    for h in range(1, self.contrastive_steps + 1)
+                    for s in range(1, self.contrastive_steps + 1)
                 ]
             )
         self._num_envs: Optional[int] = None
@@ -197,11 +199,12 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         heading = self.heading_head(h_probe)
         turn = self.turn_head(action_feat)
         step = self.step_head(action_feat)
+        contrastive_input = self.contrastive_context(h)
         aux_inputs = None
         if need_aux:
             aux_inputs = {}
-            aux_inputs["contrastive_tgt_emb"] = self._project_contrastive_target_h(h)
-            aux_inputs["contrastive_pred_emb_steps"] = self._project_contrastive_pred_steps(h, action_latent)
+            aux_inputs["contrastive_tgt_emb"] = self._project_contrastive_target_h(contrastive_input)
+            aux_inputs["contrastive_pred_emb_steps"] = self._project_contrastive_pred_steps(contrastive_input, action_latent)
 
         preds = (pred_sensor, loc_x, loc_y, heading, turn, step)
         return preds, aux_inputs, h, h[:, -1, :]
@@ -362,10 +365,11 @@ class RNNPredictor(TransformerBaseline):
         turn = self.turn_head(action_feat)
         step = self.step_head(action_feat)
         aux_inputs = None
+        contrastive_input = self.contrastive_context(h)
         if need_aux:
             aux_inputs = {}
-            aux_inputs["contrastive_tgt_emb"] = self._project_contrastive_target_h(h)
-            aux_inputs["contrastive_pred_emb_steps"] = self._project_contrastive_pred_steps(h, action_latent)
+            aux_inputs["contrastive_tgt_emb"] = self._project_contrastive_target_h(contrastive_input)
+            aux_inputs["contrastive_pred_emb_steps"] = self._project_contrastive_pred_steps(contrastive_input, action_latent)
 
         preds = (pred_sensor, loc_x, loc_y, heading, turn, step)
         return preds, aux_inputs, h, h[:, -1, :]
