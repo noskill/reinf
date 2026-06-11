@@ -174,14 +174,15 @@ def main():
 
     run_dir = args.experiment_dir or default_experiment_dir(args.experiment_name)
     checkpoint_dir = os.path.join(run_dir, "checkpoints")
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    copy_python_sources(str(THIS_DIR), run_dir)
+    os.makedirs(run_dir, exist_ok=True)
     lockfile_path = os.path.join(run_dir, "lock.file")
     if os.path.exists(lockfile_path):
         print(f"lockfile exists {lockfile_path}")
         return
     with open(lockfile_path, "w", encoding="utf-8"):
         pass
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    copy_python_sources(str(THIS_DIR), run_dir)
 
     if args.render and args.num_envs != 1:
         raise ValueError("--render requires --num-envs 1")

@@ -16,7 +16,8 @@ import torch
 from torch.distributions import Categorical
 
 from agent_utils_wm import MAZE_WM_MODEL_DEFAULTS, add_create_model_args, extract_create_model_args
-from wm_joint_agent import WMActionHeadPolicy, create_maze_world_model
+from policy_head import WMActionHeadPolicy
+from wm_joint_agent import create_maze_world_model
 
 
 THIS_DIR = Path(__file__).resolve().parent
@@ -203,6 +204,19 @@ def _load_wm_weights_from_checkpoint(wm_model: torch.nn.Module, checkpoint: Dict
     raise RuntimeError("Unsupported checkpoint format.")
 
 
+def _load_policy_weights_from_checkpoint(policy: torch.nn.Module, checkpoint: Dict[str, Any]) -> None:
+    agent_state = checkpoint.get("agent_state", checkpoint)
+    if not isinstance(agent_state, dict):
+        raise RuntimeError("Unsupported checkpoint format: missing agent state.")
+    policy_state = agent_state.get("policy_state", agent_state)
+    if not isinstance(policy_state, dict):
+        raise RuntimeError("Unsupported checkpoint format: missing policy state.")
+    policy_weights = policy_state.get("policy", None)
+    if policy_weights is None:
+        raise RuntimeError("Unsupported checkpoint format: missing policy weights.")
+    policy.load_state_dict(policy_weights)
+
+
 def main() -> None:
     args = parse_args()
 
@@ -263,15 +277,19 @@ def main() -> None:
     wm_model.eval()
 
     policy = WMActionHeadPolicy(
-        wm_model=wm_model,
         action_table=env.action_table,
         device=device,
-        backprop_through_wm=False,
+        input_dim=int(wm_model_args.hidden_size),
     )
+    _load_policy_weights_from_checkpoint(policy, checkpoint)
     policy.eval()
-    policy.reset_policy_state()
+
+    action_cont_table = torch.as_tensor(env.action_table, dtype=torch.float32, device=device)
+    prev_actions = torch.zeros((env.num_envs, action_cont_table.shape[1]), dtype=torch.float32, device=device)
 
     obs = env.reset(seed=args.seed)
+    if hasattr(wm_model, "clear_cache"):
+        wm_model.clear_cache()
     episode_start = torch.ones(env.num_envs, dtype=torch.bool, device=device)
     completed = 0
     total_steps = 0
@@ -288,12 +306,22 @@ def main() -> None:
     try:
         while completed < args.episodes:
             with torch.no_grad():
-                logits = policy(obs, episode_start=episode_start)
+                if episode_start.any():
+                    prev_actions[episode_start] = 0.0
+                sensor = obs["sensor"].to(device=device, dtype=torch.float32)
+                model_obs = {
+                    "sensor": sensor.unsqueeze(1),
+                    "actions": None,
+                    "prev_actions": prev_actions.unsqueeze(1),
+                }
+                wm_out = wm_model(model_obs, episode_start=episode_start)
+                policy_state = wm_out["state_last"].detach()
+                logits = policy(policy_state)
                 if args.deterministic:
-                    action = torch.argmax(logits, dim=-1).to(torch.int32)
+                    action = torch.argmax(logits, dim=-1).to(torch.long)
                 else:
-                    action = Categorical(logits=logits).sample().to(torch.int32)
-            policy.record_sampled_actions(action)
+                    action = Categorical(logits=logits).sample().to(torch.long)
+                prev_actions = action_cont_table[action].detach()
 
             obs, _reward, done, info = env.step(action)
             done_t = done.to(torch.bool)

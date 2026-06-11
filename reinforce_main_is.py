@@ -117,18 +117,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     else:
         experiment_dir = args_cli.experiment_dir
 
-    copy_python_sources(os.path.dirname(os.path.abspath(__file__)), experiment_dir)
     checkpoint_dir = os.path.join(experiment_dir, "checkpoints")
     print(f"[INFO] Logging experiment in directory: {experiment_dir}")
 
-    env = setup_env(env_cfg, args_cli, experiment_dir)
-
+    os.makedirs(experiment_dir, exist_ok=True)
     lockfile_path = os.path.join(experiment_dir, 'lock.file')
     if os.path.exists(lockfile_path):
         print(f"lockfile exists {lockfile_path}")
         return
     with open(lockfile_path, 'w') as f:
         pass
+    copy_python_sources(os.path.dirname(os.path.abspath(__file__)), experiment_dir)
+
+    env = setup_env(env_cfg, args_cli, experiment_dir)
 
     # Create logger
     logger = Logger(experiment_dir)
