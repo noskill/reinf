@@ -7,7 +7,7 @@ https://arxiv.org/pdf/2503.04416
 
 Key components of DREAMER/TWISTER
 
-ht =Fϕ​(ht-1,zt-1​,at−1​)  - context encoder e.g. RNN or transformer.
+ht =Fϕ(ht-1, zt-1, at−1)  - context encoder e.g. RNN or transformer.
 zt ∼ qϕ(zt | ot)  - observation encoder, models distribution of z_t given only current observation ot e.g. VAE encoder in dreamer v3 its zt ∼ qϕ(* | ot, ht) .
 zt ∼ dϕ(zt | ht) - dynamics predictor: models distribution of world state given context. Virtually this predicts how world changes given previous state and action at-1which encoded in ht
 st = {ht, zt} - concatenation of context and world state.
@@ -42,14 +42,11 @@ Having said that it helps to concatenate many observations ot or use dreamer sty
 Both methods are reported to work best with discrete distribution of world states  zt.  though can be used with different distributions.
 
 
-conceptually:
-
 baselines:
 h0 = f(h-1,a-1, o0)
 h0 -> a0
 h0, a0 -> predict o1
 h1 = f(h0, a0, o1)
-
 
 
 // world models
