@@ -238,6 +238,7 @@ def main():
         pos_sigma=args.wm_pos_sigma,
         heading_smoothing=args.wm_heading_smoothing,
         sensor_max_bin=args.wm_sensor_max_bin,
+        logger=logger
     )
     policy_input_dim = int(wm_model_args.hidden_size)
     policy_module = WMActionHeadPolicy(

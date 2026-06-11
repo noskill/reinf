@@ -415,6 +415,7 @@ def create_model(
     obs_dim: int,
     active_attention_window,
     model_config_extra: Dict,
+    logger=None,
 ):
     if args.model_type == "transformer":
         if args.sensor_mode != "categorical":
@@ -431,6 +432,7 @@ def create_model(
             head_dim=args.head_dim,
             attention_dropout=args.attention_dropout,
             attention_window=active_attention_window,
+            logger=logger,
         )
         model = TransformerBaseline(
             cfg,
@@ -449,6 +451,7 @@ def create_model(
             probe_layers=args.probe_layers,
             contrastive_dim=args.contrastive_dim,
             contrastive_steps=args.contrastive_steps,
+            logger=logger,
         ).to(args.device)
         model_config_extra["llama"] = asdict(cfg)
         model_config_extra["probe_hidden_dim"] = args.probe_hidden_dim
@@ -489,6 +492,7 @@ def create_model(
             state_norm=args.rnn_state_norm,
             contrastive_dim=args.contrastive_dim,
             contrastive_steps=args.contrastive_steps,
+            logger=logger,
         ).to(args.device)
         model_config_extra["rnn"] = {
             "input_size": input_dim,
@@ -536,6 +540,7 @@ def create_model(
             state_norm=args.rssm_state_norm,
             recon_beta=args.recon_beta,
             obs_loss_mode=args.obs_loss_mode,
+            logger=logger,
         ).to(args.device)
         model_config_extra["rssm"] = {
             "hidden_size": args.hidden_size,

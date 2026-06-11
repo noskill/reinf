@@ -205,6 +205,10 @@ def masked_action_acc(logits: torch.Tensor, target_idx: torch.Tensor, mask: torc
     return correct
 
 
+def scale_upstream_grad(x, scale: float):
+    return x.detach() + scale * (x - x.detach())
+
+
 def batch_row_k_step_contrastive_pair_stats(
     pred_steps: List[torch.Tensor],
     target_emb: Optional[torch.Tensor],

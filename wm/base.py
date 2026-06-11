@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
+import neural_sfa
 
 from utils import (
     batch_row_k_step_contrastive_pair_stats,
@@ -257,6 +258,26 @@ class PredictionLossMixin:
             temperature=temperature,
             horizon_discount=horizon_discount,
         )
+    
+    def compute_sfa_loss(self,
+        aux_inputs: Optional[Dict[str, torch.Tensor]],
+        key_padding_mask: torch.Tensor):
+        sfa = aux_inputs['sfa']
+        valid_pairs = (~key_padding_mask[:, 1:]) & (~key_padding_mask[:, :-1])
+        y = sfa[:, 1:][valid_pairs]
+        y_prev = sfa[:, :-1][valid_pairs]
+        if y.shape[0] < 2:
+            return {'loss': sfa.sum() * 0.0}
+
+        if y.shape[0] < 2:
+            raise ValueError("SFA loss needs at least 2 valid adjacent pairs")
+
+        loss, l_slowness, l_var, l_corr = neural_sfa.sfa_loss(y, y_prev=y_prev, return_components=True)
+        self.logger.log_scalar('sfa/loss', loss.detach().item())
+        self.logger.log_scalar('sfa/slow', l_slowness.detach().item())
+        self.logger.log_scalar('sfa/var', l_var.detach().item())
+        self.logger.log_scalar('sfa/corr', l_corr.detach().item())
+        return {'loss': loss}
 
     def compute_losses_and_metrics(
         self,
@@ -308,7 +329,10 @@ class PredictionLossMixin:
             temperature=cfg.contrastive_temp,
             horizon_discount=cfg.contrastive_horizon_discount,
         )
+        sfa_results = self.compute_sfa_loss(aux_inputs=aux_inputs,
+                                            key_padding_mask=targets["key_padding_mask"])
         losses["contrastive"] = contrastive_results["loss"]
+        losses["sfa"] = sfa_results['loss']
         return losses
 
     def compute_metrics(

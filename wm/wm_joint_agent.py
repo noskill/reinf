@@ -40,6 +40,7 @@ def create_maze_world_model(
     pos_sigma: float = 1.0,
     heading_smoothing: float = 0.0,
     sensor_max_bin: int = 64,
+    logger=None
 ) -> TransformerBaseline:
     if int(model_args.contrastive_dim) <= 0:
         raise ValueError("contrastive_dim must be > 0 for AC-CPC intrinsic reward")
@@ -72,6 +73,7 @@ def create_maze_world_model(
         action_dim=2,
         active_attention_window=active_attention_window,
         model_config_extra=model_config_extra,
+        logger=logger,
     )
     loc_min = torch.tensor([0.0, 0.0], dtype=torch.float32, device=device)
     sensor_min_idx = torch.zeros(3, dtype=torch.long, device=device)
@@ -994,15 +996,16 @@ class BaseWMOnPolicy:
                 + cfg.loc_weight * (losses["loc_x"] + losses["loc_y"])
                 + cfg.head_weight * losses["head"]
             )
+        default = torch.tensor(0.0, device=self.device)
         total_loss = (
             obs_total
             + cfg.turn_weight * losses["turn"]
             + cfg.step_weight * losses["step"]
-            + losses.get("aux_total", torch.tensor(0.0, device=self.device))
+            + losses.get("aux_total", default)
         )
         total_loss = total_loss + cfg.contrastive_weight * losses.get(
-            "contrastive", torch.tensor(0.0, device=self.device)
-        )
+            "contrastive", default)  + losses.get('sfa', default)
+        assert 'sfa' in losses
         return total_loss
 
     def _sample_replay_episodes(self) -> List[List[Dict[str, torch.Tensor]]]:

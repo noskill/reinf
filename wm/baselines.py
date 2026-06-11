@@ -10,7 +10,8 @@ from torch import nn
 from base import PredictionLossMixin
 from tr_cache import PositionBasedDynamicCache, WindowedPositionBasedDynamicCache
 from transformer import LlamaConfig, LlamaModel, LlamaRMSNorm
-from utils import make_probe_head
+from utils import make_probe_head, scale_upstream_grad
+from recurrent_mlp import RecurrentMLP
 
 
 
@@ -35,6 +36,7 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         contrastive_dim: int = 0,
         contrastive_steps: int = 1,
         cpc_context_dim=128,
+        logger=None
     ):
         super().__init__()
         self.backbone = LlamaModel(config)
@@ -77,28 +79,29 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         self.obs_fuse = nn.Linear(config.hidden_size + self.action_latent_dim, config.hidden_size)
         self.turn_head = nn.Linear(config.hidden_size, turn_bins)
         self.step_head = nn.Linear(config.hidden_size, step_bins)
-        self.contrastive_target_head: Optional[nn.Module] = None
-        self.contrastive_action_heads: Optional[nn.ModuleList] = None
-        if self.contrastive_dim > 0:
-            self.contrastive_target_head = nn.Sequential(
-                nn.Linear(cpc_context_dim, config.hidden_size),
-                nn.ReLU(),
-                nn.Linear(config.hidden_size, self.contrastive_dim),
-            )
-            self.contrastive_action_heads = nn.ModuleList(
-                [
-                    nn.Sequential(
-                        nn.Linear(cpc_context_dim + s * self.action_latent_dim, config.hidden_size),
-                        nn.ReLU(),
-                        nn.Linear(config.hidden_size, self.contrastive_dim),
-                    )
-                    for s in range(1, self.contrastive_steps + 1)
-                ]
-            )
+        # inputs prev sfa + new feature
+        self.cpc_sfa = RecurrentMLP(make_probe_head(self.contrastive_dim * 2, self.contrastive_dim, 256, 3))
+        self.contrastive_target_head = nn.Sequential(
+            nn.Linear(cpc_context_dim, config.hidden_size),
+            nn.ReLU(),
+            nn.Linear(config.hidden_size, self.contrastive_dim),
+        )
+        self.contrastive_action_heads = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(cpc_context_dim + s * self.action_latent_dim, config.hidden_size),
+                    nn.ReLU(),
+                    nn.Linear(config.hidden_size, self.contrastive_dim),
+                )
+                for s in range(1, self.contrastive_steps + 1)
+            ]
+        )
         self._num_envs: Optional[int] = None
         self._cache_position: Optional[torch.Tensor] = None
         self._cache = None
         self.attention_window = config.attention_window
+        self.logger = logger
+        self.sfa_cpc_grad_scale = 0.05
 
     def init_cache(self, num_envs: int, device: torch.device):
         self._num_envs = int(num_envs)
@@ -107,6 +110,9 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         else:
             self._cache = PositionBasedDynamicCache().to(device=device)
         self._cache_position = torch.zeros(self._num_envs, dtype=torch.long, device=device)
+        self._prev_sfa = torch.zeros(self._num_envs, self.contrastive_dim,   
+            device=device,
+            dtype=self.obs_fuse.weight.dtype)
 
     def reset_cache(self, reset_mask: torch.Tensor):
         if self._cache_position is None:
@@ -116,11 +122,13 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
             raise ValueError("reset_mask size must match num_envs for cache reset")
         self._cache.reset(reset_mask)
         self._cache_position[reset_mask] = 0
+        self._prev_sfa[reset_mask] = 0.0
 
     def clear_cache(self):
         self._num_envs = None
         self._cache_position = None
         self._cache = None
+        self._prev_sfa = None
 
     def _project_contrastive_target_h(self, h: torch.Tensor) -> Optional[torch.Tensor]:
         if self.contrastive_target_head is None:
@@ -199,13 +207,7 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         heading = self.heading_head(h_probe)
         turn = self.turn_head(action_feat)
         step = self.step_head(action_feat)
-        contrastive_input = self.contrastive_context(h)
-        aux_inputs = None
-        if need_aux:
-            aux_inputs = {}
-            aux_inputs["contrastive_tgt_emb"] = self._project_contrastive_target_h(contrastive_input)
-            aux_inputs["contrastive_pred_emb_steps"] = self._project_contrastive_pred_steps(contrastive_input, action_latent)
-
+        aux_inputs = self.compute_aux(h, action_latent, using_internal_state)
         preds = (pred_sensor, loc_x, loc_y, heading, turn, step)
         return preds, aux_inputs, h, h[:, -1, :]
 
@@ -227,6 +229,21 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
             "state_last": last_state,
             "state_seq": state_seq,
         }
+
+    def compute_aux(self, h, action_latent, using_internal_state):
+        aux_inputs = {}
+        contrastive_input = self.contrastive_context(h)
+        aux_inputs["contrastive_tgt_emb"] = self._project_contrastive_target_h(contrastive_input)
+        aux_inputs["contrastive_pred_emb_steps"] = self._project_contrastive_pred_steps(contrastive_input, action_latent)
+
+        if using_internal_state:
+            sfa = self.cpc_sfa(scale_upstream_grad(aux_inputs["contrastive_tgt_emb"], scale=self.sfa_cpc_grad_scale),
+                               self._prev_sfa)
+            self._prev_sfa = sfa.detach()
+        else:
+            sfa = self.cpc_sfa(aux_inputs["contrastive_tgt_emb"], torch.zeros_like(aux_inputs["contrastive_tgt_emb"][:, 0, :]))
+        aux_inputs['sfa'] = sfa
+        return aux_inputs
 
 
 class RNNPredictor(TransformerBaseline):
@@ -250,6 +267,7 @@ class RNNPredictor(TransformerBaseline):
         state_norm: str = "none",
         contrastive_dim: int = 0,
         contrastive_steps: int = 1,
+        logger=None
     ):
         super().__init__(
             config,
@@ -268,6 +286,7 @@ class RNNPredictor(TransformerBaseline):
             probe_layers=probe_layers,
             contrastive_dim=contrastive_dim,
             contrastive_steps=contrastive_steps,
+            logger=logger
         )
         self.state_norm = str(state_norm)
         if self.state_norm not in {"none", "layernorm", "rmsnorm"}:
@@ -294,6 +313,9 @@ class RNNPredictor(TransformerBaseline):
             device=device,
             dtype=self.obs_fuse.weight.dtype,
         )
+        self._prev_sfa = torch.zeros(self._num_envs, self.contrastive_dim,   
+            device=device,
+            dtype=self.obs_fuse.weight.dtype)
 
     def reset_cache(self, reset_mask: torch.Tensor):
         if self._state_h is None:
@@ -302,10 +324,12 @@ class RNNPredictor(TransformerBaseline):
         if reset_mask.numel() != self._state_h.shape[1]:
             raise ValueError("reset_mask size must match num_envs for cache reset")
         self._state_h[:, reset_mask, :] = 0.0
+        self._prev_sfa[reset_mask] = 0.0
 
     def clear_cache(self):
         self._num_envs = None
         self._state_h = None
+        self._prev_sfa = None
 
     def _forward_core(
         self,
@@ -364,13 +388,7 @@ class RNNPredictor(TransformerBaseline):
         heading = self.heading_head(h_probe)
         turn = self.turn_head(action_feat)
         step = self.step_head(action_feat)
-        aux_inputs = None
-        contrastive_input = self.contrastive_context(h)
-        if need_aux:
-            aux_inputs = {}
-            aux_inputs["contrastive_tgt_emb"] = self._project_contrastive_target_h(contrastive_input)
-            aux_inputs["contrastive_pred_emb_steps"] = self._project_contrastive_pred_steps(contrastive_input, action_latent)
-
+        aux_inputs = self.compute_aux(h, action_latent, using_internal_state)
         preds = (pred_sensor, loc_x, loc_y, heading, turn, step)
         return preds, aux_inputs, h, h[:, -1, :]
 
