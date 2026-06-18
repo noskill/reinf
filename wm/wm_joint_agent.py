@@ -750,10 +750,19 @@ class BaseWMOnPolicy:
             if per_env:
                 coverage_vals = [float(item["coverage"]) for item in per_env if "coverage" in item]
                 effective_vals = [float(item["effective_coverage"]) for item in per_env if "effective_coverage" in item]
+                wall_vals = [float(item["wall_coverage"]) for item in per_env if "wall_coverage" in item]
+                walls_explored_vals = [float(item["walls_explored"]) for item in per_env if "walls_explored" in item]
+                walls_total_vals = [float(item["walls_total"]) for item in per_env if "walls_total" in item]
                 if coverage_vals:
                     self.logger.log_scalar("coverage", sum(coverage_vals) / len(coverage_vals))
                 if effective_vals:
                     self.logger.log_scalar("effective_coverage", sum(effective_vals) / len(effective_vals))
+                if wall_vals:
+                    self.logger.log_scalar("wall_coverage", sum(wall_vals) / len(wall_vals))
+                if walls_explored_vals:
+                    self.logger.log_scalar("walls_explored", sum(walls_explored_vals) / len(walls_explored_vals))
+                if walls_total_vals:
+                    self.logger.log_scalar("walls_total", sum(walls_total_vals) / len(walls_total_vals))
 
     def action_idx_to_val(self, actions_idx: torch.Tensor) -> torch.Tensor:
         idx = actions_idx.to(self.device).long().view(-1)
@@ -1004,7 +1013,7 @@ class BaseWMOnPolicy:
             + losses.get("aux_total", default)
         )
         total_loss = total_loss + cfg.contrastive_weight * losses.get(
-            "contrastive", default)  + losses.get('sfa', default)
+            "contrastive", default)  + losses.get('sfa', default) + losses['sensor_cpc'] * 0.1
         assert 'sfa' in losses
         return total_loss
 

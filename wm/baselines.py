@@ -79,6 +79,11 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         self.obs_fuse = nn.Linear(config.hidden_size + self.action_latent_dim, config.hidden_size)
         self.turn_head = nn.Linear(config.hidden_size, turn_bins)
         self.step_head = nn.Linear(config.hidden_size, step_bins)
+        self.cpc_sensor_latent_head = make_probe_head(
+            self.contrastive_dim,
+            self.sensor_latent_dim,
+            self.probe_hidden_dim,
+            3,)
         # inputs prev sfa + new feature
         self.cpc_sfa = RecurrentMLP(make_probe_head(self.contrastive_dim * 2, self.contrastive_dim, 256, 3))
         self.contrastive_target_head = nn.Sequential(
@@ -110,7 +115,7 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         else:
             self._cache = PositionBasedDynamicCache().to(device=device)
         self._cache_position = torch.zeros(self._num_envs, dtype=torch.long, device=device)
-        self._prev_sfa = torch.zeros(self._num_envs, self.contrastive_dim,   
+        self._prev_sfa = torch.zeros(self._num_envs, self.contrastive_dim,
             device=device,
             dtype=self.obs_fuse.weight.dtype)
 
@@ -133,7 +138,7 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
     def _project_contrastive_target_h(self, h: torch.Tensor) -> Optional[torch.Tensor]:
         if self.contrastive_target_head is None:
             return None
-        return self.contrastive_target_head(h.detach())
+        return self.contrastive_target_head(h)
 
     def _project_contrastive_pred_steps(self, h: torch.Tensor, actions: torch.Tensor) -> List[torch.Tensor]:
         if self.contrastive_dim <= 0 or self.contrastive_action_heads is None:
@@ -207,7 +212,7 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         heading = self.heading_head(h_probe)
         turn = self.turn_head(action_feat)
         step = self.step_head(action_feat)
-        aux_inputs = self.compute_aux(h, action_latent, using_internal_state)
+        aux_inputs = self.compute_aux(h, action_latent, using_internal_cache, sensor_latent)
         preds = (pred_sensor, loc_x, loc_y, heading, turn, step)
         return preds, aux_inputs, h, h[:, -1, :]
 
@@ -230,18 +235,21 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
             "state_seq": state_seq,
         }
 
-    def compute_aux(self, h, action_latent, using_internal_state):
+    def compute_aux(self, h, action_latent, using_internal_state, sensor_latent):
         aux_inputs = {}
         contrastive_input = self.contrastive_context(h)
         aux_inputs["contrastive_tgt_emb"] = self._project_contrastive_target_h(contrastive_input)
         aux_inputs["contrastive_pred_emb_steps"] = self._project_contrastive_pred_steps(contrastive_input, action_latent)
-
+        aux_inputs["sensor_latent"] = sensor_latent
+        aux_inputs["cpc_sensor_latent_pred"] = self.cpc_sensor_latent_head(aux_inputs["contrastive_tgt_emb"])
         if using_internal_state:
             sfa = self.cpc_sfa(scale_upstream_grad(aux_inputs["contrastive_tgt_emb"], scale=self.sfa_cpc_grad_scale),
                                self._prev_sfa)
-            self._prev_sfa = sfa.detach()
+            assert sfa.shape[1] == 1
+            self._prev_sfa = sfa.squeeze(1).detach()
         else:
-            sfa = self.cpc_sfa(aux_inputs["contrastive_tgt_emb"], torch.zeros_like(aux_inputs["contrastive_tgt_emb"][:, 0, :]))
+            sfa = self.cpc_sfa(scale_upstream_grad(aux_inputs["contrastive_tgt_emb"], scale=self.sfa_cpc_grad_scale),
+                               torch.zeros_like(aux_inputs["contrastive_tgt_emb"][:, 0, :]))
         aux_inputs['sfa'] = sfa
         return aux_inputs
 
@@ -313,7 +321,7 @@ class RNNPredictor(TransformerBaseline):
             device=device,
             dtype=self.obs_fuse.weight.dtype,
         )
-        self._prev_sfa = torch.zeros(self._num_envs, self.contrastive_dim,   
+        self._prev_sfa = torch.zeros(self._num_envs, self.contrastive_dim,
             device=device,
             dtype=self.obs_fuse.weight.dtype)
 
@@ -388,7 +396,7 @@ class RNNPredictor(TransformerBaseline):
         heading = self.heading_head(h_probe)
         turn = self.turn_head(action_feat)
         step = self.step_head(action_feat)
-        aux_inputs = self.compute_aux(h, action_latent, using_internal_state)
+        aux_inputs = self.compute_aux(h, action_latent, using_internal_state, sensor_latent)
         preds = (pred_sensor, loc_x, loc_y, heading, turn, step)
         return preds, aux_inputs, h, h[:, -1, :]
 

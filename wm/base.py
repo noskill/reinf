@@ -258,7 +258,7 @@ class PredictionLossMixin:
             temperature=temperature,
             horizon_discount=horizon_discount,
         )
-    
+
     def compute_sfa_loss(self,
         aux_inputs: Optional[Dict[str, torch.Tensor]],
         key_padding_mask: torch.Tensor):
@@ -266,8 +266,6 @@ class PredictionLossMixin:
         valid_pairs = (~key_padding_mask[:, 1:]) & (~key_padding_mask[:, :-1])
         y = sfa[:, 1:][valid_pairs]
         y_prev = sfa[:, :-1][valid_pairs]
-        if y.shape[0] < 2:
-            return {'loss': sfa.sum() * 0.0}
 
         if y.shape[0] < 2:
             raise ValueError("SFA loss needs at least 2 valid adjacent pairs")
@@ -331,8 +329,15 @@ class PredictionLossMixin:
         )
         sfa_results = self.compute_sfa_loss(aux_inputs=aux_inputs,
                                             key_padding_mask=targets["key_padding_mask"])
+
+        pred = aux_inputs["cpc_sensor_latent_pred"]
+        target = aux_inputs["sensor_latent"]
+        valid = ~targets["key_padding_mask"]
+        loss_sensor_cpc = F.mse_loss(pred[valid], target[valid].detach())
+
         losses["contrastive"] = contrastive_results["loss"]
         losses["sfa"] = sfa_results['loss']
+        losses["sensor_cpc"] = loss_sensor_cpc
         return losses
 
     def compute_metrics(

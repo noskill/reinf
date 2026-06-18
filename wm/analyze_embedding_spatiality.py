@@ -69,7 +69,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-size", type=int, default=4096)
     parser.add_argument("--knn-k", type=int, default=10)
     parser.add_argument("--cluster-count", type=int, default=100)
-    parser.add_argument("--embedding", choices=("contrastive", "state"), default="contrastive")
+    parser.add_argument(
+        "--embedding",
+        choices=("contrastive", "state", "sfa", "sensor_latent", "cpc_sensor_latent_pred"),
+        default="contrastive",
+    )
     parser.add_argument("--no-cosine", action="store_true", help="Skip cosine-distance metrics.")
     parser.add_argument("--wm-contrastive-temp", type=float, default=0.1)
     parser.add_argument("--wm-contrastive-discount", type=float, default=0.75)
@@ -584,6 +588,26 @@ def per_sequence_average_metrics(
     return {family: mean_metric_dicts(items) for family, items in per_family.items()}, rows_used
 
 
+def select_embedding(out: Dict[str, torch.Tensor], embedding: str) -> torch.Tensor:
+    if embedding == "state":
+        return out["state_seq"].detach()
+
+    aux = out.get("aux")
+    if aux is None:
+        raise ValueError(f"Embedding '{embedding}' requires aux outputs, but model returned aux=None")
+
+    key_by_embedding = {
+        "contrastive": "contrastive_tgt_emb",
+        "sfa": "sfa",
+        "sensor_latent": "sensor_latent",
+        "cpc_sensor_latent_pred": "cpc_sensor_latent_pred",
+    }
+    key = key_by_embedding[embedding]
+    if key not in aux:
+        raise KeyError(f"Embedding '{embedding}' requires aux['{key}']; available aux keys: {sorted(aux.keys())}")
+    return aux[key].detach()
+
+
 def main() -> None:
     args = parse_args()
     torch.manual_seed(args.seed)
@@ -598,10 +622,7 @@ def main() -> None:
         key_padding_mask = wm_obs["key_padding_mask"].detach().cpu()
     with torch.no_grad():
         out = model(wm_obs)
-    if args.embedding == "contrastive":
-        emb = out["aux"]["contrastive_tgt_emb"].detach()
-    else:
-        emb = out["state_seq"].detach()
+    emb = select_embedding(out, args.embedding)
     emb_s, loc_s, heading_s, sensor_s = sample_rows(emb, loc, heading, sensor, args.sample_size, args.seed, key_padding_mask)
     per_seq_metrics, per_seq_rows = per_sequence_average_metrics(emb, loc, heading, sensor, key_padding_mask, args)
     pooled_metrics = full_metric_values(
@@ -618,6 +639,7 @@ def main() -> None:
     print(f"sequences {emb.shape[0]}")
     print(f"per_sequence_samples_total {per_seq_rows}")
     print(f"source {'data_path' if args.data_path else args.policy}")
+    print(f"embedding {args.embedding}")
     print(f"data_maze_dim {maze_dim}")
     print(f"model_maze_dim {getattr(args, '_model_maze_dim', maze_dim)}")
     print(f"embedding_dim {emb_s.shape[1]}")

@@ -42,11 +42,7 @@ Having said that it helps to concatenate many observations ot or use dreamer sty
 Both methods are reported to work best with discrete distribution of world states  zt.  though can be used with different distributions.
 
 
-baselines:
-h0 = f(h-1,a-1, o0)
-h0 -> a0
-h0, a0 -> predict o1
-h1 = f(h0, a0, o1)
+
 
 
 // world models
@@ -65,5 +61,24 @@ and for ac-cpc starting from h1:
 e10 = f(h1) - conditioned by a0 via h1
 e12 = f(h1, hat z1, a1)
 e13 = f(h1, hat z1, a1, a2)
-with positives e10 <-> z1, e12 <-> z2, e13 <-> z3…
+with positives e10 <-> z1, e12 <-> z2, e13 <-> z3… with projection z -> e
+in twister z is computed just from series of observations ot-k..ok
+
+
+baselines:
+h0 = f(h-1,a-1, o0)
+h0 -> a0
+h0, a0 -> predict o1
+h1 = f(h0, a0, o1)
+
+e10 = f(h1) - conditioned by a0 via h1
+e12 = f(h1, a1)
+e13 = f(h1, a1, a2)
+with positives e13 <-> e30, e12 <-> e20... with backprop enabled in both branches
+additionally:
+e_k0 -> ok - sensor embedding reconstruction
+sfa(e_k, e_k+1) - with downscaled backprop
+
+
+policy(h) -> a trained with sensor surprise + learning progress + embedding divergence from nearest embedding in other episodes
 

@@ -432,7 +432,6 @@ def create_model(
             head_dim=args.head_dim,
             attention_dropout=args.attention_dropout,
             attention_window=active_attention_window,
-            logger=logger,
         )
         model = TransformerBaseline(
             cfg,
@@ -634,7 +633,11 @@ def create_model(
 
     if args.load_path:
         ckpt = torch.load(args.load_path, map_location=args.device, weights_only=False)
-        state = ckpt.get("model_state", ckpt)
+        state = ckpt.get("model_state", None) if isinstance(ckpt, dict) else None
+        if state is None and isinstance(ckpt, dict) and isinstance(ckpt.get("agent_state"), dict):
+            state = ckpt["agent_state"].get("wm_model")
+        if state is None:
+            state = ckpt
         if isinstance(ckpt, dict) and "config" in ckpt:
             ckpt_type = ckpt["config"].get("model_type")
             if ckpt_type and ckpt_type != args.model_type:
