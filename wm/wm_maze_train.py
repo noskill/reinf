@@ -17,12 +17,13 @@ import gymnasium as gym
 import numpy as np
 import torch
 
-from agent_utils_wm import MAZE_WM_MODEL_DEFAULTS, add_create_model_args, extract_create_model_args
+from agent_utils_wm import MAZE_WM_MODEL_DEFAULTS, add_create_model_args, extract_create_model_args, create_single_policy_agent
 from log import Logger
 from sample import DiscreteActionSampler
-from wm_joint_agent import JointWMReinforce, create_maze_world_model, JointWMPPO
+from wm_joint_agent import JointWMReinforce, JointWMPPO
 from policy_head import WMActionHeadPolicy, WMValueHeadPolicy
 from util import copy_python_sources
+from agent_utils_wm import create_maze_world_model
 
 
 THIS_DIR = Path(__file__).resolve().parent
@@ -162,6 +163,7 @@ def parse_args():
     parser.add_argument("--wm-sensor-sigma", type=float, default=1.0)
     parser.add_argument("--wm-pos-sigma", type=float, default=1.0)
     parser.add_argument("--wm-heading-smoothing", type=float, default=0.0)
+    parser.add_argument("--agent-type", type=str, default="single-policy-ppo")
     return parser.parse_args()
 
 
@@ -240,44 +242,13 @@ def main():
         sensor_max_bin=args.wm_sensor_max_bin,
         logger=logger
     )
-    policy_input_dim = int(wm_model_args.hidden_size)
-    policy_module = WMActionHeadPolicy(
-        action_table=base_env.action_table,
-        device=torch.device(args.device),
-        input_dim=policy_input_dim
-    )
-    
-    value = WMValueHeadPolicy(
-        device=torch.device(args.device),
-        input_dim=policy_input_dim
-    )
 
-
-    agent = JointWMPPO(
-        policy=policy_module,
-        value=value,
-        sampler=DiscreteActionSampler(),
-        policy_lr=args.policy_lr,
-        num_envs=env.num_envs,
-        discount=args.discount,
-        logger=logger,
-        wm_model=wm_model,
-        action_table=base_env.action_table,
-        device=torch.device(args.device),
-        entropy_coef=args.entropy_coef,
-        target_entropy=args.target_entropy,
-        intrinsic_reward_scale=args.intrinsic_reward_scale,
-        env_reward_scale=args.env_reward_scale,
-        wm_updates_per_policy=args.wm_updates_per_policy,
-        wm_replay_capacity=args.wm_replay_capacity,
-        wm_train_episodes=args.wm_train_episodes,
-        wm_divergence_novelty_coef=args.wm_divergence_novelty_coef,
-        wm_fixed=args.wm_fixed,
-        sensor_max_bin=args.wm_sensor_max_bin,
-        maze_dim=maze_dim,
-        wm_weight_decay=args.wm_weight_decay,
-        wm_lr=args.wm_lr
-    )
+    if args.agent_type == "single-policy-ppo":
+        agent = create_single_policy_agent(args, wm_model_args, wm_model, logger,
+                                           maze_dim, len(base_env.action_table), base_env.action_table)
+    elif args.agent_type == "double-policy-ppo":
+        agent = create_double_policy_agent(args, wm_model_args, wm_model, logger,
+                                           maze_dim, len(base_env.action_table), base_env.action_table)
 
     trainer = OnPolicyTrainer(
         env=env,

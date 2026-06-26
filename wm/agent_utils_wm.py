@@ -7,11 +7,17 @@ from types import SimpleNamespace
 from typing import Dict
 
 import torch
+import numpy
+from base import LossConfig
+from sample import DiscreteActionSampler
 
 from baselines import RNNPredictor, TransformerBaseline
 from rssm import RSSMDiscretePredictor
 from transformer import LlamaConfig
 from tssm import TSSMDiscretePredictor
+from policy_head import WMActionHeadPolicy, WMValueHeadPolicy
+from wm_joint_agent import JointWMPPO
+from utils import make_soft_table, make_label_smoothing_table
 
 
 _MODEL_ARG_DEFAULTS = {
@@ -668,3 +674,178 @@ def create_model(
         print(f"loaded checkpoint from {args.load_path}", flush=True)
 
     return model
+
+
+def create_single_policy_agent(args, wm_model_args, wm_model, logger, maze_dim, num_actions, action_table):
+    policy_input_dim = int(wm_model_args.hidden_size)
+    policy_module = WMActionHeadPolicy(
+        num_actions=num_actions,
+        device=torch.device(args.device),
+        input_dim=policy_input_dim
+    )
+    
+    value = WMValueHeadPolicy(
+        device=torch.device(args.device),
+        input_dim=policy_input_dim
+    )
+
+   
+    agent = JointWMPPO(
+        policy=policy_module,
+        value=value,
+        sampler=DiscreteActionSampler(),
+        policy_lr=args.policy_lr,
+        num_envs=args.num_envs,
+        discount=args.discount,
+        logger=logger,
+        wm_model=wm_model,
+        action_table=action_table,
+        device=torch.device(args.device),
+        entropy_coef=args.entropy_coef,
+        target_entropy=args.target_entropy,
+        intrinsic_reward_scale=args.intrinsic_reward_scale,
+        env_reward_scale=args.env_reward_scale,
+        wm_updates_per_policy=args.wm_updates_per_policy,
+        wm_replay_capacity=args.wm_replay_capacity,
+        wm_train_episodes=args.wm_train_episodes,
+        wm_divergence_novelty_coef=args.wm_divergence_novelty_coef,
+        wm_fixed=args.wm_fixed,
+        sensor_max_bin=args.wm_sensor_max_bin,
+        maze_dim=maze_dim,
+        wm_weight_decay=args.wm_weight_decay,
+        wm_lr=args.wm_lr
+    )
+    return agent
+
+
+def create_double_policy_agent(args, wm_model_args, logger, maze_dim):
+    h_t_dim = int(wm_model_args.hidden_size)
+    # sfa is the same dim as cpc
+    contrastive_dim = args.contrastive_dim
+    # goal dim is just sfa
+    # input is h_t + sfa_t + goal
+    policy_input_dim = h_t_dim + contrastive_dim + contrastive_dim 
+    policy_high = WMActionHeadPolicy(
+        num_actions=len(base_env.action_table),
+        device=torch.device(args.device),
+        input_dim=policy_input_dim
+    )
+
+    policy_low = WMActionHeadPolicy(
+        action_table=base_env.action_table,
+        device=torch.device(args.device),
+        input_dim=policy_input_dim
+    )
+    
+    value = WMValueHeadPolicy(
+        device=torch.device(args.device),
+        input_dim=policy_input_dim
+    )
+
+   
+    agent = JointWMPPO(
+        policy=policy_module,
+        value=value,
+        sampler=DiscreteActionSampler(),
+        policy_lr=args.policy_lr,
+        num_envs=env.num_envs,
+        discount=args.discount,
+        logger=logger,
+        wm_model=wm_model,
+        action_table=base_env.action_table,
+        device=torch.device(args.device),
+        entropy_coef=args.entropy_coef,
+        target_entropy=args.target_entropy,
+        intrinsic_reward_scale=args.intrinsic_reward_scale,
+        env_reward_scale=args.env_reward_scale,
+        wm_updates_per_policy=args.wm_updates_per_policy,
+        wm_replay_capacity=args.wm_replay_capacity,
+        wm_train_episodes=args.wm_train_episodes,
+        wm_divergence_novelty_coef=args.wm_divergence_novelty_coef,
+        wm_fixed=args.wm_fixed,
+        sensor_max_bin=args.wm_sensor_max_bin,
+        maze_dim=maze_dim,
+        wm_weight_decay=args.wm_weight_decay,
+        wm_lr=args.wm_lr
+    )
+    return agent
+
+
+def create_maze_world_model(
+    *,
+    model_args,
+    device: torch.device,
+    maze_dim: int,
+    turn_bins: int,
+    step_bins: int,
+    contrastive_temp: float = 0.1,
+    contrastive_horizon_discount: float = 0.75,
+    sensor_weight: float = 1.0,
+    loc_weight: float = 0.0,
+    head_weight: float = 0.0,
+    turn_weight: float = 0.0,
+    step_weight: float = 0.0,
+    sensor_sigma: float = 1.0,
+    pos_sigma: float = 1.0,
+    heading_smoothing: float = 0.0,
+    sensor_max_bin: int = 64,
+    logger=None
+) -> TransformerBaseline:
+    if int(model_args.contrastive_dim) <= 0:
+        raise ValueError("contrastive_dim must be > 0 for AC-CPC intrinsic reward")
+    if sensor_max_bin < 1:
+        raise ValueError("sensor_max_bin must be >= 1")
+    if maze_dim < 2:
+        raise ValueError("maze_dim must be >= 2")
+
+    sensor_bin_count = int(sensor_max_bin) + 1
+    sensor_bins = numpy.array([sensor_bin_count, sensor_bin_count, sensor_bin_count], dtype=numpy.int64)
+    model_args.device = device
+    active_attention_window = (
+        model_args.attention_window
+        if (model_args.attention_window is not None and model_args.attention_window > 0)
+        else None
+    )
+    model_config_extra: Dict = {}
+    input_dim = int(model_args.sensor_latent_dim) + int(model_args.action_latent_dim)
+    model = create_model(
+        model_args,
+        input_dim=input_dim,
+        sensor_dim=3,
+        sensor_bins=sensor_bins,
+        loc_x_bins=int(maze_dim),
+        loc_y_bins=int(maze_dim),
+        heading_dim=4,
+        turn_bins=int(turn_bins),
+        step_bins=int(step_bins),
+        obs_dim=3,
+        action_dim=2,
+        active_attention_window=active_attention_window,
+        model_config_extra=model_config_extra,
+        logger=logger,
+    )
+    loc_min = torch.tensor([0.0, 0.0], dtype=torch.float32, device=device)
+    sensor_min_idx = torch.zeros(3, dtype=torch.long, device=device)
+    model.config = LossConfig(
+        sensor_tables=[
+            make_soft_table(sensor_bin_count, sensor_sigma, device),
+            make_soft_table(sensor_bin_count, sensor_sigma, device),
+            make_soft_table(sensor_bin_count, sensor_sigma, device),
+        ],
+        sensor_min_idx=sensor_min_idx,
+        loc_x_table=make_soft_table(int(maze_dim), pos_sigma, device),
+        loc_y_table=make_soft_table(int(maze_dim), pos_sigma, device),
+        heading_table=make_label_smoothing_table(4, heading_smoothing, device),
+        sensor_weight=sensor_weight,
+        loc_weight=loc_weight,
+        head_weight=head_weight,
+        turn_weight=turn_weight,
+        step_weight=step_weight,
+        contrastive_weight=1.0,  # CPC term kept explicit in trainer loss.
+        contrastive_temp=float(contrastive_temp),
+        contrastive_horizon_discount=float(contrastive_horizon_discount),
+        loc_min=loc_min,
+    )
+    return model
+
+

@@ -10,12 +10,12 @@ class WMActionHeadPolicy(nn.Module):
 
     def __init__(
         self,
-        action_table: Sequence[Tuple[int, int]],
+        num_actions,
         device: torch.device,
         input_dim: int,
     ):
         super().__init__()
-        self.num_actions = int(len(action_table))
+        self.num_actions = num_actions
         self.layers = make_probe_head(int(input_dim), self.num_actions, 512, 6).to(device)
 
     def forward(self, state, **kwargs):

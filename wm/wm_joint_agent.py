@@ -10,7 +10,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from agent_utils_wm import create_model
 from base import LossConfig
 from baselines import TransformerBaseline
 from pool import EpisodesOldPoolMixin
@@ -20,85 +19,6 @@ from util import RunningNorm
 from utils import make_label_smoothing_table, make_soft_table
 from util import RunningNorm, EpisodeBatch, to_device, gae, normalize_padded_returns, flatten_padded, unflatten_padded
 from clustering import SmartClusteringNovelty
-
-
-def create_maze_world_model(
-    *,
-    model_args,
-    device: torch.device,
-    maze_dim: int,
-    turn_bins: int,
-    step_bins: int,
-    contrastive_temp: float = 0.1,
-    contrastive_horizon_discount: float = 0.75,
-    sensor_weight: float = 1.0,
-    loc_weight: float = 0.0,
-    head_weight: float = 0.0,
-    turn_weight: float = 0.0,
-    step_weight: float = 0.0,
-    sensor_sigma: float = 1.0,
-    pos_sigma: float = 1.0,
-    heading_smoothing: float = 0.0,
-    sensor_max_bin: int = 64,
-    logger=None
-) -> TransformerBaseline:
-    if int(model_args.contrastive_dim) <= 0:
-        raise ValueError("contrastive_dim must be > 0 for AC-CPC intrinsic reward")
-    if sensor_max_bin < 1:
-        raise ValueError("sensor_max_bin must be >= 1")
-    if maze_dim < 2:
-        raise ValueError("maze_dim must be >= 2")
-
-    sensor_bin_count = int(sensor_max_bin) + 1
-    sensor_bins = np.array([sensor_bin_count, sensor_bin_count, sensor_bin_count], dtype=np.int64)
-    model_args.device = device
-    active_attention_window = (
-        model_args.attention_window
-        if (model_args.attention_window is not None and model_args.attention_window > 0)
-        else None
-    )
-    model_config_extra: Dict = {}
-    input_dim = int(model_args.sensor_latent_dim) + int(model_args.action_latent_dim)
-    model = create_model(
-        model_args,
-        input_dim=input_dim,
-        sensor_dim=3,
-        sensor_bins=sensor_bins,
-        loc_x_bins=int(maze_dim),
-        loc_y_bins=int(maze_dim),
-        heading_dim=4,
-        turn_bins=int(turn_bins),
-        step_bins=int(step_bins),
-        obs_dim=3,
-        action_dim=2,
-        active_attention_window=active_attention_window,
-        model_config_extra=model_config_extra,
-        logger=logger,
-    )
-    loc_min = torch.tensor([0.0, 0.0], dtype=torch.float32, device=device)
-    sensor_min_idx = torch.zeros(3, dtype=torch.long, device=device)
-    model.config = LossConfig(
-        sensor_tables=[
-            make_soft_table(sensor_bin_count, sensor_sigma, device),
-            make_soft_table(sensor_bin_count, sensor_sigma, device),
-            make_soft_table(sensor_bin_count, sensor_sigma, device),
-        ],
-        sensor_min_idx=sensor_min_idx,
-        loc_x_table=make_soft_table(int(maze_dim), pos_sigma, device),
-        loc_y_table=make_soft_table(int(maze_dim), pos_sigma, device),
-        heading_table=make_label_smoothing_table(4, heading_smoothing, device),
-        sensor_weight=sensor_weight,
-        loc_weight=loc_weight,
-        head_weight=head_weight,
-        turn_weight=turn_weight,
-        step_weight=step_weight,
-        contrastive_weight=1.0,  # CPC term kept explicit in trainer loss.
-        contrastive_temp=float(contrastive_temp),
-        contrastive_horizon_discount=float(contrastive_horizon_discount),
-        loc_min=loc_min,
-    )
-    return model
-
 
 
 class BaseWMOnPolicy:
@@ -116,8 +36,11 @@ class BaseWMOnPolicy:
         wm_divergence_novelty_coef: float = 0.0,
         sensor_max_bin: int = 64,
         maze_dim: int = 10,
+        device=None,
+        logger=None,
         **kwargs
     ):
+        self.logger = logger
         self.wm_model = wm_model
         self.action_table = [(int(turn), int(step)) for turn, step in action_table]
         self.intrinsic_reward_scale = float(intrinsic_reward_scale)
@@ -157,7 +80,7 @@ class BaseWMOnPolicy:
         self.action_dim = int(self.action_cont_table.shape[-1])
         self._divergence_running_norm = RunningNorm(device=self.device)
         self._episode_novelty_running_norm = RunningNorm(device=self.device)
-        self.hparams.update({
+        self.hparams = {
             "wm_updates_per_policy": self.wm_updates_per_policy,
             "wm_fixed": self.wm_fixed,
             "wm_replay_capacity": self.wm_replay_capacity,
@@ -166,10 +89,13 @@ class BaseWMOnPolicy:
             "wm_divergence_novelty_coef": self.wm_divergence_novelty_coef,
             "intrinsic_reward_scale": self.intrinsic_reward_scale,
             "env_reward_scale": self.env_reward_scale,
-        })
+        }
         self.log_hparams()
         self.create_wm_optimizers(**kwargs)
         self.clustering = SmartClusteringNovelty(adaptation_frequency=100_000)
+
+    def log_hparams(self):
+        pass # todo
 
     def create_wm_optimizers(self, **kwargs):
         self.wm_optimizer = torch.optim.AdamW(
@@ -177,6 +103,21 @@ class BaseWMOnPolicy:
             lr=kwargs.get('wm_lr', 0.0001),
             weight_decay=kwargs.get('wm_weight_decay', 0.0001),
         )
+
+    def rl_sampler(self):
+        return self.sampler
+
+    def rl_add_transition_batch(self, *args, **kwargs):
+        return self.add_transition_batch(*args, **kwargs)
+
+    def rl_add_reward(self, *args, **kwargs):
+        return self.add_reward(*args, **kwargs)
+
+    def rl_get_state_dict(self):
+        return super().get_state_dict()
+
+    def rl_load_state_dict(self, state_dict):
+        return super().load_state_dict(state_dict)
 
     def episode_start(self):
         super().episode_start()
@@ -257,7 +198,7 @@ class BaseWMOnPolicy:
         policy = self.get_policy_for_action()
         policy_states = self.process_states(state, episode_start)
         policy_kwargs = dict(episode_start=episode_start)
-        actions, log_probs, dist = self.sampler(policy, policy_states, policy_kwargs)
+        actions, log_probs, dist = self.rl_sampler()(policy, policy_states, policy_kwargs)
 
         # ------------------------------------------------------------------
         # Obtain entropy safely. Some `TransformedDistribution` instances do
@@ -284,7 +225,7 @@ class BaseWMOnPolicy:
         if entropy.dim() == 1:
             entropy = entropy.unsqueeze(-1)
 
-        self.add_transition_batch(policy_states, actions, log_probs, entropy)
+        self.rl_add_transition_batch(policy_states, actions, log_probs, entropy)
         wm_states = {
             "sensor": state["sensor"].detach().to("cpu"),
             "heading_idx": state["heading_idx"].detach().to("cpu"),
@@ -301,7 +242,7 @@ class BaseWMOnPolicy:
     def update(self, rewards, dones, info=None, **kwargs):
         env_rewards = self.env_reward_scale * rewards
         for env_idx in range(self.num_envs):
-            self.add_reward(env_idx, env_rewards[env_idx])
+            self.rl_add_reward(env_idx, env_rewards[env_idx])
             self._wm_pool.add_reward(env_idx, env_rewards[env_idx].detach().to("cpu"))
         self.process_dones(dones)
         self._wm_pool.process_dones(dones)
@@ -325,7 +266,7 @@ class BaseWMOnPolicy:
             self.wm_model.eval()
         else:
             self.wm_model.train()
-        self.policy.train()
+        self.train()
         cpc_error_before = self._evaluate_step_cpc_error_no_grad(self.wm_model, obs_new, targets_new)
         sensor_error_before = self._evaluate_step_sensor_error_no_grad(self.wm_model, obs_new, targets_new)
         with torch.no_grad():
@@ -479,6 +420,9 @@ class BaseWMOnPolicy:
         )
 
         return True
+
+    def train(self):
+        self.policy.train()
 
     def _compute_intrinsic_rewards(
         self,
@@ -1086,7 +1030,7 @@ class BaseWMOnPolicy:
         return obs, targets, meta
 
     def get_state_dict(self):
-        base_state = super().get_state_dict()
+        base_state = self.rl_get_state_dict()
         return {
             "policy_state": base_state,
             "wm_model": self.wm_model.state_dict(),
@@ -1096,7 +1040,7 @@ class BaseWMOnPolicy:
 
     def load_state_dict(self, state_dict):
         policy_state = state_dict.get("policy_state", state_dict)
-        super().load_state_dict(policy_state)
+        self.rl_load_state_dict(policy_state)
         wm_state = state_dict.get("wm_model")
         if wm_state is not None:
             self.wm_model.load_state_dict(wm_state)
@@ -1217,8 +1161,8 @@ class JointWMReinforce(BaseWMOnPolicy, Reinforce):
         BaseWMOnPolicy.__init__(self, **kwargs)
 
 
-class JointWMPPO(BaseWMOnPolicy, PPO):
-    """Reinforce agent with joint AC-CPC world-model updates."""
+class JointWMPPO(BaseWMOnPolicy):
+    """PPO agent with joint AC-CPC world-model updates."""
     def __init__(self, policy,
                  value,
                  sampler,
@@ -1233,7 +1177,7 @@ class JointWMPPO(BaseWMOnPolicy, PPO):
                  exp_adv=None,
                  target_entropy=2,
                  **kwargs):
-        PPO.__init__(self,
+        self.agent = PPO(
             policy=policy,
             value=value,
             sampler=sampler,
@@ -1249,7 +1193,77 @@ class JointWMPPO(BaseWMOnPolicy, PPO):
             clip_param=clip_param,
             exp_adv=exp_adv,
         )
-        BaseWMOnPolicy.__init__(self, **kwargs)
+        BaseWMOnPolicy.__init__(self, device=device, logger=logger, **kwargs)
+        self.agents = [self.agent]
+
+    @property
+    def device(self):
+        return self.agent.device
+
+    @property
+    def num_envs(self):
+        return self.agent.num_envs
+
+    def episode_start(self):
+        for agent in self.agents:
+            agent.episode_start()
+        self._prev_actions = None
+        if hasattr(self.wm_model, "clear_cache"):
+            self.wm_model.clear_cache()
+        self._wm_pool.reset_episodes()
+
+    def get_policy_for_action(self):
+        return self.agent.get_policy_for_action()
+
+    def rl_sampler(self):
+        return self.agent.sampler
+
+    def rl_add_transition_batch(self, *args, **kwargs):
+        return self.agent.add_transition_batch(*args, **kwargs)
+
+    def rl_add_reward(self, *args, **kwargs):
+        return self.agent.add_reward(*args, **kwargs)
+
+    def rl_get_state_dict(self):
+        return self.agent.get_state_dict()
+
+    def rl_load_state_dict(self, state_dict):
+        return self.agent.load_state_dict(state_dict)
+
+    def process_dones(self, dones):
+        return self.agent.process_dones(dones)
+
+    def should_learn(self):
+        return self.agent.should_learn()
+
+    def get_train_episodes(self):
+        return self.agent.get_train_episodes()
+
+    def train(self):
+        self.agent.policy.train()
+
+    def _prepare_episode_batch(self, batch):
+        return self.agent._prepare_episode_batch(batch)
+
+    def train_policy_batch_joint(self, batch):
+        return self.agent.train_policy_batch_joint(batch)
+
+    def print_episode_stats(self, episodes):
+        return self.agent.print_episode_stats(episodes)
+
+    def get_completed_episodes(self):
+        return self.agent.get_completed_episodes()
+
+    @property
+    def version(self):
+        return self.agent.version
+
+    @version.setter
+    def version(self, value):
+        self.agent.version = value
+
+    def clear_completed(self):
+        return self.agent.clear_completed()
 
 
 class _WMEpisodePool(EpisodesOldPoolMixin):

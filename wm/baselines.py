@@ -8,11 +8,12 @@ import torch
 from torch import nn
 
 from base import PredictionLossMixin
-from tr_cache import PositionBasedDynamicCache, WindowedPositionBasedDynamicCache
 from transformer import LlamaConfig, LlamaModel, LlamaRMSNorm
+from transformer_cached import CachedTransformer
+from rnn_cached import CachedRNN
 from utils import make_probe_head, scale_upstream_grad
 from recurrent_mlp import RecurrentMLP
-
+from recurrent_cache import clear_cache, reset_cache
 
 
 class TransformerBaseline(PredictionLossMixin, nn.Module):
@@ -39,7 +40,7 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         logger=None
     ):
         super().__init__()
-        self.backbone = LlamaModel(config)
+        self.backbone = CachedTransformer(config)
         self.sensor_mode = sensor_mode
         self.heading_dim = heading_dim
         self.turn_bins = turn_bins
@@ -102,38 +103,16 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
             ]
         )
         self._num_envs: Optional[int] = None
-        self._cache_position: Optional[torch.Tensor] = None
         self._cache = None
         self.attention_window = config.attention_window
         self.logger = logger
         self.sfa_cpc_grad_scale = 0.05
 
-    def init_cache(self, num_envs: int, device: torch.device):
-        self._num_envs = int(num_envs)
-        if self.attention_window is not None and self.attention_window > 0:
-            self._cache = WindowedPositionBasedDynamicCache(self.attention_window).to(device=device)
-        else:
-            self._cache = PositionBasedDynamicCache().to(device=device)
-        self._cache_position = torch.zeros(self._num_envs, dtype=torch.long, device=device)
-        self._prev_sfa = torch.zeros(self._num_envs, self.contrastive_dim,
-            device=device,
-            dtype=self.obs_fuse.weight.dtype)
-
     def reset_cache(self, reset_mask: torch.Tensor):
-        if self._cache_position is None:
-            return
-        reset_mask = reset_mask.to(torch.bool).view(-1)
-        if reset_mask.numel() != self._cache_position.numel():
-            raise ValueError("reset_mask size must match num_envs for cache reset")
-        self._cache.reset(reset_mask)
-        self._cache_position[reset_mask] = 0
-        self._prev_sfa[reset_mask] = 0.0
+        reset_cache(self, reset_mask)
 
     def clear_cache(self):
-        self._num_envs = None
-        self._cache_position = None
-        self._cache = None
-        self._prev_sfa = None
+        clear_cache(self)
 
     def _project_contrastive_target_h(self, h: torch.Tensor) -> Optional[torch.Tensor]:
         if self.contrastive_target_head is None:
@@ -168,17 +147,6 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         )
 
         using_internal_cache = episode_start is not None
-        if using_internal_cache:
-            episode_start_t = torch.as_tensor(episode_start, dtype=torch.bool, device=sensor.device).view(-1)
-            if episode_start_t.numel() != sensor.shape[0]:
-                raise ValueError(
-                    f"episode_start batch mismatch: expected {sensor.shape[0]}, got {episode_start_t.numel()}"
-                )
-            if self._cache is None or self._cache_position is None or self._cache_position.numel() != episode_start_t.numel():
-                self.init_cache(num_envs=episode_start_t.numel(), device=sensor.device)
-            else:
-                self.reset_cache(episode_start_t)
-
         prev_action_latent = self.action_encoder(prev_actions)
         sensor_latent = self.sensor_encoder(sensor)
         x = torch.cat([sensor_latent, prev_action_latent], dim=-1)
@@ -187,13 +155,9 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
 
         h = self.backbone(
             x,
-            past_key_values=self._cache if using_internal_cache else None,
-            cache_position=self._cache_position.unsqueeze(1) if using_internal_cache else None,
             key_padding_mask=key_padding_mask,
-            attention_window=self.attention_window,
-        )
-        if using_internal_cache:
-            self._cache_position.add_(1)
+            reset_mask=episode_start)
+
         action_latent = self.action_encoder(actions)
         obs_feat = torch.tanh(self.obs_fuse(torch.cat([h, action_latent], dim=-1)))
         if self.sensor_mode != "categorical":
@@ -212,7 +176,7 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         heading = self.heading_head(h_probe)
         turn = self.turn_head(action_feat)
         step = self.step_head(action_feat)
-        aux_inputs = self.compute_aux(h, action_latent, using_internal_cache, sensor_latent)
+        aux_inputs = self.compute_aux(h, action_latent, episode_start, sensor_latent)
         preds = (pred_sensor, loc_x, loc_y, heading, turn, step)
         return preds, aux_inputs, h, h[:, -1, :]
 
@@ -235,21 +199,20 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
             "state_seq": state_seq,
         }
 
-    def compute_aux(self, h, action_latent, using_internal_state, sensor_latent):
+    def compute_aux(self, h, action_latent, reset_mask, sensor_latent):
         aux_inputs = {}
         contrastive_input = self.contrastive_context(h)
         aux_inputs["contrastive_tgt_emb"] = self._project_contrastive_target_h(contrastive_input)
         aux_inputs["contrastive_pred_emb_steps"] = self._project_contrastive_pred_steps(contrastive_input, action_latent)
         aux_inputs["sensor_latent"] = sensor_latent
         aux_inputs["cpc_sensor_latent_pred"] = self.cpc_sensor_latent_head(aux_inputs["contrastive_tgt_emb"])
-        if using_internal_state:
-            sfa = self.cpc_sfa(scale_upstream_grad(aux_inputs["contrastive_tgt_emb"], scale=self.sfa_cpc_grad_scale),
-                               self._prev_sfa)
+
+        sfa = self.cpc_sfa(scale_upstream_grad(aux_inputs["contrastive_tgt_emb"], scale=self.sfa_cpc_grad_scale),
+                            reset_mask)
+
+        if reset_mask is not None:
             assert sfa.shape[1] == 1
-            self._prev_sfa = sfa.squeeze(1).detach()
-        else:
-            sfa = self.cpc_sfa(scale_upstream_grad(aux_inputs["contrastive_tgt_emb"], scale=self.sfa_cpc_grad_scale),
-                               torch.zeros_like(aux_inputs["contrastive_tgt_emb"][:, 0, :]))
+
         aux_inputs['sfa'] = sfa
         return aux_inputs
 
@@ -296,135 +259,5 @@ class RNNPredictor(TransformerBaseline):
             contrastive_steps=contrastive_steps,
             logger=logger
         )
-        self.state_norm = str(state_norm)
-        if self.state_norm not in {"none", "layernorm", "rmsnorm"}:
-            raise ValueError("state_norm must be one of {'none', 'layernorm', 'rmsnorm'}")
-        if self.state_norm == "layernorm":
-            self.state_out_norm = nn.LayerNorm(config.hidden_size)
-        elif self.state_norm == "rmsnorm":
-            self.state_out_norm = LlamaRMSNorm(config.hidden_size)
-        else:
-            self.state_out_norm = nn.Identity()
-        self.backbone = nn.GRU(
-            input_size=config.input_size,
-            hidden_size=config.hidden_size,
-            num_layers=config.num_hidden_layers,
-            batch_first=True,
-        )
-        self.backbone.flatten_parameters()
-        self._state_h: Optional[torch.Tensor] = None
+        self.backbone = CachedRNN(config)
 
-    def init_cache(self, num_envs: int, device: torch.device):
-        self._num_envs = int(num_envs)
-        self._state_h = torch.zeros(
-            (self.backbone.num_layers, self._num_envs, self.backbone.hidden_size),
-            device=device,
-            dtype=self.obs_fuse.weight.dtype,
-        )
-        self._prev_sfa = torch.zeros(self._num_envs, self.contrastive_dim,
-            device=device,
-            dtype=self.obs_fuse.weight.dtype)
-
-    def reset_cache(self, reset_mask: torch.Tensor):
-        if self._state_h is None:
-            return
-        reset_mask = reset_mask.to(torch.bool).view(-1)
-        if reset_mask.numel() != self._state_h.shape[1]:
-            raise ValueError("reset_mask size must match num_envs for cache reset")
-        self._state_h[:, reset_mask, :] = 0.0
-        self._prev_sfa[reset_mask] = 0.0
-
-    def clear_cache(self):
-        self._num_envs = None
-        self._state_h = None
-        self._prev_sfa = None
-
-    def _forward_core(
-        self,
-        obs,
-        *,
-        episode_start=None,
-        need_aux: bool = False,
-    ):
-        sensor, actions, prev_actions, _key_padding_mask, _ = self._validate_obs_contract(
-            obs,
-            episode_start=episode_start,
-        )
-        using_internal_state = episode_start is not None
-        if using_internal_state:
-            episode_start_t = torch.as_tensor(episode_start, dtype=torch.bool, device=sensor.device).view(-1)
-            if episode_start_t.numel() != sensor.shape[0]:
-                raise ValueError(
-                    f"episode_start batch mismatch: expected {sensor.shape[0]}, got {episode_start_t.numel()}"
-                )
-            if self._state_h is None or self._state_h.shape[1] != episode_start_t.numel():
-                self.init_cache(num_envs=episode_start_t.numel(), device=sensor.device)
-            else:
-                self.reset_cache(episode_start_t)
-            h0 = self._state_h.to(device=sensor.device, dtype=sensor.dtype)
-        else:
-            h0 = None
-
-        prev_action_latent = self.action_encoder(prev_actions)
-        sensor_latent = self.sensor_encoder(sensor)
-        x = torch.cat([sensor_latent, prev_action_latent], dim=-1)
-        if x.shape[-1] != self.input_size:
-            raise ValueError(f"Expected input_size {self.input_size}, got {x.shape[-1]}")
-
-        if self.attention_window is not None and self.attention_window > 0 and episode_start is None:
-            h, h_n = self.window_iterate(x, h0)
-        else:
-            h, h_n = self.backbone(x, h0)
-        if using_internal_state:
-            self._state_h = h_n.detach()
-        h = self.state_out_norm(h)
-        action_latent = self.action_encoder(actions)
-        obs_feat = torch.tanh(self.obs_fuse(torch.cat([h, action_latent], dim=-1)))
-        if self.sensor_mode != "categorical":
-            raise ValueError("RNNPredictor currently supports sensor_mode='categorical' only.")
-        pred_sensor = (
-            self.sensor_head_l(obs_feat),
-            self.sensor_head_f(obs_feat),
-            self.sensor_head_r(obs_feat),
-        )
-        # State probes (current-step location/heading) read detached state.
-        h_probe = h.detach()
-        # Action heads use detached or live state based on constructor setting.
-        action_feat = h_probe
-        loc_x = self.loc_x_head(h_probe)
-        loc_y = self.loc_y_head(h_probe)
-        heading = self.heading_head(h_probe)
-        turn = self.turn_head(action_feat)
-        step = self.step_head(action_feat)
-        aux_inputs = self.compute_aux(h, action_latent, using_internal_state, sensor_latent)
-        preds = (pred_sensor, loc_x, loc_y, heading, turn, step)
-        return preds, aux_inputs, h, h[:, -1, :]
-
-    def window_iterate(self, x, h0):
-        all_h_chunks = []
-        h_current = h0
-        window_size = self.attention_window
-        for i in range(0, x.size(1), window_size):
-            # Slice the current sequence window
-            x_chunk = x[:, i : i + window_size, :]
-
-            # Forward pass: current hidden state flows in
-            # h_chunk: (batch, window_size, hidden_size)
-            # h_current: (num_layers, batch, hidden_size)
-            h_chunk, h_current = self.backbone(x_chunk, h_current)
-
-            # Store output chunk for the final 'h' result
-            all_h_chunks.append(h_chunk)
-
-            # --- CRITICAL STEP FOR BACKPROP RESTRICTION ---
-            # This detaches the hidden state from the graph.
-            # Gradients will NOT flow from the next window back into this one.
-            h_current = h_current.detach()
-            # ----------------------------------------------
-
-        # 3. Reconstruct the full 'h' and 'h_n'
-        # h will have shape (batch, 2048, hidden_size)
-        h = torch.cat(all_h_chunks, dim=1)
-        # h_n is simply the h_current from the last iteration
-        h_n = h_current
-        return h, h_n
