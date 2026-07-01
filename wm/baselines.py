@@ -137,12 +137,24 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
             pred_steps.append(head(pred_in))
         return pred_steps
 
+    def predict_next_contrastive_emb(self, h: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        assert h.dim() == 2, f"Expected h [B,H], got {tuple(h.shape)}"
+        assert action.dim() == 2, f"Expected action [B,A], got {tuple(action.shape)}"
+        assert action.shape[0] == h.shape[0], "h and action batch sizes must match"
+        assert action.shape[-1] == self.action_dim, f"Expected action dim {self.action_dim}, got {action.shape[-1]}"
+        assert self.contrastive_action_heads is not None, "contrastive_action_heads is not initialized"
+        assert len(self.contrastive_action_heads) >= 1, "At least one contrastive action head is required"
+
+        context = self.contrastive_context(h)
+        action_latent = self.action_encoder(action.to(dtype=h.dtype, device=h.device))
+        pred_input = torch.cat([context, action_latent], dim=-1)
+        return self.contrastive_action_heads[0](pred_input)
+
     def _forward_core(
         self,
         obs,
         *,
         episode_start=None,
-        need_aux: bool = False,
     ):
         sensor, actions, prev_actions, key_padding_mask, _ = self._validate_obs_contract(
             obs,
@@ -160,7 +172,6 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
             x,
             key_padding_mask=key_padding_mask,
             reset_mask=episode_start)
-
         action_latent = self.action_encoder(actions)
         obs_feat = torch.tanh(self.obs_fuse(torch.cat([h, action_latent], dim=-1)))
         if self.sensor_mode != "categorical":
@@ -188,15 +199,13 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         obs,
         episode_start=None,
     ):
-        need_aux = episode_start is None
         preds, aux_inputs, state_seq, last_state = self._forward_core(
             obs,
             episode_start=episode_start,
-            need_aux=need_aux,
         )
         return {
             "preds": preds,
-            "aux": aux_inputs if need_aux else None,
+            "aux": aux_inputs,
             "state": last_state,
             "state_last": last_state,
             "state_seq": state_seq,
@@ -263,4 +272,3 @@ class RNNPredictor(TransformerBaseline):
             logger=logger
         )
         self.backbone = CachedRNN(config)
-

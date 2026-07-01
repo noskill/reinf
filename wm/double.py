@@ -46,17 +46,35 @@ class DoubleAgent(BaseWMOnPolicy):
             return x[:, -1, :]
         return x
 
-    def _base_features(self, wm_out):
-        h = wm_out["state_last"]
-        aux = wm_out["aux"]
-        cpc = self._squeeze_time(aux["contrastive_tgt_emb"])
-        sfa = self._squeeze_time(aux["sfa"])
-        return torch.cat([h, cpc, sfa], dim=-1), sfa
+    def _cpc_surprise(self, cpc, episode_start):
+        prev_h, prev_action = self.agent_high.prediction_context()
+        if prev_h is None:
+            return cpc.new_zeros((cpc.shape[0], 1))
+
+        assert prev_action.dim() == 1, f"Expected previous discrete action [B], got {tuple(prev_action.shape)}"
+        assert prev_h.shape[0] == cpc.shape[0], "previous h and current cpc batch sizes must match"
+        assert prev_action.shape[0] == cpc.shape[0], "previous action and current cpc batch sizes must match"
+
+        prev_action_cont = self.action_cont_table[prev_action.to(self.action_cont_table.device).long()]
+        with torch.no_grad():
+            pred_cpc = self.wm_model.predict_next_contrastive_emb(prev_h, prev_action_cont)
+            surprise = torch.linalg.vector_norm(pred_cpc - cpc, dim=-1, keepdim=True)
+
+        reset_mask = torch.as_tensor(episode_start, dtype=torch.bool, device=surprise.device).view(-1)
+        assert reset_mask.numel() == cpc.shape[0], "episode_start must match batch size"
+        if reset_mask.any():
+            surprise = surprise.clone()
+            surprise[reset_mask] = 0.0
+        return surprise.detach()
 
     def get_action(self, state, episode_start):
         wm_out = self.call_wm(state, episode_start)
 
-        base_features, sfa = self._base_features(wm_out)
+        aux = wm_out["aux"]
+        cpc = self._squeeze_time(aux["contrastive_tgt_emb"])
+        sfa = self._squeeze_time(aux["sfa"])
+        base_features = torch.cat([wm_out["state_last"], cpc, sfa], dim=-1)
+        surprise = self._cpc_surprise(cpc.detach(), episode_start)
         base_features = base_features.detach()
         sfa = sfa.detach()
 
@@ -64,12 +82,13 @@ class DoubleAgent(BaseWMOnPolicy):
         batch_size = sfa.shape[0]
         zeros = sfa.new_zeros((batch_size, 1))
         high_state = torch.cat([base_features, prev_goal,
-                                zeros,  # surprise placeholder
+                                surprise,
                                 progress, steps_since_switch, ], dim=-1,)
         goal = self.agent_high.get_action(high_state, episode_start).detach()
 
         low_state = torch.cat([base_features, goal, goal - sfa], dim=-1)
         actions = self.agent_low.get_action(low_state, episode_start)
+        self.agent_high.store_prediction_context(wm_out["state_last"], actions)
 
         wm_states = {
             "sensor": state["sensor"].detach().to("cpu"),
