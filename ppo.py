@@ -69,10 +69,13 @@ class PPOBase(VPGBase):
         return states_padded
 
     def compute_distribution_params(self, observations, actions, key_padding_mask):
-        _, logp_new_padded, dist = self.sampler(
+        policy_params = self.sampler.policy_params(
             self.policy,
             observations,
-            policy_kwargs=dict(episode_start=None),
+            dict(episode_start=None),
+        )
+        _, logp_new_padded, dist = self.sampler(
+            policy_params,
             actions=actions,
             return_distribution=True,
         )

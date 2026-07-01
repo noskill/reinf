@@ -73,7 +73,8 @@ class ReinforceBase(Agent):
         policy = self.get_policy_for_action()
         active_states = self.process_states(state, episode_start)
         policy_kwargs = dict(episode_start=episode_start)
-        actions, log_probs, dist = self.sampler(policy, active_states, policy_kwargs)
+        policy_params = self.sampler.policy_params(policy, active_states, policy_kwargs)
+        actions, log_probs, dist = self.sampler(policy_params)
 
         # ------------------------------------------------------------------
         # Obtain entropy safely. Some `TransformedDistribution` instances do
@@ -172,10 +173,13 @@ class ReinforceBase(Agent):
             obs_for_policy = dict(obs_for_policy)
             obs_for_policy['key_padding_mask'] = key_padding_mask
 
-        _, _, dist = self.sampler(
+        policy_params = self.sampler.policy_params(
             self.policy,
             obs_for_policy,
-            policy_kwargs=dict(episode_start=None),
+            dict(episode_start=None),
+        )
+        _, _, dist = self.sampler(
+            policy_params,
             actions=actions_padded,
             return_distribution=True,
         )

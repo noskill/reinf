@@ -267,7 +267,8 @@ class PPOD(PPOBase, PPODPool):
                 old_logp_mb = old_logp_batch[mb_idx]
                 adv_mb = adv_all[mb_idx]
 
-                _, logp_new_mb, dist = self.sampler(self.policy, obs_mb, actions=actions_mb, return_distribution=True)
+                policy_params = self.sampler.policy_params(self.policy, obs_mb)
+                _, logp_new_mb, dist = self.sampler(policy_params, actions=actions_mb, return_distribution=True)
                 try:
                     entropy_new_mb = dist.entropy()
                 except NotImplementedError:
