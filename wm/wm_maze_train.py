@@ -17,7 +17,8 @@ import gymnasium as gym
 import numpy as np
 import torch
 
-from agent_utils_wm import MAZE_WM_MODEL_DEFAULTS, add_create_model_args, extract_create_model_args, create_single_policy_agent
+from agent_utils_wm import (MAZE_WM_MODEL_DEFAULTS, add_create_model_args, extract_create_model_args, create_single_policy_agent,
+                            create_double_policy_agent)
 from log import Logger
 from sample import DiscreteActionSampler
 from wm_joint_agent import JointWMReinforce, JointWMPPO

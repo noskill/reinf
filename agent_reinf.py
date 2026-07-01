@@ -30,7 +30,8 @@ class VPG(Agent):
     def get_action(self, state, done):
         # state is now a batch of states
         state = torch.FloatTensor(state)
-        actions, log_probs, params = self.sampler(self.policy, state)
+        policy_params = self.sampler.policy_params(self.policy, state)
+        actions, log_probs, params = self.sampler(policy_params)
         # Store transitions for each environment
         for env_idx in range(self.num_envs):
             assert not done[env_idx]

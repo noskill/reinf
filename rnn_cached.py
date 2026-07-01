@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from recurrent_cache import CacheModuleMixin
+from dataclasses import dataclass
 
 
 class CachedRNN(torch.nn.Module, CacheModuleMixin):
@@ -37,7 +38,7 @@ class CachedRNN(torch.nn.Module, CacheModuleMixin):
         if using_cache:
             self._state_h = h_n.detach()
         return h
-        
+
     def reset_cache(self, reset_mask: torch.Tensor):
         if self._state_h is None:
             return
@@ -93,3 +94,11 @@ class CachedRNN(torch.nn.Module, CacheModuleMixin):
         # h_n is simply the h_current from the last iteration
         h_n = h_current
         return h, h_n
+
+
+@dataclass
+class RNNConfig:
+    input_size: int
+    hidden_size: int
+    num_hidden_layers: int
+    attention_window: int = -1

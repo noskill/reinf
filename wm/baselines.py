@@ -52,18 +52,11 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         self.action_dim = action_dim
         if self.action_dim <= 0:
             raise ValueError("action_dim inferred from config.input_size - sensor_dim must be > 0")
-        self.probe_hidden_dim = int(probe_hidden_dim)
-        self.probe_layers = int(probe_layers)
-        self.contrastive_dim = int(contrastive_dim)
-        self.contrastive_steps = int(contrastive_steps)
-        if self.probe_hidden_dim < 0:
-            raise ValueError("probe_hidden_dim must be >= 0")
-        if self.probe_layers < 1:
-            raise ValueError("probe_layers must be >= 1")
-        if self.contrastive_dim < 0:
-            raise ValueError("contrastive_dim must be >= 0")
-        if self.contrastive_steps < 1:
-            raise ValueError("contrastive_steps must be >= 1")
+        self.probe_hidden_dim = probe_hidden_dim
+        self.probe_layers = probe_layers
+        self.contrastive_dim = contrastive_dim
+        self.contrastive_steps = contrastive_steps
+        self._validate_params()
         if sensor_mode == "categorical":
             assert sensor_bins is not None and len(sensor_bins) == 3
             self.sensor_head_l = nn.Linear(config.hidden_size, int(sensor_bins[0]))
@@ -107,6 +100,16 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         self.attention_window = config.attention_window
         self.logger = logger
         self.sfa_cpc_grad_scale = 0.05
+
+    def _validate_params(self):
+        if self.probe_hidden_dim < 0:
+            raise ValueError("probe_hidden_dim must be >= 0")
+        if self.probe_layers < 1:
+            raise ValueError("probe_layers must be >= 1")
+        if self.contrastive_dim < 0:
+            raise ValueError("contrastive_dim must be >= 0")
+        if self.contrastive_steps < 1:
+            raise ValueError("contrastive_steps must be >= 1")
 
     def reset_cache(self, reset_mask: torch.Tensor):
         reset_cache(self, reset_mask)

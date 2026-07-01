@@ -148,7 +148,7 @@ class BaseWMOnPolicy:
     def call_wm(self, state, episode_start):
         if not isinstance(state, dict):
             raise ValueError("JointWMReinforce expects dict observation with 'sensor'")
-        sensor = state["sensor"].to(torch.float32)
+        sensor = state["sensor"]
         if sensor.dim() == 2:
             sensor = sensor.unsqueeze(1)
         if sensor.dim() != 3:
@@ -168,14 +168,10 @@ class BaseWMOnPolicy:
             )
         # we are in the episode collection
         else:
-            if not isinstance(episode_start, torch.Tensor):
-                episode_start_t = torch.as_tensor(episode_start, dtype=torch.bool, device=sensor.device)
-            else:
-                episode_start_t = episode_start.to(sensor.device).bool()
             if self._prev_actions is None:
                 self._prev_actions = torch.zeros((batch_size, self.action_dim), dtype=sensor.dtype, device=sensor.device)
-            if episode_start_t.any():
-                self._prev_actions[episode_start_t, :] = 0.0
+            if episode_start.any():
+                self._prev_actions[episode_start, :] = 0.0
             prev_actions = self._prev_actions.unsqueeze(1).expand(batch_size, seq_len, self.action_dim)
             model_obs = {
                 "sensor": sensor,
@@ -184,7 +180,7 @@ class BaseWMOnPolicy:
             }
             wm_out = self.wm_model(
                 model_obs,
-                episode_start=episode_start_t,
+                episode_start=episode_start,
             )
         return wm_out
 
@@ -198,7 +194,9 @@ class BaseWMOnPolicy:
         policy = self.get_policy_for_action()
         policy_states = self.process_states(state, episode_start)
         policy_kwargs = dict(episode_start=episode_start)
-        actions, log_probs, dist = self.rl_sampler()(policy, policy_states, policy_kwargs)
+        sampler = self.rl_sampler()
+        policy_params = sampler.policy_params(policy, policy_states, policy_kwargs)
+        actions, log_probs, dist = sampler(policy_params)
 
         # ------------------------------------------------------------------
         # Obtain entropy safely. Some `TransformedDistribution` instances do
@@ -1177,22 +1175,7 @@ class JointWMPPO(BaseWMOnPolicy):
                  exp_adv=None,
                  target_entropy=2,
                  **kwargs):
-        self.agent = PPO(
-            policy=policy,
-            value=value,
-            sampler=sampler,
-            policy_lr=policy_lr,
-            value_lr=value_lr,
-            num_envs=num_envs,
-            discount=discount,
-            device=device,
-            logger=logger,
-            entropy_coef=entropy_coef,
-            target_entropy=target_entropy,
-            num_learning_epochs=num_learning_epochs,
-            clip_param=clip_param,
-            exp_adv=exp_adv,
-        )
+
         BaseWMOnPolicy.__init__(self, device=device, logger=logger, **kwargs)
         self.agents = [self.agent]
 

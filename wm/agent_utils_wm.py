@@ -8,15 +8,19 @@ from typing import Dict
 
 import torch
 import numpy
+from ppo import PPO
 from base import LossConfig
-from sample import DiscreteActionSampler
+from sample import DiscreteActionSampler, GoalSwitchSampler
 
 from baselines import RNNPredictor, TransformerBaseline
 from rssm import RSSMDiscretePredictor
 from transformer import LlamaConfig
 from tssm import TSSMDiscretePredictor
-from policy_head import WMActionHeadPolicy, WMValueHeadPolicy
+from rnn_cached import RNNConfig, CachedRNN
+from policy_head import WMActionHeadPolicy, WMValueHeadPolicy, ActionSwitchPolicy
 from wm_joint_agent import JointWMPPO
+from double import DoubleAgent
+from goal_agent import GoalAgent
 from utils import make_soft_table, make_label_smoothing_table
 
 
@@ -683,13 +687,13 @@ def create_single_policy_agent(args, wm_model_args, wm_model, logger, maze_dim, 
         device=torch.device(args.device),
         input_dim=policy_input_dim
     )
-    
+
     value = WMValueHeadPolicy(
         device=torch.device(args.device),
         input_dim=policy_input_dim
     )
 
-   
+
     agent = JointWMPPO(
         policy=policy_module,
         value=value,
@@ -718,44 +722,94 @@ def create_single_policy_agent(args, wm_model_args, wm_model, logger, maze_dim, 
     return agent
 
 
-def create_double_policy_agent(args, wm_model_args, logger, maze_dim):
+def create_double_policy_agent(args, wm_model_args, wm_model, logger, maze_dim, num_actions, action_table):
+    device = torch.device(args.device)
+
     h_t_dim = int(wm_model_args.hidden_size)
     # sfa is the same dim as cpc
-    contrastive_dim = args.contrastive_dim
-    # goal dim is just sfa
-    # input is h_t + sfa_t + goal
-    policy_input_dim = h_t_dim + contrastive_dim + contrastive_dim 
-    policy_high = WMActionHeadPolicy(
-        num_actions=len(base_env.action_table),
-        device=torch.device(args.device),
-        input_dim=policy_input_dim
-    )
+    contrastive_dim = wm_model_args.contrastive_dim
+    # goal dim is just sfa dim
+    goal_dim = cpc_dim = sfa_dim = wm_model_args.contrastive_dim
+
+    # bt = [h_t, e_t, sfa_t]
+    bt_dim = h_t_dim + cpc_dim + sfa_dim
+    # low-level input [bt, g_t, g_t - sfa_t]  # maybe add d = |g_t - sfa_t|_2 ?
+    low_policy_input_dim = bt_dim + goal_dim + goal_dim
 
     policy_low = WMActionHeadPolicy(
-        action_table=base_env.action_table,
-        device=torch.device(args.device),
-        input_dim=policy_input_dim
-    )
-    
-    value = WMValueHeadPolicy(
-        device=torch.device(args.device),
-        input_dim=policy_input_dim
+        num_actions=len(action_table),
+        device=device,
+        input_dim=low_policy_input_dim
     )
 
-   
-    agent = JointWMPPO(
-        policy=policy_module,
-        value=value,
-        sampler=DiscreteActionSampler(),
+    sampler_low = DiscreteActionSampler()
+    value_low = WMValueHeadPolicy(
+        device=device,
+        input_dim=low_policy_input_dim
+    )
+
+    agent_low = PPO(
+        policy=policy_low,
+        value=value_low,
+        sampler=sampler_low,
         policy_lr=args.policy_lr,
-        num_envs=env.num_envs,
+        value_lr=getattr(args, "value_lr", 0.001),
+        num_envs=args.num_envs,
         discount=args.discount,
+        device=device,
         logger=logger,
-        wm_model=wm_model,
-        action_table=base_env.action_table,
-        device=torch.device(args.device),
         entropy_coef=args.entropy_coef,
         target_entropy=args.target_entropy,
+        num_learning_epochs=getattr(args, "num_learning_epochs", 4),
+        clip_param=getattr(args, "clip_param", None),
+        exp_adv=getattr(args, "exp_adv", False),
+    )
+
+    surprise_dim = progress_dim = steps_dim = 1
+    # high-level input [bt, gt, surprise, progress, steps since goal switch]
+    # output s ~ Bernoulli + g_t+1 ~ Normal
+    # output gt+1 * s + (1 - s) gt
+    # in future possibly achievability
+    high_policy_input_dim = bt_dim + goal_dim + surprise_dim + progress_dim + steps_dim
+
+    cfg = RNNConfig(input_size=high_policy_input_dim,
+                    hidden_size=64, # world model may be too big, hardcode for now
+                    num_hidden_layers=args.wm_layers, # reuse world model param
+                    attention_window=30) # shorter than world model
+
+    # output is {goal: Normal params, switch: Bernoulli logits}
+    policy_high = ActionSwitchPolicy(CachedRNN(cfg), cfg.hidden_size, goal_dim).to(device)
+
+    value_high = WMValueHeadPolicy(
+        device=device,
+        input_dim=high_policy_input_dim,
+        output_dim=2,
+    )
+
+    goal_switch = GoalSwitchSampler(goal_dim, goal_min=-2.0, goal_max=2.0, reparameterize=False, transform=False)
+    agent_high = GoalAgent(
+        policy=policy_high,
+        value=value_high,
+        sampler=goal_switch,
+        policy_lr=args.policy_lr,
+        value_lr=getattr(args, "value_lr", 0.001),
+        num_envs=args.num_envs,
+        discount=args.discount,
+        device=device,
+        logger=logger,
+        entropy_coef=args.entropy_coef,
+        target_entropy=args.target_entropy,
+        num_learning_epochs=getattr(args, "num_learning_epochs", 4),
+        clip_param=getattr(args, "clip_param", None),
+        exp_adv=getattr(args, "exp_adv", False),
+    )
+    agent = DoubleAgent(
+        agent_high,
+        agent_low,
+        logger=logger,
+        wm_model=wm_model,
+        action_table=action_table,
+        device=device,
         intrinsic_reward_scale=args.intrinsic_reward_scale,
         env_reward_scale=args.env_reward_scale,
         wm_updates_per_policy=args.wm_updates_per_policy,
@@ -847,5 +901,3 @@ def create_maze_world_model(
         loc_min=loc_min,
     )
     return model
-
-
