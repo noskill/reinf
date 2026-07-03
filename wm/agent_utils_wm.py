@@ -20,7 +20,7 @@ from rnn_cached import RNNConfig, CachedRNN
 from policy_head import WMActionHeadPolicy, WMValueHeadPolicy, ActionSwitchPolicy
 from wm_joint_agent import JointWMPPO
 from double import DoubleAgent
-from goal_agent import GoalAgent
+from goal_agent import GoalAgent, LowLevelAgent
 from utils import make_soft_table, make_label_smoothing_table
 
 
@@ -748,7 +748,7 @@ def create_double_policy_agent(args, wm_model_args, wm_model, logger, maze_dim, 
         input_dim=low_policy_input_dim
     )
 
-    agent_low = PPO(
+    agent_low = LowLevelAgent(
         policy=policy_low,
         value=value_low,
         sampler=sampler_low,

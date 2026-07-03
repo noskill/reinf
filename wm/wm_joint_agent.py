@@ -361,9 +361,12 @@ class BaseWMOnPolicy:
             key_padding_mask=obs_new["key_padding_mask"],
             divergence_novelty=divergence_novelty,
             episode_novelty=episode_novelty,
-            policy_episodes=policy_episodes,
             cluster_dist_novelty=cluster_dist_novelty,
             embedding_prediction_error=emb_pred_error,
+        )
+        self._apply_intrinsic_rewards_to_episodes(
+            policy_episodes=policy_episodes,
+            intrinsic_rewards=intrinsic_rewards,
         )
         self._log_intrinsic_vs_episode_coverage(
             intrinsic_rewards=intrinsic_rewards,
@@ -432,7 +435,6 @@ class BaseWMOnPolicy:
         key_padding_mask: torch.Tensor,
         divergence_novelty: torch.Tensor,
         episode_novelty: torch.Tensor,
-        policy_episodes,
         cluster_dist_novelty,
         embedding_prediction_error,
     ) -> torch.Tensor:
@@ -482,13 +484,6 @@ class BaseWMOnPolicy:
         # reward = reward_progress
         intrinsic_rewards = self.intrinsic_reward_scale * reward
 
-        for ep_idx, episode in enumerate(policy_episodes[: intrinsic_rewards.shape[0]]):
-            max_t = min(len(episode) - 1, intrinsic_rewards.shape[1])
-            for t in range(max_t):
-                transition = episode[t]
-                updated_reward = torch.as_tensor(transition[4], dtype=torch.float32, device=self.device) + intrinsic_rewards[ep_idx, t]
-                episode[t] = (transition[0], transition[1], transition[2], transition[3], updated_reward)
-
         self.logger.log_scalar("reward/lp_mean", lp_rewards_new.detach().mean().cpu().item())
         self.logger.log_scalar("reward/surprise_mean", cpc_error_before.detach().mean().cpu().item() * 0.001)
         self.logger.log_scalar("reward/sensor_lp_mean", self._masked_mean(sensor_lp_rewards_new, valid))
@@ -500,6 +495,19 @@ class BaseWMOnPolicy:
             valid_mask=valid,
             metric_prefix="reward/intrinsic")
         return intrinsic_rewards
+
+    def _apply_intrinsic_rewards_to_episodes(
+        self,
+        *,
+        policy_episodes,
+        intrinsic_rewards: torch.Tensor,
+    ) -> None:
+        for ep_idx, episode in enumerate(policy_episodes[: intrinsic_rewards.shape[0]]):
+            max_t = min(len(episode) - 1, intrinsic_rewards.shape[1])
+            for t in range(max_t):
+                transition = episode[t]
+                updated_reward = torch.as_tensor(transition[4], dtype=torch.float32, device=self.device) + intrinsic_rewards[ep_idx, t]
+                episode[t] = (transition[0], transition[1], transition[2], transition[3], updated_reward)
 
     @staticmethod
     def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> float:
