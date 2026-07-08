@@ -21,10 +21,10 @@ class PPOBase(VPGBase):
       log_probs_new (and optional mu for Normal policies) to avoid re-forward
       duplication and ease maintenance.
     """
-    def __init__(self, policy, value, sampler, policy_lr=0.0001, value_lr=0.001, num_envs=8, discount=0.99, device=torch.device('cpu'), logger=None, num_learning_epochs=4, clip_param=None, **kwargs):
+    def __init__(self, policy, value, sampler, policy_lr=0.0001, value_lr=0.001, num_envs=8, discount=0.99, device=torch.device('cpu'), logger=None, log_prefix=None, num_learning_epochs=4, clip_param=None, **kwargs):
         super().__init__(policy, value, sampler, policy_lr=policy_lr,
                     num_envs=num_envs, discount=discount,
-                    device=device, logger=logger, num_learning_epochs=num_learning_epochs, **kwargs)
+                    device=device, logger=logger, log_prefix=log_prefix, num_learning_epochs=num_learning_epochs, **kwargs)
         self.policy_old = copy.deepcopy(self.policy)
         self.eps = float(clip_param) if clip_param is not None else 0.2
         self.hparams.update({'eps': self.eps})

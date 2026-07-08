@@ -22,6 +22,7 @@ class ReinforceBase(Agent):
         discount=0.99,
         device=torch.device("cpu"),
         logger=None,
+        log_prefix=None,
         entropy_coef=0.005,
         target_entropy=2,
         exp_adv=False,
@@ -39,7 +40,7 @@ class ReinforceBase(Agent):
         self.create_optimizers(**kwargs)
         self.entropy_coef = entropy_coef
         self.entropy_thresh = 1
-        super().__init__(logger=logger, **kwargs)
+        super().__init__(logger=logger, log_prefix=log_prefix, **kwargs)
         self.target_entropy = torch.tensor(target_entropy, dtype=torch.float16)
         self.mu_coef = 0.001
         self.exp_adv_scale_coeff = 0.5
@@ -410,8 +411,8 @@ class Reinforce(ReinforceBase, EpisodesPoolMixin):
         num_envs=8,
         discount=0.99,
         device=torch.device("cpu"),
-        logger=None, **kwargs
+        logger=None, log_prefix=None, **kwargs
     ):
         super().__init__(policy, sampler, policy_lr=policy_lr,
                          num_envs=num_envs, discount=discount,
-                         device=device, logger=logger, **kwargs)
+                         device=device, logger=logger, log_prefix=log_prefix, **kwargs)

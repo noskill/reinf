@@ -19,6 +19,7 @@ class CachedRNN(torch.nn.Module, CacheModuleMixin):
         self._state_h: Optional[torch.Tensor] = None
 
     def forward(self, x, key_padding_mask, reset_mask):
+        self.backbone.flatten_parameters()
         using_cache = reset_mask is not None
         if using_cache:
             assert x.shape[1] == 1, f"CachedRNN internal cache expects online T=1 calls, got sequence length {x.shape[1]}"

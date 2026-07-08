@@ -26,13 +26,13 @@ class Value(nn.Module):
 
 class VPGBase(ReinforceBase):
     def __init__(self, policy, value, sampler, policy_lr=0.0001, value_lr=0.001, num_envs=8,
-                 discount=0.99, device=torch.device('cpu'), logger=None, entropy_coef=0.01, num_learning_epochs=4, **kwargs):
+                 discount=0.99, device=torch.device('cpu'), logger=None, log_prefix=None, entropy_coef=0.01, num_learning_epochs=4, **kwargs):
         self.value = value
         self.value_lr = value_lr
         self.weight_decay_value = 0
         super().__init__(policy, sampler, policy_lr=policy_lr,
                     num_envs=num_envs, discount=discount,
-                    device=device, logger=logger, entropy_coef=entropy_coef, **kwargs)
+                    device=device, logger=logger, log_prefix=log_prefix, entropy_coef=entropy_coef, **kwargs)
         self.lambda_discount = self.discount
         self.sampler = sampler
         self.create_optimizers(**kwargs)
