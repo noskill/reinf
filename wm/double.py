@@ -160,8 +160,10 @@ class DoubleAgent(BaseWMOnPolicy):
         if progress.shape[0] > 1:
             next_progress[:-1] = progress[1:]
 
-        intrinsic = intrinsic_rewards[:progress.shape[0]].to(progress).clamp_min(0.0)
-        rewards = intrinsic * next_progress.clamp(0.0, 1.0)
+        rewards = torch.zeros_like(progress)
+        valid_steps = min(progress.shape[0], intrinsic_rewards.shape[0])
+        intrinsic = intrinsic_rewards[:valid_steps].to(progress).clamp_min(0.0)
+        rewards[:valid_steps] = intrinsic * next_progress[:valid_steps].clamp(0.0, 1.0)
         return rewards.detach()
 
     def _extract_high_sfa(self, states):
@@ -408,6 +410,31 @@ class DoubleAgent(BaseWMOnPolicy):
         if high_episodes:
             self.agent_high.learn_from_episodes(high_episodes)
             self.agent_high.train_goal_hindsight(high_episodes, high_goal_targets, high_goal_weights)
+
+        scalar_sums = {
+            "joint/loss_total": total_loss_sum,
+            "reward/intrinsic_mean": float(intrinsic_rewards.mean().detach().cpu()) * wm_updates_for_logging,
+            "wm/loss/total": wm_loss_sum,
+        }
+        extra_scalars = {
+            "wm/fixed": float(self.wm_fixed),
+            "wm/actual_updates": float(wm_updates),
+            "wm/replay_size": float(len(self._wm_pool.episode_pool)),
+            "wm/replay_sampled_episodes": float(len(replay_episodes)),
+            "wm/joint_sampled_episodes": float(len(wm_new_episodes) + len(replay_episodes)),
+            "wm/joint_sampled_transitions": float(
+                sum(max(0, len(ep) - 1) for ep in wm_new_episodes)
+                + sum(max(0, len(ep) - 1) for ep in replay_episodes)
+            ),
+        }
+        self._log_update_stats(
+            updates=wm_updates_for_logging,
+            scalar_sums=scalar_sums,
+            extra_scalars=extra_scalars,
+            wm_loss_sums=wm_loss_sums,
+            wm_metric_sums=wm_metric_sums,
+            info=info,
+        )
 
         self.version += 1
         self.clear_completed()
