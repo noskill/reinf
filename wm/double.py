@@ -40,6 +40,34 @@ class DoubleAgent(BaseWMOnPolicy):
     @version.setter
     def version(self, value):
         self.agent_low.version = value
+        self.agent_high.version = value
+
+    def rl_add_reward(self, env_idx, reward):
+        self.agent_low.add_reward(env_idx, reward)
+        self.agent_high.add_reward(env_idx, reward)
+
+    def process_dones(self, dones):
+        self.agent_low.process_dones(dones)
+        self.agent_high.process_dones(dones)
+
+    def train(self):
+        for agent in self.agents:
+            agent.policy.train()
+            agent.value.train()
+
+    def clear_completed(self):
+        self.agent_low.clear_completed()
+        self.agent_high.clear_completed()
+
+    def rl_get_state_dict(self):
+        return {
+            "high": self.agent_high.get_state_dict(),
+            "low": self.agent_low.get_state_dict(),
+        }
+
+    def rl_load_state_dict(self, state_dict):
+        self.agent_high.load_state_dict(state_dict["high"])
+        self.agent_low.load_state_dict(state_dict["low"])
 
     def should_learn(self):
         return ( self.agent_low.should_learn()
@@ -122,13 +150,76 @@ class DoubleAgent(BaseWMOnPolicy):
         rewards[stalled] -= 1.0
         return rewards.detach()
 
-    def _overwrite_high_rewards(self, episodes, switch_rewards_per_episode):
+    def _compute_high_goal_rewards(self, episode, intrinsic_rewards):
+        states = torch.stack([step[0] for step in episode], dim=0).to(self.device)
+        progress = states[:, -2]
+
+        # The sampled goal at t only affects behavior after t, so use next-step
+        # progress as the achievability gate for crediting intrinsic reward.
+        next_progress = torch.zeros_like(progress)
+        if progress.shape[0] > 1:
+            next_progress[:-1] = progress[1:]
+
+        intrinsic = intrinsic_rewards[:progress.shape[0]].to(progress).clamp_min(0.0)
+        rewards = intrinsic * next_progress.clamp(0.0, 1.0)
+        return rewards.detach()
+
+    def _extract_high_sfa(self, states):
+        assert states.dim() == 2, f"Expected high states [T,D], got {tuple(states.shape)}"
+        goal_dim = self.wm_model.contrastive_dim
+        sfa_end = -(goal_dim + 3)
+        sfa_start = sfa_end - goal_dim
+        sfa = states[:, sfa_start:sfa_end]
+        assert sfa.shape[-1] == goal_dim, "failed to extract SFA from high-level state"
+        return sfa
+
+    def _compute_high_goal_hindsight(self, high_episodes, intrinsic_rewards, horizon=5):
+        assert len(high_episodes) <= intrinsic_rewards.shape[0], "high episodes and intrinsic rewards are misaligned"
+        targets_per_episode = []
+        weights_per_episode = []
+        target_distances = []
+
+        for ep_idx, episode in enumerate(high_episodes):
+            states = torch.stack([step[0] for step in episode], dim=0).to(self.device)
+            sfa = self._extract_high_sfa(states)
+            targets = torch.zeros_like(sfa)
+            weights = torch.zeros(sfa.shape[0], dtype=sfa.dtype, device=sfa.device)
+
+            if sfa.shape[0] > 1:
+                step_horizon = min(int(horizon), sfa.shape[0] - 1)
+                valid_steps = sfa.shape[0] - step_horizon
+
+                # Hindsight target: train the goal proposal at time t to predict an
+                # SFA state the low-level policy actually reached shortly after t.
+                # The loss later masks to switch_t == 1, so only new-goal proposal
+                # decisions are supervised by these future achieved states.
+                targets[:valid_steps] = sfa[step_horizon:]
+
+                # Use intrinsic reward along the achieved segment as the learning
+                # weight: future states reached through more novel/surprising/LP-rich
+                # segments should be more likely high-level goals.
+                # that's similiar to   w(s, z_future) = exp(Q(s, z_future) - V(s))
+                # in advantage-weighted regression / AWR / AWAC than vanilla PPO.
+                # todo: try w_t = segment_intrinsic_return - value_goal(s_t)
+                _intrinsic = intrinsic_rewards[ep_idx, :sfa.shape[0]].to(sfa).clamp_min(0.0)
+                for t in range(valid_steps):
+                    weights[t] = _intrinsic[t : t + step_horizon].mean()
+                target_distances.append(torch.linalg.vector_norm(targets[:valid_steps] - sfa[:valid_steps], dim=-1).detach())
+
+            targets_per_episode.append(targets.detach())
+            weights_per_episode.append(weights.detach())
+
+        if target_distances:
+            self.logger.log_scalar("high/goal_hindsight_target_dist", torch.cat(target_distances).mean())
+        return targets_per_episode, weights_per_episode
+
+    def _overwrite_high_rewards(self, episodes, goal_rewards_per_episode, switch_rewards_per_episode):
         assert len(episodes) == len(switch_rewards_per_episode), "episode/reward count mismatch"
-        goal_rewards_per_episode = []
+        assert len(episodes) == len(goal_rewards_per_episode), "episode/goal reward count mismatch"
         for episode, switch_rewards in zip(episodes, switch_rewards_per_episode):
             assert len(episode) == switch_rewards.shape[0], "episode/reward length mismatch"
-            goal_rewards = torch.zeros_like(switch_rewards)
-            goal_rewards_per_episode.append(goal_rewards)
+        for episode, goal_rewards, switch_rewards in zip(episodes, goal_rewards_per_episode, switch_rewards_per_episode):
+            assert len(episode) == goal_rewards.shape[0] == switch_rewards.shape[0], "episode/reward length mismatch"
             for step_idx, (goal_reward, switch_reward) in enumerate(zip(goal_rewards, switch_rewards)):
                 episode[step_idx] = (*episode[step_idx][:4], goal_reward, switch_reward)
         self.logger.log_scalar(
@@ -303,14 +394,23 @@ class DoubleAgent(BaseWMOnPolicy):
             divergence_novelty=divergence_novelty,
             episode_novelty=episode_novelty,
             cluster_dist_novelty=None,
-            embedding_prediction_error=emb_pred_error,
-        )
+            embedding_prediction_error=emb_pred_error)
 
         high_episodes = [ep for ep in self.agent_high.get_train_episodes() if len(ep) >= 2]
+        high_goal_rewards = [
+            self._compute_high_goal_rewards(ep, intrinsic_rewards[ep_idx])
+            for ep_idx, ep in enumerate(high_episodes)
+        ]
         high_switch_rewards = [self._compute_high_switch_rewards(ep) for ep in high_episodes]
-        self._overwrite_high_rewards(high_episodes, high_switch_rewards)
+        high_goal_targets, high_goal_weights = self._compute_high_goal_hindsight(high_episodes, intrinsic_rewards)
+        self._overwrite_high_rewards(high_episodes, high_goal_rewards, high_switch_rewards)
         
         if high_episodes:
             self.agent_high.learn_from_episodes(high_episodes)
+            self.agent_high.train_goal_hindsight(high_episodes, high_goal_targets, high_goal_weights)
+
+        self.version += 1
+        self.clear_completed()
+        self._wm_pool.clear_completed()
 
         return True
