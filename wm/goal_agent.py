@@ -12,6 +12,43 @@ class LowLevelAgent(PPO):
         self.process_dones(dones)
         return False
 
+    def train_hindsight(self, states_per_episode, actions_per_episode, weights_per_episode, coef=0.05):
+        assert len(states_per_episode) == len(actions_per_episode) == len(weights_per_episode), "hindsight batch count mismatch"
+        if not states_per_episode:
+            return
+        batch = EpisodeBatch({
+            "states": states_per_episode,
+            "actions": actions_per_episode,
+            "weights": weights_per_episode,
+        }).to(self.device)
+        padded, padding_mask, _ = batch.pad(fields=["states", "actions", "weights"])
+        padding_mask = padding_mask.to(self.device)
+        states_padded = to_device(padded["states"], self.device)
+        actions_padded = padded["actions"].to(self.device)
+        weights_flat = flatten_padded(padded["weights"].unsqueeze(-1).to(self.device), padding_mask).squeeze(-1)
+        selected = weights_flat > 0.0
+        if not selected.any():
+            self.logger.log_scalar("hindsight_loss", 0.0)
+            self.logger.log_scalar("hindsight_selected_frac", 0.0)
+            return
+
+        weights_selected = weights_flat[selected].detach()
+        weights_selected = (weights_selected / weights_selected.mean().clamp_min(1e-6)).clamp(0.0, 5.0)
+        self.optimizer_policy.zero_grad()
+        logits = self.policy(states_padded)
+        _, logp_padded, dist = self.sampler(logits, actions=actions_padded, return_distribution=True)
+        logp_flat = flatten_padded(logp_padded.unsqueeze(-1), padding_mask).squeeze(-1)
+        entropy_flat = flatten_padded(dist.entropy().unsqueeze(-1), padding_mask).squeeze(-1)
+        entropy_loss = self.compute_entropy_loss(entropy_flat[selected], entropy_flat.device, entropy_flat.dtype)
+        loss = -float(coef) * (logp_flat[selected] * weights_selected).mean() + self.entropy_coef * entropy_loss
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1)
+        self.optimizer_policy.step()
+        self.policy_old.load_state_dict(self.policy.state_dict())
+        self.logger.log_scalar("hindsight_loss", loss.detach().item())
+        self.logger.log_scalar("hindsight_weight_mean", weights_flat[selected].mean().item())
+        self.logger.log_scalar("hindsight_selected_frac", selected.to(torch.float32).mean().item())
+
 
 class GoalAgent(PPO):
     """PPO policy for option-like SFA goals.

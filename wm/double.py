@@ -107,6 +107,14 @@ class DoubleAgent(BaseWMOnPolicy):
         goal_delta = states[:, -self.wm_model.contrastive_dim:]
         return torch.linalg.vector_norm(goal_delta, dim=-1)
 
+    def _extract_low_base_sfa(self, states):
+        assert states.dim() == 2, f"Expected low states [T,D], got {tuple(states.shape)}"
+        goal_dim = self.wm_model.contrastive_dim
+        base = states[:, :-2 * goal_dim]
+        sfa = base[:, -goal_dim:]
+        assert sfa.shape[-1] == goal_dim, "failed to extract SFA from low-level state"
+        return base, sfa
+
     def _compute_low_actual_rewards(self, episode, intrinsic_rewards=None, intrinsic_coef=0.1):
         distances = self._low_goal_distances(episode)
         goal_rewards = torch.zeros_like(distances)
@@ -152,6 +160,41 @@ class DoubleAgent(BaseWMOnPolicy):
             "low/intrinsic_bonus_mean",
             float(intrinsic_coef) * torch.cat(intrinsic_bonus).mean() if intrinsic_bonus else torch.tensor(0.0),
         )
+
+    def _compute_low_hindsight(self, low_episodes, intrinsic_rewards, horizon=5):
+        assert len(low_episodes) <= intrinsic_rewards.shape[0], "low episodes and intrinsic rewards are misaligned"
+        states_per_episode = []
+        actions_per_episode = []
+        weights_per_episode = []
+        target_distances = []
+
+        for ep_idx, episode in enumerate(low_episodes):
+            states = torch.stack([step[0] for step in episode], dim=0).to(self.device)
+            actions = torch.stack([step[1] for step in episode], dim=0).to(self.device).long()
+            base, sfa = self._extract_low_base_sfa(states)
+            hindsight_states = torch.zeros_like(states)
+            weights = torch.zeros(sfa.shape[0], dtype=sfa.dtype, device=sfa.device)
+
+            if sfa.shape[0] > 1:
+                step_horizon = min(int(horizon), sfa.shape[0] - 1)
+                valid_steps = sfa.shape[0] - step_horizon
+                goals = sfa[step_horizon:]
+                hindsight_states[:valid_steps] = torch.cat([base[:valid_steps], goals, goals - sfa[:valid_steps]], dim=-1)
+                distances = torch.linalg.vector_norm(goals - sfa[:valid_steps], dim=-1)
+                next_distances = torch.linalg.vector_norm(goals - sfa[1 : valid_steps + 1], dim=-1)
+                progress = (distances - next_distances).clamp_min(0.0)
+                _intrinsic = intrinsic_rewards[ep_idx, :sfa.shape[0]].to(sfa).clamp_min(0.0)
+                for t in range(valid_steps):
+                    weights[t] = progress[t] + 0.1 * _intrinsic[t : t + step_horizon].mean()
+                target_distances.append(distances.detach())
+
+            states_per_episode.append(hindsight_states.detach().cpu())
+            actions_per_episode.append(actions.detach().cpu())
+            weights_per_episode.append(weights.detach().cpu())
+
+        if target_distances:
+            self.logger.log_scalar("low/hindsight_target_dist", torch.cat(target_distances).mean())
+        return states_per_episode, actions_per_episode, weights_per_episode
 
     def _compute_high_switch_rewards(self, episode):
         states = torch.stack([step[0] for step in episode], dim=0).to(self.device)
@@ -424,6 +467,8 @@ class DoubleAgent(BaseWMOnPolicy):
         self._overwrite_low_rewards(low_episodes, low_rewards)
         if low_episodes:
             self.agent_low.learn_from_episodes(low_episodes)
+            low_h_states, low_h_actions, low_h_weights = self._compute_low_hindsight(low_episodes, intrinsic_rewards)
+            self.agent_low.train_hindsight(low_h_states, low_h_actions, low_h_weights)
 
         high_episodes = [ep for ep in self.agent_high.get_train_episodes() if len(ep) >= 2]
         high_goal_rewards = [
