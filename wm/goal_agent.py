@@ -267,7 +267,7 @@ class GoalAgent(PPO):
                 actions=targets_padded,
                 return_distribution=True,
             )
-            old_logp_flat = self._flatten_time(old_logp_padded, padding_mask).detach()
+            old_logp_flat = flatten_padded(old_logp_padded, padding_mask).detach()
 
         last_loss = None
         for _ in range(num_epochs):
@@ -278,11 +278,11 @@ class GoalAgent(PPO):
                 actions=targets_padded,
                 return_distribution=True,
             )
-            logp_flat = self._flatten_time(logp_padded, padding_mask)
+            logp_flat = flatten_padded(logp_padded, padding_mask)
             ratio = torch.exp(logp_flat[selected] - old_logp_flat[selected])
             clipped_ratio = ratio.clamp(1.0 - self.eps, 1.0 + self.eps)
             objective = torch.minimum(ratio * weights_selected, clipped_ratio * weights_selected)
-            entropy = self._flatten_time(self._one_dist_entropy(dist), padding_mask)[selected]
+            entropy = flatten_padded(self._one_dist_entropy(dist), padding_mask)[selected]
             entropy_loss = self.compute_entropy_loss(entropy, entropy.device, entropy.dtype)
             loss = -self.goal_hindsight_coef * objective.mean() + self.entropy_coef * entropy_loss
             loss.backward()
@@ -388,11 +388,11 @@ class GoalAgent(PPO):
             mb_obs, mb_actions, mb_padding, mb_old_logp, mb_goal_adv, mb_switch_adv = minibatch
             logp_new, entropy, mu = self.compute_distribution_params(mb_obs, mb_actions, mb_padding)
 
-            goal_old = self._flatten_time(mb_old_logp["goal"], mb_padding).detach()
-            switch_old = self._flatten_time(mb_old_logp["switch"], mb_padding).detach()
-            goal_adv = self._flatten_time(mb_goal_adv, mb_padding)
-            switch_adv = self._flatten_time(mb_switch_adv, mb_padding)
-            switch = self._flatten_time(mb_actions["switch"], mb_padding).to(goal_adv)
+            goal_old = flatten_padded(mb_old_logp["goal"], mb_padding).detach()
+            switch_old = flatten_padded(mb_old_logp["switch"], mb_padding).detach()
+            goal_adv = flatten_padded(mb_goal_adv, mb_padding)
+            switch_adv = flatten_padded(mb_switch_adv, mb_padding)
+            switch = flatten_padded(mb_actions["switch"].squeeze(), mb_padding).to(goal_adv)
             new_goal_mask = switch
 
             if goal_old.numel() == 0:
@@ -407,6 +407,7 @@ class GoalAgent(PPO):
                 new_goal_mask,
                 mu=mu,
             )
+
             switch_loss = self.policy_loss(
                 switch_old,
                 switch_adv,
@@ -480,14 +481,15 @@ class GoalAgent(PPO):
             actions=actions,
             return_distribution=True,
         )
+
         entropy = self._dist_entropy(dist)
         out_logp = {
-            "goal": self._flatten_time(logp_new["goal"], key_padding_mask),
-            "switch": self._flatten_time(logp_new["switch"], key_padding_mask),
+            "goal": flatten_padded(logp_new["goal"], key_padding_mask),
+            "switch": flatten_padded(logp_new["switch"], key_padding_mask),
         }
         out_entropy = {
-            "goal": self._flatten_time(entropy["goal"], key_padding_mask),
-            "switch": self._flatten_time(entropy["switch"], key_padding_mask),
+            "goal": flatten_padded(entropy["goal"], key_padding_mask),
+            "switch": flatten_padded(entropy["switch"], key_padding_mask),
         }
         mu = self._goal_mu(dist["goal"], key_padding_mask)
         return out_logp, out_entropy, mu
@@ -529,13 +531,6 @@ class GoalAgent(PPO):
         if not hasattr(base_normal, "loc"):
             return None
         return flatten_padded(base_normal.loc, key_padding_mask)
-
-    def _flatten_time(self, tensor, key_padding_mask):
-        if tensor.dim() == 3 and tensor.shape[-1] == 1:
-            tensor = tensor.squeeze(-1)
-        if tensor.dim() == 2:
-            return flatten_padded(tensor.unsqueeze(-1), key_padding_mask).squeeze(-1)
-        return flatten_padded(tensor, key_padding_mask).squeeze(-1)
 
     def _log_training_stats(self, actions_batch):
         goal = flatten_padded(actions_batch["goal"], torch.zeros(

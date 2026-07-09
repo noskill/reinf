@@ -107,11 +107,17 @@ class DoubleAgent(BaseWMOnPolicy):
         goal_delta = states[:, -self.wm_model.contrastive_dim:]
         return torch.linalg.vector_norm(goal_delta, dim=-1)
 
-    def _compute_low_actual_rewards(self, episode):
+    def _compute_low_actual_rewards(self, episode, intrinsic_rewards=None, intrinsic_coef=0.1):
         distances = self._low_goal_distances(episode)
-        rewards = torch.zeros_like(distances)
+        goal_rewards = torch.zeros_like(distances)
         if distances.shape[0] > 1:
-            rewards[:-1] = distances[:-1] - distances[1:]
+            goal_rewards[:-1] = distances[:-1] - distances[1:]
+        rewards = goal_rewards
+        if intrinsic_rewards is not None:
+            intrinsic_bonus = torch.zeros_like(rewards)
+            valid_steps = min(rewards.shape[0], intrinsic_rewards.shape[0])
+            intrinsic_bonus[:valid_steps] = intrinsic_rewards[:valid_steps].to(rewards).clamp_min(0.0)
+            rewards = rewards + float(intrinsic_coef) * intrinsic_bonus
         return rewards.detach().to("cpu")
 
     def _overwrite_low_rewards(self, episodes, rewards_per_episode):
@@ -128,6 +134,23 @@ class DoubleAgent(BaseWMOnPolicy):
             "low/goal_distance_mean",
             torch.cat([self._low_goal_distances(ep).detach().cpu() for ep in episodes]).mean()
             if episodes else torch.tensor(0.0),
+        )
+
+    def _log_low_reward_components(self, low_episodes, intrinsic_rewards, intrinsic_coef=0.1):
+        goal_rewards = [self._compute_low_actual_rewards(ep, intrinsic_rewards=None) for ep in low_episodes]
+        intrinsic_bonus = []
+        for ep_idx, episode in enumerate(low_episodes):
+            bonus = torch.zeros(len(episode), dtype=torch.float32, device=self.device)
+            valid_steps = min(len(episode), intrinsic_rewards.shape[1])
+            bonus[:valid_steps] = intrinsic_rewards[ep_idx, :valid_steps].to(bonus).clamp_min(0.0)
+            intrinsic_bonus.append(bonus.detach().cpu())
+        self.logger.log_scalar(
+            "low/goal_progress_reward_mean",
+            torch.cat(goal_rewards).mean() if goal_rewards else torch.tensor(0.0),
+        )
+        self.logger.log_scalar(
+            "low/intrinsic_bonus_mean",
+            float(intrinsic_coef) * torch.cat(intrinsic_bonus).mean() if intrinsic_bonus else torch.tensor(0.0),
         )
 
     def _compute_high_switch_rewards(self, episode):
@@ -307,12 +330,6 @@ class DoubleAgent(BaseWMOnPolicy):
         if not self.should_learn():
             return False
 
-        low_episodes = [ep for ep in self.agent_low.get_train_episodes() if len(ep) >= 2]
-        low_rewards = [self._compute_low_actual_rewards(ep) for ep in low_episodes]
-        self._overwrite_low_rewards(low_episodes, low_rewards)
-        if low_episodes:
-            self.agent_low.learn_from_episodes(low_episodes)
-
         wm_new_episodes = [ep for ep in self._wm_pool.get_completed_episodes() if len(ep) >= 2]
 
         replay_episodes = self._sample_replay_episodes()
@@ -397,6 +414,16 @@ class DoubleAgent(BaseWMOnPolicy):
             episode_novelty=episode_novelty,
             cluster_dist_novelty=None,
             embedding_prediction_error=emb_pred_error)
+
+        low_episodes = [ep for ep in self.agent_low.get_train_episodes() if len(ep) >= 2]
+        low_rewards = [
+            self._compute_low_actual_rewards(ep, intrinsic_rewards[ep_idx])
+            for ep_idx, ep in enumerate(low_episodes)
+        ]
+        self._log_low_reward_components(low_episodes, intrinsic_rewards)
+        self._overwrite_low_rewards(low_episodes, low_rewards)
+        if low_episodes:
+            self.agent_low.learn_from_episodes(low_episodes)
 
         high_episodes = [ep for ep in self.agent_high.get_train_episodes() if len(ep) >= 2]
         high_goal_rewards = [
