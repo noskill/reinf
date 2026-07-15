@@ -527,3 +527,139 @@ maybe one-step cpc error would work best for reward computation
 update ppo and vpg and reinforce impl
 
 need to add GAE to vpg and ppo
+
+# Wed Apr 29 11:23:55 AM UTC 2026
+
+better entropy regularisation was introduced
+
+# Thu May 14 01:29:56 PM UTC 2026
+
+refactored ppo, vpg towards using GAE
+
+
+# Mon May 25 03:09:10 PM UTC 2026
+
+exponential-weighted advantage introduced to reinforce.py
+
+# Fri May 29 11:34:35 AM UTC 2026
+
+current reward computation:
+  1. Compute lp = cpc_error_before - cpc_error_after.
+  2. Compute surprise = 0.001 * cpc_error_before.
+  3. Compute two novelty terms:
+      - divergence_novelty
+      - episode_novelty
+  4. Mix novelty:
+      - novelty_signal = 0.5 * (divergence_novelty + episode_novelty)
+  5. Build base reward:
+      - base = lp + surprise
+  6. Dynamic novelty scaling:
+      - novelty_scale = clamp(mean(|base|)/mean(|novelty_signal|), 0.1, 10.0)
+      - novelty_coef_effective = wm_divergence_novelty_coef * novelty_scale
+  7. Final intrinsic per step:
+      - intrinsic = intrinsic_reward_scale * (base + novelty_coef_effective * novelty_signal)
+  8. Add intrinsic to each stored policy transition reward.
+
+
+ppowm_04_stable_try1 - best run so far 
+to reproduce disable novel per/episode novelty and scaling
+
+
+
+what to try:
+
+1) novelty based on cpc-features instead of s = {h_t}
+2) training with frozen wm, or iterate training with large itervals wm vs policy
+3) regularize cpc-features more heavily - e.g. use SFA
+4) enable learning progress reward with frozen wm, train one copy and use other, frozen for policy/value
+
+
+
+# Wed Jun  3 10:07:56 AM UTC 2026
+tested  with frozen wm - mean-centering harms.
+frozen, frozen1, frozen2, frozen3 runs
+there is strong correlation of reward vs coverage/distance from start but coverage is not growing.
+
+what to try:
+  - Disable adaptive novelty scaling for ablation (fixed coef only) to reduce non-stationarity.
+  - Test absolute + relative novelty mix: r = a*raw_novelty + b*(raw_novelty - batch_mean_t), with b<a (e.g.
+    a=1,b=0.2).
+  - Add a progress term: max(0, raw_novelty_t - raw_novelty_{t-k}) (k=10/20) to reward moving to newer states, not
+    just high static variance.
+  - Move novelty space from state_seq to CPC embedding (frozen first), compare coverage slopes.
+  - Add mild entropy floor increase (or higher target entropy) only if entropy collapses early.
+  - Keep diagnostics: coverage, distance_from_start, intrinsic_vs_coverage_corr, plus coverage-by-reward-bin.
+  - Promote configs only if they improve last-200 mean coverage and stay positive on adv-vs-coverage across seeds.
+  - test separately each reward type
+  - try per-timestep mean substruction
+  - log unvisited cell/reward correlation
+
+check value-substraction advantage effects:
+
+  1. current: normalize(return - V)
+  2. no advantage normalization: return - V
+  3. no centering: (return - V) / std
+  4. no baseline diagnostic: return
+
+# Wed Jun 4 UTC 2026
+
+added clustering-based reward - worth to check cluster-hit distribution and maybe use it for reward
+
+currrent runs
+
+  - frozen-gae-nonorm: mixed WM novelty reward, GAE without advantage normalization.
+  - froz-returnsadv: mixed WM novelty reward, raw returns as policy weights.
+  - surprise-only-returns: CPC/surprise-only reward, raw returns.
+  - froz-returnsadv-episodenovelty: episode latent novelty reward, raw returns.
+  - froz-returnsadv-divergence-progress: progress/difference of batch divergence novelty, raw returns.
+  - froz-returnsadv-episodenovelty-progress: progress/difference of episode novelty, raw returns.
+  - episode-novelty-progress-mcadv: progress/difference of episode novelty, MC advantage.
+  - cluster-novelty-mcadv: clustering novelty reward, MC advantage.
+  - cluster-novelty-progress-mcadv: progress/difference of clustering novelty, MC advantage.
+  - cluster-novelty-progress-returns: progress/difference of clustering novelty, raw returns.
+  - cluster-novelty-returns: clustering novelty reward, raw returns.
+  - cluster-novelty-*-joint-norm: same four cluster variants, but using joint policy/value update and std-only normalization for returns or MC advantage.
+
+# Fri Jun 5 
+- use actual prediction error to next embedding/sensor, or add count/visitation-aware novelty, rather than relying only on centroid distance.
+- a frequently visited region can still map to one/few centroids 
+- use eucledian distance as surprise reward
+- likely  CPC batch-contrastive error is not the same as local sensor prediction error
+- batch-derived rewards work poorly so far
+
+new script analyze_embedding_spatiality.py:
+
+python analyze_embedding_spatiality.py --wm-load-path outputs/wm_rnn_pretrain_h176l3.pt --device cuda --data-path ~/projects/Algernon/data.txt --max-episodes 64 --max-steps 256  --sample-size 4096 --cluster-count 100 --knn-k 10 --wm-sensor-max-bin 18
+
+# Jun  6
+
+cluster with count reward also fails, worth fixing surprise reward
+
+Jun 11
+
+training works fine now with sensor prediction error as main drive + more wm iterations
+unified wm api for transformer and rnn backend
+next steps:
+   fix visualisation script
+   add reward per entering a new cell logging
+   port sfa code from https://github.com/noskill/sfa-gen
+   align cpc-features with sensors signal
+# Jun 24
+
+fix visualisation code
+
+# Jun 25
+
+implementing high/low level policies
+
+
+# Sat Jul  4
+
+mostly done, except for goal head:
+hindsight-style goal-head supervised loss ppo-style regularisation
+
+# Wed Jul 15
+
+hindsight training is relatively stable
+
+next step is to add wm head for sensor embedding prediction accuracy
