@@ -414,6 +414,7 @@ def flatten_padded(x: torch.Tensor, key_padding_mask: torch.Tensor) -> torch.Ten
     """
     if x.dim() < 2:
         raise ValueError("flatten_padded expects a tensor with at least 2 dims [B,T,...]")
+    assert key_padding_mask.shape == x.shape[:key_padding_mask.dim()]
     B, T = x.shape[:2]
     valid = (~key_padding_mask).reshape(B * T)
     return x.reshape(B * T, *x.shape[2:])[valid]

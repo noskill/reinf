@@ -291,7 +291,7 @@ class PPOBase(VPGBase):
 
         self.policy_old.load_state_dict(self.policy.state_dict())
 
-    def policy_loss(self,  log_probs_old, advantages, entropy, log_probs_new, mu=None):
+    def policy_loss(self, log_probs_old, advantages, entropy, log_probs_new, mu=None, target_entropy=None, return_parts=False):
         # Shape alignment and checks
         for name, t in (('log_probs_old', log_probs_old), ('advantages', advantages), ('entropy', entropy), ('log_probs_new', log_probs_new)):
             assert t.dim() in (1, 2), f"{name} must be 1D or 2D, got {t.shape}"
@@ -308,7 +308,13 @@ class PPOBase(VPGBase):
             f"Shape mismatch: old {log_probs_old.shape}, new {log_probs_new.shape}, adv {advantages.shape}")
 
         # Entropy loss (thresholded)
-        e_loss = self.compute_entropy_loss(entropy, log_probs_old.device, log_probs_old.dtype)
+        e_loss, e_loss_items = self.compute_entropy_loss(
+            entropy,
+            log_probs_old.device,
+            log_probs_old.dtype,
+            target_entropy=target_entropy,
+            return_parts=True,
+        )
 
         # Optional mu regularizer
         mu_loss = torch.tensor(0.0, device=self.device)
@@ -341,12 +347,21 @@ class PPOBase(VPGBase):
         if torch.isnan(policy_loss_ppo).any():
             import pdb; pdb.set_trace()
 
-        policy_loss = policy_loss_ppo.mean() + self.entropy_coef * e_loss + mu_loss * self.mu_coef
+        ppo_loss = policy_loss_ppo.mean()
+        entropy_term = self.entropy_coef * e_loss
+        mu_term = self.mu_coef * mu_loss
+        policy_loss = ppo_loss + entropy_term + mu_term
         if policy_loss > 100:
             import pdb; pdb.set_trace()
         self.logger.log_scalar("entropy mean:", entropy.mean())
         self.logger.log_scalar("entropy loss:", e_loss)
         self.logger.log_scalar("policy loss:", policy_loss.item())
+        if return_parts:
+            return policy_loss, {
+                "ppo": policy_loss_ppo,
+                "entropy": self.entropy_coef * e_loss_items,
+                "mu": mu_term,
+            }
         return policy_loss
 
     def log_grads(self):
@@ -365,6 +380,42 @@ class PPOBase(VPGBase):
                 "policy_first_layer_grad_norm",
                 first_layer.weight.grad.norm().item()
             )
+
+    def _flatten_optional_grads(self, loss, parameters):
+        if not loss.requires_grad:
+            return None
+        grads = torch.autograd.grad(loss, parameters, retain_graph=True, allow_unused=True)
+        flat = [grad.detach().reshape(-1) for grad in grads if grad is not None]
+        if not flat:
+            return None
+        return torch.cat(flat)
+
+    def _log_loss_grad_stats(self, losses, prefix="grad_probe"):
+        parameters = [param for param in self.policy.parameters() if param.requires_grad]
+        grads = {
+            name: self._flatten_optional_grads(loss, parameters)
+            for name, loss in losses.items()
+        }
+        grads = {name: grad for name, grad in grads.items() if grad is not None}
+        for name, grad in grads.items():
+            self.logger.log_scalar(f"{prefix}/grad_norm_{name}", grad.norm().item())
+        names = sorted(grads)
+        for left_idx, left_name in enumerate(names):
+            for right_name in names[left_idx + 1:]:
+                left = grads[left_name]
+                right = grads[right_name]
+                denom = (left.norm() * right.norm()).clamp_min(1e-12)
+                cosine = torch.dot(left, right).div(denom)
+                self.logger.log_scalar(f"{prefix}/grad_cos_{left_name}_{right_name}", cosine.item())
+
+    def _grad_probe_loss(self, loss, count=None):
+        if loss.dim() == 0:
+            return loss
+        if count is None:
+            count = getattr(self, "grad_probe_episodes", loss.shape[0])
+        count = min(int(count), int(loss.shape[0]))
+        assert count > 0, f"Cannot probe empty loss part with shape {loss.shape}"
+        return loss[:count].mean()
 
     def get_policy_for_action(self):
         return self.policy_old

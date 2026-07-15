@@ -136,7 +136,7 @@ class OnPolicyTrainer:
             self.load_checkpoint(self.checkpoint)
             start_episode = self.agent.logger.episode_count
 
-        for i in range(start_episode, start_episode + self.n_episodes):
+        for i in range(start_episode, self.n_episodes):
             obs = self.env.reset()
             episode_start = torch.ones(self.env.num_envs, dtype=bool)
             self.agent.episode_start()
@@ -212,11 +212,6 @@ class OnPolicyTrainer:
             )
         self.agent.load_state_dict(checkpoint['agent_state'])
         self.agent.logger.episode_count = checkpoint['episode']
+        if hasattr(self.agent, "version") and getattr(self.agent, "version") == 0:
+            self.agent.version = checkpoint['episode']
         self.seed = checkpoint['seed']
-        # Optionally restore other parameters if needed
-        if 'n_episodes' in checkpoint:
-            self.n_episodes = checkpoint['n_episodes']
-        if 'checkpoint_dir' in checkpoint:
-            self.checkpoint_dir = checkpoint['checkpoint_dir']
-        if 'save_interval' in checkpoint:
-            self.save_interval = checkpoint['save_interval']

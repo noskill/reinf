@@ -343,9 +343,16 @@ class ReinforceBase(Agent):
         self.logger.log_scalar(f"policy grad std :", np.std(grads))
         self.optimizer_policy.step()
 
-    def compute_entropy_loss(self, entropy, device, dtype):
+    def compute_entropy_loss(self, entropy, device, dtype, target_entropy=None, return_parts=False):
+        if target_entropy is None:
+            target_entropy = self.target_entropy
+        if not torch.is_tensor(target_entropy):
+            target_entropy = torch.tensor(target_entropy, device=device, dtype=dtype)
         self.logger.log_scalar("entropy mean:", entropy.mean())
-        e_loss = F.relu(self.target_entropy.to(device, dtype) - entropy.to(device, dtype)).mean()
+        e_loss_items = F.relu(target_entropy.to(device, dtype) - entropy.to(device, dtype))
+        e_loss = e_loss_items.mean()
+        if return_parts:
+            return e_loss, e_loss_items
         return e_loss
     
     def mu_loss(self, mu):
@@ -389,6 +396,7 @@ class ReinforceBase(Agent):
             'optimizer_value': self.optimizer_value.state_dict() if hasattr(self, 'optimizer_value') else None,
             'mean_reward': self.mean_reward,
             'mean_std': self.mean_std,
+            'version': self.version,
             'state_normalizer': self.state_normalizer.__dict__ if self.state_normalizer else None
         }
 
@@ -397,6 +405,7 @@ class ReinforceBase(Agent):
         self.optimizer_policy.load_state_dict(state_dict['optimizer_policy'])
         self.mean_reward = state_dict['mean_reward']
         self.mean_std = state_dict['mean_std']
+        self.version = state_dict.get('version', self.version)
         if state_dict['state_normalizer'] and self.state_normalizer:
             self.state_normalizer.__dict__.update(state_dict['state_normalizer'])
 
