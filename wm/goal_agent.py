@@ -5,50 +5,6 @@ from ppo import PPO
 from util import EpisodeBatch, compute_returns_list, flatten_padded, gae, normalize_padded_returns, to_device
 
 
-class LowLevelAgent(PPO):
-    def update(self, rewards, dones, info=None, **kwargs):
-        for env_idx in range(self.num_envs):
-            self.add_reward(env_idx, rewards[env_idx])
-        self.process_dones(dones)
-        return False
-
-    def train_hindsight(self, states_per_episode, actions_per_episode, weights_per_episode, coef=0.05):
-        assert len(states_per_episode) == len(actions_per_episode) == len(weights_per_episode), "hindsight batch count mismatch"
-        if not states_per_episode:
-            return
-        batch = EpisodeBatch({
-            "states": states_per_episode,
-            "actions": actions_per_episode,
-            "weights": weights_per_episode,
-        }).to(self.device)
-        padded, padding_mask, _ = batch.pad(fields=["states", "actions", "weights"])
-        padding_mask = padding_mask.to(self.device)
-        states_padded = to_device(padded["states"], self.device)
-        actions_padded = padded["actions"].to(self.device)
-        weights_flat = flatten_padded(padded["weights"].unsqueeze(-1).to(self.device), padding_mask).squeeze(-1)
-        selected = weights_flat > 0.0
-        if not selected.any():
-            self.logger.log_scalar("hindsight_loss", 0.0)
-            self.logger.log_scalar("hindsight_selected_frac", 0.0)
-            return
-
-        weights_selected = weights_flat[selected].detach()
-        weights_selected = (weights_selected / weights_selected.mean().clamp_min(1e-6)).clamp(0.0, 5.0)
-        self.optimizer_policy.zero_grad()
-        logits = self.policy(states_padded)
-        _, logp_padded, dist = self.sampler(logits, actions=actions_padded, return_distribution=True)
-        logp_flat = flatten_padded(logp_padded.unsqueeze(-1), padding_mask).squeeze(-1)
-        entropy_flat = flatten_padded(dist.entropy().unsqueeze(-1), padding_mask).squeeze(-1)
-        entropy_loss = self.compute_entropy_loss(entropy_flat[selected], entropy_flat.device, entropy_flat.dtype)
-        loss = -float(coef) * (logp_flat[selected] * weights_selected).mean() + self.entropy_coef * entropy_loss
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1)
-        self.optimizer_policy.step()
-        self.policy_old.load_state_dict(self.policy.state_dict())
-        self.logger.log_scalar("hindsight_loss", loss.detach().item())
-        self.logger.log_scalar("hindsight_weight_mean", weights_flat[selected].mean().item())
-        self.logger.log_scalar("hindsight_selected_frac", selected.to(torch.float32).mean().item())
-
 
 class GoalAgent(PPO):
     """PPO policy for option-like SFA goals.
@@ -65,7 +21,9 @@ class GoalAgent(PPO):
     """
 
     def __init__(self, *args, **kwargs):
-        self.goal_hindsight_coef = float(kwargs.pop("goal_hindsight_coef", 0.01))
+        self.goal_hindsight_coef = kwargs.pop("goal_hindsight_coef", 0.05)
+        self.goal_hindsight_epochs = kwargs.pop("goal_hindsight_epochs", 4)
+        self.goal_target_entropy = kwargs.pop("goal_target_entropy", None)
         super().__init__(*args, **kwargs)
         self.data_types = [
             "states",
@@ -91,6 +49,28 @@ class GoalAgent(PPO):
         self._goal_reference = None
         self._prev_h = None
         self._prev_action = None
+
+    def _goal_target_entropy(self, goal_dim, device, dtype):
+        target = goal_dim if self.goal_target_entropy is None else self.goal_target_entropy
+        return torch.tensor(target, device=device, dtype=dtype)
+
+    def compute_entropy_loss(self, entropy, device, dtype, target_entropy=None, return_parts=False):
+        if target_entropy is None:
+            return super().compute_entropy_loss(entropy, device, dtype, return_parts=return_parts)
+        if not torch.is_tensor(target_entropy):
+            target_entropy = torch.tensor(target_entropy, device=device, dtype=dtype)
+        entropy = entropy.to(device=device, dtype=dtype)
+        target_entropy = target_entropy.to(device=device, dtype=dtype)
+        entropy_error = entropy - target_entropy
+        normalizer = target_entropy.abs().clamp_min(1.0)
+        self.logger.log_scalar("entropy mean:", entropy.mean())
+        self.logger.log_scalar("goal/entropy_target", target_entropy.detach().mean())
+        self.logger.log_scalar("goal/entropy_error", entropy_error.detach().mean())
+        entropy_loss_items = entropy_error.abs() / normalizer
+        entropy_loss = entropy_loss_items.mean()
+        if return_parts:
+            return entropy_loss, entropy_loss_items
+        return entropy_loss
 
     def episode_start(self):
         super().episode_start()
@@ -261,7 +241,9 @@ class GoalAgent(PPO):
             return
         self.train_policy_batch(batch, num_minibatches=num_minibatches)
 
-    def train_goal_hindsight(self, episodes, targets_per_episode, weights_per_episode, num_epochs=1):
+    def train_goal_hindsight(self, episodes, targets_per_episode, weights_per_episode, num_epochs=None, switch_only=True):
+        if num_epochs is None:
+            num_epochs = self.goal_hindsight_epochs
         assert len(episodes) == len(targets_per_episode) == len(weights_per_episode), "hindsight batch count mismatch"
         if not episodes:
             return
@@ -270,7 +252,7 @@ class GoalAgent(PPO):
         switches_per_episode = []
         for episode, targets, weights in zip(episodes, targets_per_episode, weights_per_episode):
             states = torch.stack([step[0] for step in episode], dim=0)
-            switches = torch.stack([step[1]["switch"] for step in episode], dim=0).to(torch.float32).view(-1)
+            switches = torch.stack([step[1]["switch"] for step in episode], dim=0).view(-1)
             assert states.shape[0] == targets.shape[0] == weights.shape[0], "hindsight sequence length mismatch"
             states_per_episode.append(states)
             switches_per_episode.append(switches)
@@ -287,50 +269,71 @@ class GoalAgent(PPO):
         targets_padded = padded["goal_targets"].to(self.device)
         switches_flat = flatten_padded(padded["switches"].unsqueeze(-1).to(self.device), padding_mask).squeeze(-1)
         weights_flat = flatten_padded(padded["goal_weights"].unsqueeze(-1).to(self.device), padding_mask).squeeze(-1)
-        selected = (weights_flat > 0.0) & (switches_flat > 0.5)
+        selected = weights_flat > 0.0
+        if switch_only:
+            selected = selected & (switches_flat > 0.5)
         if not selected.any():
             self.logger.log_scalar("high/goal_hindsight_loss", 0.0)
             self.logger.log_scalar("high/goal_hindsight_weight_mean", 0.0)
             self.logger.log_scalar("high/goal_hindsight_selected_frac", 0.0)
             return
 
-        weights_selected = weights_flat[selected].detach()
-        weights_selected = (weights_selected / weights_selected.mean().clamp_min(1e-6)).clamp(0.0, 5.0)
+        weights_selected = weights_flat[selected].detach().clamp(0.0, 5.0)
         assert hasattr(self.sampler, "goal_sampler"), "hindsight goal training expects GoalSwitchSampler"
-        with torch.no_grad():
-            old_params = self.policy_old(states_padded, reset_mask=None, key_padding_mask=padding_mask)
-            _, old_logp_padded, _ = self.sampler.goal_sampler(
-                old_params["goal"],
-                actions=targets_padded,
-                return_distribution=True,
-            )
-            old_logp_flat = flatten_padded(old_logp_padded, padding_mask).detach()
+
+        goal_dim = targets_padded.shape[-1]
+        state_sfa = states_padded[..., -(2 * goal_dim + 3):-(goal_dim + 3)]
+        assert state_sfa.shape[-1] == goal_dim, "failed to extract current SFA from high-level state"
+        target_flat = flatten_padded(targets_padded, padding_mask).detach()
+        state_sfa_flat = flatten_padded(state_sfa, padding_mask).detach()
+        target_selected = target_flat[selected]
+        delta_selected = target_selected - state_sfa_flat[selected]
+        sigma_target = delta_selected.std(dim=0, unbiased=False).clamp_min(1e-4).detach()
 
         last_loss = None
+        last_mu_loss = None
+        last_sigma_loss = None
         for _ in range(num_epochs):
             self.optimizer_policy.zero_grad()
             params = self.policy(states_padded, reset_mask=None, key_padding_mask=padding_mask)
-            _, logp_padded, dist = self.sampler.goal_sampler(
+            _, _, dist = self.sampler.goal_sampler(
                 params["goal"],
                 actions=targets_padded,
                 return_distribution=True,
             )
-            logp_flat = flatten_padded(logp_padded, padding_mask)
-            ratio = torch.exp(logp_flat[selected] - old_logp_flat[selected])
-            clipped_ratio = ratio.clamp(1.0 - self.eps, 1.0 + self.eps)
-            objective = torch.minimum(ratio * weights_selected, clipped_ratio * weights_selected)
-            entropy = flatten_padded(self._one_dist_entropy(dist), padding_mask)[selected]
-            entropy_loss = self.compute_entropy_loss(entropy, entropy.device, entropy.dtype)
-            loss = -self.goal_hindsight_coef * objective.mean() + self.entropy_coef * entropy_loss
+            self._log_goal_dist_stats(dist, padding_mask, prefix="goal/hindsight")
+            mu_flat = self._goal_mu(dist, padding_mask)
+            sigma_flat = self._goal_sigma(dist, padding_mask)
+            assert mu_flat is not None and sigma_flat is not None, "goal hindsight regression expects Normal goal dist"
+            mu_selected = mu_flat[selected]
+            sigma_selected = sigma_flat[selected]
+
+            mu_loss_items = (mu_selected - target_selected).pow(2).mean(dim=-1) * weights_selected
+            sigma_loss_items = (sigma_selected - sigma_target).pow(2).mean(dim=-1) * weights_selected
+            mu_loss = mu_loss_items.mean()
+            sigma_loss = sigma_loss_items.mean()
+            loss = self.goal_hindsight_coef * (mu_loss + sigma_loss)
+            if last_loss is None:
+                self._log_loss_grad_stats({
+                    "goal_hindsight_mu": self._grad_probe_loss(self.goal_hindsight_coef * mu_loss_items),
+                    "goal_hindsight_sigma": self._grad_probe_loss(self.goal_hindsight_coef * sigma_loss_items),
+                })
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1)
             self.optimizer_policy.step()
             last_loss = loss.detach()
+            last_mu_loss = mu_loss.detach()
+            last_sigma_loss = sigma_loss.detach()
 
         self.policy_old.load_state_dict(self.policy.state_dict())
         self.logger.log_scalar("high/goal_hindsight_loss", last_loss.item())
+        self.logger.log_scalar("high/goal_hindsight_mu_loss", last_mu_loss.item())
+        self.logger.log_scalar("high/goal_hindsight_sigma_loss", last_sigma_loss.item())
+        self.logger.log_scalar("high/goal_hindsight_sigma_target_mean", sigma_target.mean().item())
+        self.logger.log_scalar("high/goal_hindsight_sigma_target_min", sigma_target.min().item())
+        self.logger.log_scalar("high/goal_hindsight_sigma_target_max", sigma_target.max().item())
         self.logger.log_scalar("high/goal_hindsight_weight_mean", weights_flat[selected].mean().item())
-        self.logger.log_scalar("high/goal_hindsight_selected_frac", selected.to(torch.float32).mean().item())
+        self.logger.log_scalar("high/goal_hindsight_selected_frac", selected.float().mean().item())
 
     def _prepare_episode_batch(self, episodes):
         if isinstance(episodes, EpisodeBatch):
@@ -365,7 +368,7 @@ class GoalAgent(PPO):
             for data_type in self.data_types:
                 first = episode_data[data_type][0]
                 if data_type.endswith("rewards"):
-                    data_lists[data_type].append(torch.stack(episode_data[data_type], dim=0).to(torch.float32))
+                    data_lists[data_type].append(torch.stack(episode_data[data_type], dim=0))
                 elif isinstance(first, dict):
                     keys = set(first.keys())
                     for item in episode_data[data_type]:
@@ -412,6 +415,7 @@ class GoalAgent(PPO):
 
         self.policy.load_state_dict(self.policy_old.state_dict())
         obs_for_policy = self._build_policy_obs(states_padded, padding_mask)
+        update_idx = 0
         for minibatch in self.iterate_minibatches(
             num_minibatches,
             padding_mask.shape[0],
@@ -436,26 +440,38 @@ class GoalAgent(PPO):
                 continue
 
             self.optimizer_policy.zero_grad()
-            goal_loss = self._masked_policy_loss(
+            goal_loss, goal_loss_parts = self._masked_policy_loss(
                 goal_old,
                 goal_adv,
                 entropy["goal"],
                 logp_new["goal"],
                 new_goal_mask,
                 mu=mu,
+                return_parts=True,
             )
 
-            switch_loss = self.policy_loss(
+            switch_loss, switch_loss_parts = self.policy_loss(
                 switch_old,
                 switch_adv,
                 entropy["switch"],
                 logp_new["switch"],
+                return_parts=True,
             )
             policy_loss = goal_loss + switch_loss
+            if update_idx == 0:
+                grad_losses = {}
+                if "ppo" in goal_loss_parts:
+                    grad_losses["goal_ppo"] = self._grad_probe_loss(goal_loss_parts["ppo"])
+                if "entropy" in goal_loss_parts:
+                    grad_losses["goal_entropy"] = self._grad_probe_loss(goal_loss_parts["entropy"])
+                grad_losses["switch_ppo"] = self._grad_probe_loss(switch_loss_parts["ppo"])
+                grad_losses["switch_entropy"] = self._grad_probe_loss(switch_loss_parts["entropy"])
+                self._log_loss_grad_stats(grad_losses)
             policy_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1)
             self.log_grads()
             self.optimizer_policy.step()
+            update_idx += 1
 
         self.policy_old.load_state_dict(self.policy.state_dict())
 
@@ -520,6 +536,7 @@ class GoalAgent(PPO):
         )
 
         entropy = self._dist_entropy(dist)
+        self._log_goal_dist_stats(dist["goal"], key_padding_mask, prefix="goal")
         out_logp = {
             "goal": flatten_padded(logp_new["goal"], key_padding_mask),
             "switch": flatten_padded(logp_new["switch"], key_padding_mask),
@@ -531,17 +548,25 @@ class GoalAgent(PPO):
         mu = self._goal_mu(dist["goal"], key_padding_mask)
         return out_logp, out_entropy, mu
 
-    def _masked_policy_loss(self, log_probs_old, advantages, entropy, log_probs_new, mask, mu=None):
+    def _masked_policy_loss(self, log_probs_old, advantages, entropy, log_probs_new, mask, mu=None, return_parts=False):
         selected = mask > 0.5
         if not selected.any():
-            return log_probs_new.sum() * 0.0
+            loss = log_probs_new.sum() * 0.0
+            if return_parts:
+                return loss, {}
+            return loss
         mu_selected = mu[selected] if mu is not None else None
+        target_entropy = None
+        if mu_selected is not None:
+            target_entropy = self._goal_target_entropy(mu_selected.shape[-1], entropy.device, entropy.dtype)
         return self.policy_loss(
             log_probs_old[selected],
             advantages[selected],
             entropy[selected],
             log_probs_new[selected],
             mu=mu_selected,
+            target_entropy=target_entropy,
+            return_parts=return_parts,
         )
 
     def _dist_entropy(self, dist):
@@ -569,15 +594,31 @@ class GoalAgent(PPO):
             return None
         return flatten_padded(base_normal.loc, key_padding_mask)
 
+    def _goal_sigma(self, goal_dist, key_padding_mask):
+        base = getattr(goal_dist, "base_dist", goal_dist)
+        base_normal = getattr(base, "base_dist", base)
+        if not hasattr(base_normal, "scale"):
+            return None
+        return flatten_padded(base_normal.scale, key_padding_mask)
+
+    def _log_goal_dist_stats(self, goal_dist, key_padding_mask, prefix="goal"):
+        sigma = self._goal_sigma(goal_dist, key_padding_mask)
+        if sigma is None or sigma.numel() == 0:
+            return
+        sigma = sigma
+        self.logger.log_scalar(f"{prefix}/dist_std_mean", sigma.mean().item())
+        self.logger.log_scalar(f"{prefix}/dist_std_min", sigma.min().item())
+        self.logger.log_scalar(f"{prefix}/dist_std_max", sigma.max().item())
+
     def _log_training_stats(self, actions_batch):
         goal = flatten_padded(actions_batch["goal"], torch.zeros(
             actions_batch["goal"].shape[:2],
             dtype=torch.bool,
             device=actions_batch["goal"].device,
         )) if actions_batch["goal"].dim() >= 3 else actions_batch["goal"]
-        switch = actions_batch["switch"].to(torch.float32)
-        self.logger.log_scalar("goal/action_mean", goal.to(torch.float32).mean())
-        self.logger.log_scalar("goal/action_std", goal.to(torch.float32).std())
+        switch = actions_batch["switch"]
+        self.logger.log_scalar("goal/action_mean", goal.mean())
+        self.logger.log_scalar("goal/action_std", goal.std())
         self.logger.log_scalar("goal/switch_rate", switch.mean())
 
     def print_episode_stats(self, completed_episodes):

@@ -271,10 +271,16 @@ class PredictionLossMixin:
             raise ValueError("SFA loss needs at least 2 valid adjacent pairs")
 
         loss, l_slowness, l_var, l_corr = neural_sfa.sfa_loss(y, y_prev=y_prev, return_components=True)
+        magnitude = y.abs()
+        l_mag = (magnitude - 10.0).clamp_min(0.0).pow(2).mean()
+        loss = loss + l_mag
         self.logger.log_scalar('sfa/loss', loss.detach().item())
         self.logger.log_scalar('sfa/slow', l_slowness.detach().item())
         self.logger.log_scalar('sfa/var', l_var.detach().item())
         self.logger.log_scalar('sfa/corr', l_corr.detach().item())
+        self.logger.log_scalar('sfa/mag', l_mag.detach().item())
+        self.logger.log_scalar('sfa/abs_max', magnitude.max().detach().item())
+        self.logger.log_scalar('sfa/std', y.std(dim=0).mean())
         return {'loss': loss}
 
     def compute_losses_and_metrics(

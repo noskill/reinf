@@ -166,6 +166,9 @@ def sfa_loss(
     l_corr = off_diag.pow(2).mean()
 
     total = l_slowness + l_var + l_corr
+    assert torch.isfinite(total).all()
+    assert y.abs().max() < 100
+
 
     if return_components:
         return total, l_slowness, l_var, l_corr

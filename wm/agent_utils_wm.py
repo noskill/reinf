@@ -20,7 +20,8 @@ from rnn_cached import RNNConfig, CachedRNN
 from policy_head import WMActionHeadPolicy, WMValueHeadPolicy, ActionSwitchPolicy
 from wm_joint_agent import JointWMPPO
 from double import DoubleAgent
-from goal_agent import GoalAgent, LowLevelAgent
+from goal_agent import GoalAgent
+from goal_agent_low import LowLevelAgent
 from utils import make_soft_table, make_label_smoothing_table
 
 
@@ -714,6 +715,12 @@ def create_single_policy_agent(args, wm_model_args, wm_model, logger, maze_dim, 
         wm_train_episodes=args.wm_train_episodes,
         wm_divergence_novelty_coef=args.wm_divergence_novelty_coef,
         wm_fixed=args.wm_fixed,
+        low_warmup_updates=getattr(args, "low_warmup_updates", 0),
+        low_warmup_goal_noise=getattr(args, "low_warmup_goal_noise", 0.1),
+        high_warmup_horizon=getattr(args, "high_warmup_horizon", 5),
+        high_warmup_goal_coef=getattr(args, "high_warmup_goal_coef", 0.005),
+        high_warmup_goal_epochs=getattr(args, "high_warmup_goal_epochs", 1),
+        reset_high_agent_on_load=getattr(args, "reset_high_agent", False),
         sensor_max_bin=args.wm_sensor_max_bin,
         maze_dim=maze_dim,
         wm_weight_decay=args.wm_weight_decay,
@@ -733,8 +740,8 @@ def create_double_policy_agent(args, wm_model_args, wm_model, logger, maze_dim, 
 
     # bt = [h_t, e_t, sfa_t]
     bt_dim = h_t_dim + cpc_dim + sfa_dim
-    # low-level input [bt, g_t, g_t - sfa_t]  # maybe add d = |g_t - sfa_t|_2 ?
-    low_policy_input_dim = bt_dim + goal_dim + goal_dim
+    # low-level input [bt, g_t, g_t - sfa_t, goal_valid]
+    low_policy_input_dim = bt_dim + goal_dim + goal_dim + 1
 
     policy_low = WMActionHeadPolicy(
         num_actions=len(action_table),
@@ -801,6 +808,7 @@ def create_double_policy_agent(args, wm_model_args, wm_model, logger, maze_dim, 
         log_prefix="high",
         entropy_coef=args.entropy_coef,
         target_entropy=args.target_entropy,
+        goal_target_entropy=getattr(args, "high_goal_target_entropy", None),
         num_learning_epochs=getattr(args, "num_learning_epochs", 4),
         clip_param=getattr(args, "clip_param", None),
         exp_adv=getattr(args, "exp_adv", False),
@@ -819,6 +827,12 @@ def create_double_policy_agent(args, wm_model_args, wm_model, logger, maze_dim, 
         wm_train_episodes=args.wm_train_episodes,
         wm_divergence_novelty_coef=args.wm_divergence_novelty_coef,
         wm_fixed=args.wm_fixed,
+        low_warmup_updates=getattr(args, "low_warmup_updates", 0),
+        low_warmup_goal_noise=getattr(args, "low_warmup_goal_noise", 0.1),
+        high_warmup_horizon=getattr(args, "high_warmup_horizon", 5),
+        high_warmup_goal_coef=getattr(args, "high_warmup_goal_coef", 0.005),
+        high_warmup_goal_epochs=getattr(args, "high_warmup_goal_epochs", 1),
+        reset_high_agent_on_load=getattr(args, "reset_high_agent", False),
         sensor_max_bin=args.wm_sensor_max_bin,
         maze_dim=maze_dim,
         wm_weight_decay=args.wm_weight_decay,

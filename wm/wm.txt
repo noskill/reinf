@@ -58,11 +58,11 @@ z0 = q(h0, o0) -> h1 = F(h0, z0, a0)  -> predict a1 from o0, a0, o1
 s0 -> a0,
 s1 -> a1
 and for ac-cpc starting from h1:
-e10 = wϕ(h1) - conditioned by a0 via h1
+e10 = wϕ(h1, hat z1) - conditioned by a0 via h1
 e12 = wϕ(h1, hat z1, a1)
 e13 = wϕ(h1, hat z1, a1, a2)
 with positives e10 <-> z1, e12 <-> z2, e13 <-> z3… with projection z -> e
-in twister z is computed just from series of observations ot-k..ok
+in twister cpc target z is computed from augmented series of observations ot-k..ok
 
 
 baselines:
