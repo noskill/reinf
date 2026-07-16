@@ -169,14 +169,14 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         *,
         episode_start=None,
     ):
-        sensor, actions, prev_actions, key_padding_mask, _ = self._validate_obs_contract(
+        sensor, sensor_latent, actions, prev_actions, key_padding_mask, _ = self._validate_obs_contract(
             obs,
             episode_start=episode_start,
         )
-
         using_internal_cache = episode_start is not None
         prev_action_latent = self.action_encoder(prev_actions)
-        sensor_latent = self.sensor_encoder(sensor)
+        if sensor_latent is None:
+            sensor_latent = self.sensor_encoder(sensor)
         x = torch.cat([sensor_latent, prev_action_latent], dim=-1)
         if x.shape[-1] != self.input_size:
             raise ValueError(f"Expected input_size {self.input_size}, got {x.shape[-1]}")
@@ -185,15 +185,27 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
             x,
             key_padding_mask=key_padding_mask,
             reset_mask=episode_start)
-        action_latent = self.action_encoder(actions)
-        obs_feat = torch.tanh(self.obs_fuse(torch.cat([h, action_latent], dim=-1)))
-        if self.sensor_mode != "categorical":
-            raise ValueError("TransformerBaseline currently supports sensor_mode='categorical' only.")
-        pred_sensor = (
-            self.sensor_head_l(obs_feat),
-            self.sensor_head_f(obs_feat),
-            self.sensor_head_r(obs_feat),
-        )
+        preds, aux_inputs = self.forward_preds(h, actions, sensor_latent, episode_start)
+        return preds, aux_inputs, h, h[:, -1, :]
+
+    def forward_preds(self, h, actions, sensor_latent, episode_start):
+        """
+        Compute cpc/sfa and other features based on {st, at}
+        """
+        if actions is None:
+            action_latent = None
+            pred_sensor = None
+        else:
+            action_latent = self.action_encoder(actions)
+            obs_feat = torch.tanh(self.obs_fuse(torch.cat([h, action_latent], dim=-1)))
+            if self.sensor_mode != "categorical":
+                raise ValueError("TransformerBaseline currently supports sensor_mode='categorical' only.")
+            pred_sensor = (
+                self.sensor_head_l(obs_feat),
+                self.sensor_head_f(obs_feat),
+                self.sensor_head_r(obs_feat),
+            )
+        aux_inputs = self.compute_aux(h, action_latent, episode_start, sensor_latent)
         # State probes (current-step location/heading) read detached state.
         h_probe = h.detach()
         # Action heads use detached or live state based on constructor setting.
@@ -203,9 +215,9 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         heading = self.heading_head(h_probe)
         turn = self.turn_head(action_feat)
         step = self.step_head(action_feat)
-        aux_inputs = self.compute_aux(h, action_latent, episode_start, sensor_latent)
+
         preds = (pred_sensor, loc_x, loc_y, heading, turn, step)
-        return preds, aux_inputs, h, h[:, -1, :]
+        return preds, aux_inputs
 
     def forward(
         self,
@@ -228,7 +240,10 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         aux_inputs = {}
         contrastive_input = self.contrastive_context(h)
         aux_inputs["contrastive_tgt_emb"] = self._project_contrastive_target_h(contrastive_input)
-        pred_steps, scale_steps = self._project_contrastive_pred_steps(contrastive_input, action_latent)
+        if action_latent is None:
+            pred_steps, scale_steps = [], []
+        else:
+            pred_steps, scale_steps = self._project_contrastive_pred_steps(contrastive_input, action_latent)
         aux_inputs["contrastive_pred_emb_steps"] = pred_steps
         aux_inputs["contrastive_pred_scale_steps"] = scale_steps
         aux_inputs["sensor_latent"] = sensor_latent

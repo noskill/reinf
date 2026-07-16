@@ -1,5 +1,4 @@
 import torch
-import math
 from typing import Dict
 
 from ppo import PPOBase
@@ -298,72 +297,17 @@ class DoubleAgent(BaseWMOnPolicy):
         assert sfa.shape[-1] == goal_dim, "failed to extract SFA from high-level state"
         return sfa
 
-    def _compute_high_goal_hindsight(self, high_episodes, intrinsic_rewards, horizon=5):
-        assert len(high_episodes) <= intrinsic_rewards.shape[0], "high episodes and intrinsic rewards are misaligned"
+    def _compute_high_goal_targets(self, high_episodes, horizon, intrinsic_rewards=None):
+        if horizon < 1:
+            raise ValueError(f"high goal horizon must be >= 1, got {horizon}")
+        if intrinsic_rewards is not None:
+            assert len(high_episodes) <= intrinsic_rewards.shape[0], "high episodes and intrinsic rewards are misaligned"
         targets_per_episode = []
         weights_per_episode = []
-        target_distances = []
-        goal_current_distances = []
-        goal_future_distances = []
-        goal_next_progress = []
 
         for ep_idx, episode in enumerate(high_episodes):
             states = torch.stack([step[0] for step in episode], dim=0).to(self.device)
             sfa = self._extract_high_sfa(states)
-            goals = torch.stack([step[1]["goal"] for step in episode], dim=0).to(self.device)
-            assert goals.shape == sfa.shape, "high goal and SFA shapes must match"
-            targets = torch.zeros_like(sfa)
-            weights = torch.zeros(sfa.shape[0], dtype=sfa.dtype, device=sfa.device)
-
-            goal_current_distances.append(torch.linalg.vector_norm(goals - sfa, dim=-1).detach())
-            if sfa.shape[0] > 1:
-                d_curr = torch.linalg.vector_norm(goals[:-1] - sfa[:-1], dim=-1)
-                d_next = torch.linalg.vector_norm(goals[:-1] - sfa[1:], dim=-1)
-                goal_next_progress.append((d_curr - d_next).detach())
-
-            if sfa.shape[0] > 1:
-                step_horizon = min(int(horizon), sfa.shape[0] - 1)
-                valid_steps = sfa.shape[0] - step_horizon
-
-                # Hindsight target: train the goal proposal at time t to predict an
-                # SFA state the low-level policy actually reached shortly after t.
-                # The loss later masks to switch_t == 1, so only new-goal proposal
-                # decisions are supervised by these future achieved states.
-                targets[:valid_steps] = sfa[step_horizon:]
-
-                # Use intrinsic reward along the achieved segment as the learning
-                # weight: future states reached through more novel/surprising/LP-rich
-                # segments should be more likely high-level goals.
-                # that's similiar to   w(s, z_future) = exp(Q(s, z_future) - V(s))
-                # in advantage-weighted regression / AWR / AWAC than vanilla PPO.
-                # todo: try w_t = segment_intrinsic_return - value_goal(s_t)
-                _intrinsic = intrinsic_rewards[ep_idx, :sfa.shape[0]].to(sfa).clamp_min(0.0)
-                for t in range(valid_steps):
-                    weights[t] = _intrinsic[t : t + step_horizon].mean()
-                target_distances.append(torch.linalg.vector_norm(targets[:valid_steps] - sfa[:valid_steps], dim=-1).detach())
-                goal_future_distances.append(torch.linalg.vector_norm(goals[:valid_steps] - targets[:valid_steps], dim=-1).detach())
-
-            targets_per_episode.append(targets.detach())
-            weights_per_episode.append(weights.detach())
-
-
-        self.logger.log_scalar("high/goal_hindsight_target_dist", torch.cat(target_distances).mean())
-        self.logger.log_scalar("high/goal_dist_to_current_sfa", torch.cat(goal_current_distances).mean())
-        self.logger.log_scalar("high/goal_dist_to_future_sfa", torch.cat(goal_future_distances).mean())
-        self.logger.log_scalar("high/goal_next_progress", torch.cat(goal_next_progress).mean())
-        return targets_per_episode, weights_per_episode
-
-    def _compute_high_warmup_targets(self, high_episodes, horizon=None):
-        if horizon is None:
-            horizon = self.high_warmup_horizon
-        targets_per_episode = []
-        weights_per_episode = []
-        target_distances = []
-        target_deltas = []
-
-        for episode in high_episodes:
-            states = torch.stack([step[0] for step in episode], dim=0).to(self.device)
-            sfa = self._extract_high_sfa(states)
             targets = torch.zeros_like(sfa)
             weights = torch.zeros(sfa.shape[0], dtype=sfa.dtype, device=sfa.device)
 
@@ -371,25 +315,16 @@ class DoubleAgent(BaseWMOnPolicy):
                 step_horizon = min(int(horizon), sfa.shape[0] - 1)
                 valid_steps = sfa.shape[0] - step_horizon
                 targets[:valid_steps] = sfa[step_horizon:]
-                weights[:valid_steps] = 1.0
-                delta = targets[:valid_steps] - sfa[:valid_steps]
-                target_distances.append(torch.linalg.vector_norm(delta, dim=-1).detach())
-                target_deltas.append(delta.detach())
+                if intrinsic_rewards is None:
+                    weights[:valid_steps] = 1.0
+                else:
+                    intrinsic = intrinsic_rewards[ep_idx, :sfa.shape[0]].to(sfa).clamp_min(0.0)
+                    for t in range(valid_steps):
+                        weights[t] = intrinsic[t : t + step_horizon].mean()
 
             targets_per_episode.append(targets.detach())
             weights_per_episode.append(weights.detach())
 
-        if target_distances:
-            self.logger.log_scalar("high/warmup_goal_target_dist", torch.cat(target_distances).mean())
-        if target_deltas:
-            deltas = torch.cat(target_deltas, dim=0).to(torch.float32)
-            std = deltas.std(dim=0, unbiased=False)
-            var = deltas.var(dim=0, unbiased=False).clamp_min(1e-8)
-            diag_entropy = 0.5 * torch.log(2.0 * math.pi * math.e * var).sum()
-            self.logger.log_scalar("high/warmup_delta/std_dim_mean", std.mean().item())
-            self.logger.log_scalar("high/warmup_delta/std_dim_min", std.min().item())
-            self.logger.log_scalar("high/warmup_delta/std_dim_max", std.max().item())
-            self.logger.log_scalar("high/warmup_delta/diag_entropy", diag_entropy.item())
         return targets_per_episode, weights_per_episode
 
     def _overwrite_high_rewards(self, episodes, goal_rewards_per_episode, switch_rewards_per_episode):
@@ -601,25 +536,32 @@ class DoubleAgent(BaseWMOnPolicy):
             for ep_idx, ep in enumerate(high_episodes)
         ]
         high_switch_rewards = [self._compute_high_switch_rewards(ep) for ep in high_episodes]
-        high_goal_targets, high_goal_weights = self._compute_high_goal_hindsight(high_episodes, intrinsic_rewards)
         self._overwrite_high_rewards(high_episodes, high_goal_rewards, high_switch_rewards)
 
         if high_episodes:
             if in_warmup:
-                warmup_targets, warmup_weights = self._compute_high_warmup_targets(high_episodes)
+                goal_targets, goal_weights = self._compute_high_goal_targets(
+                    high_episodes,
+                    horizon=self.high_warmup_horizon,
+                )
                 old_coef = self.agent_high.goal_hindsight_coef
                 self.agent_high.goal_hindsight_coef = self.high_warmup_goal_coef
                 self.agent_high.train_goal_hindsight(
                     high_episodes,
-                    warmup_targets,
-                    warmup_weights,
+                    goal_targets,
+                    goal_weights,
                     num_epochs=self.high_warmup_goal_epochs,
                     switch_only=False,
                 )
                 self.agent_high.goal_hindsight_coef = old_coef
             else:
+                goal_targets, goal_weights = self._compute_high_goal_targets(
+                    high_episodes,
+                    horizon=5,
+                    intrinsic_rewards=intrinsic_rewards,
+                )
                 self.agent_high.learn_from_episodes(high_episodes)
-                self.agent_high.train_goal_hindsight(high_episodes, high_goal_targets, high_goal_weights)
+                self.agent_high.train_goal_hindsight(high_episodes, goal_targets, goal_weights)
 
         scalar_sums = {
             "joint/loss_total": total_loss_sum,

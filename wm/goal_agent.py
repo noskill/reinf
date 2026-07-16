@@ -244,6 +244,8 @@ class GoalAgent(PPO):
     def train_goal_hindsight(self, episodes, targets_per_episode, weights_per_episode, num_epochs=None, switch_only=True):
         if num_epochs is None:
             num_epochs = self.goal_hindsight_epochs
+        if num_epochs < 1:
+            raise ValueError(f"goal hindsight epochs must be >= 1, got {num_epochs}")
         assert len(episodes) == len(targets_per_episode) == len(weights_per_episode), "hindsight batch count mismatch"
         if not episodes:
             return
@@ -273,9 +275,6 @@ class GoalAgent(PPO):
         if switch_only:
             selected = selected & (switches_flat > 0.5)
         if not selected.any():
-            self.logger.log_scalar("high/goal_hindsight_loss", 0.0)
-            self.logger.log_scalar("high/goal_hindsight_weight_mean", 0.0)
-            self.logger.log_scalar("high/goal_hindsight_selected_frac", 0.0)
             return
 
         weights_selected = weights_flat[selected].detach().clamp(0.0, 5.0)
@@ -290,10 +289,9 @@ class GoalAgent(PPO):
         delta_selected = target_selected - state_sfa_flat[selected]
         sigma_target = delta_selected.std(dim=0, unbiased=False).clamp_min(1e-4).detach()
 
-        last_loss = None
-        last_mu_loss = None
-        last_sigma_loss = None
-        for _ in range(num_epochs):
+        last_mu_target_dist = None
+        last_std_mean = None
+        for epoch_idx in range(num_epochs):
             self.optimizer_policy.zero_grad()
             params = self.policy(states_padded, reset_mask=None, key_padding_mask=padding_mask)
             _, _, dist = self.sampler.goal_sampler(
@@ -301,7 +299,6 @@ class GoalAgent(PPO):
                 actions=targets_padded,
                 return_distribution=True,
             )
-            self._log_goal_dist_stats(dist, padding_mask, prefix="goal/hindsight")
             mu_flat = self._goal_mu(dist, padding_mask)
             sigma_flat = self._goal_sigma(dist, padding_mask)
             assert mu_flat is not None and sigma_flat is not None, "goal hindsight regression expects Normal goal dist"
@@ -310,10 +307,10 @@ class GoalAgent(PPO):
 
             mu_loss_items = (mu_selected - target_selected).pow(2).mean(dim=-1) * weights_selected
             sigma_loss_items = (sigma_selected - sigma_target).pow(2).mean(dim=-1) * weights_selected
-            mu_loss = mu_loss_items.mean()
-            sigma_loss = sigma_loss_items.mean()
-            loss = self.goal_hindsight_coef * (mu_loss + sigma_loss)
-            if last_loss is None:
+       
+            loss = self.goal_hindsight_coef * (mu_loss_items.mean() + sigma_loss_items.mean())
+
+            if epoch_idx == 0:
                 self._log_loss_grad_stats({
                     "goal_hindsight_mu": self._grad_probe_loss(self.goal_hindsight_coef * mu_loss_items),
                     "goal_hindsight_sigma": self._grad_probe_loss(self.goal_hindsight_coef * sigma_loss_items),
@@ -321,19 +318,19 @@ class GoalAgent(PPO):
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1)
             self.optimizer_policy.step()
-            last_loss = loss.detach()
-            last_mu_loss = mu_loss.detach()
-            last_sigma_loss = sigma_loss.detach()
 
         self.policy_old.load_state_dict(self.policy.state_dict())
-        self.logger.log_scalar("high/goal_hindsight_loss", last_loss.item())
-        self.logger.log_scalar("high/goal_hindsight_mu_loss", last_mu_loss.item())
-        self.logger.log_scalar("high/goal_hindsight_sigma_loss", last_sigma_loss.item())
-        self.logger.log_scalar("high/goal_hindsight_sigma_target_mean", sigma_target.mean().item())
-        self.logger.log_scalar("high/goal_hindsight_sigma_target_min", sigma_target.min().item())
-        self.logger.log_scalar("high/goal_hindsight_sigma_target_max", sigma_target.max().item())
-        self.logger.log_scalar("high/goal_hindsight_weight_mean", weights_flat[selected].mean().item())
-        self.logger.log_scalar("high/goal_hindsight_selected_frac", selected.float().mean().item())
+
+        last_mu_target_dist = torch.linalg.vector_norm(
+                mu_selected - target_selected,
+                dim=-1,
+            ).mean().detach()
+        self.logger.log_scalar("high/hindsight/loss", loss.item())
+        self.logger.log_scalar("high/hindsight/loss_sigma", sigma_loss_items.detach().mean().item())
+        self.logger.log_scalar("high/hindsight/mu_target_dist", last_mu_target_dist.item())
+        self.logger.log_scalar("high/hindsight/std", sigma_selected.mean().detach().item())
+        self.logger.log_scalar("high/hindsight/target_std", sigma_target.mean().item())
+        self.logger.log_scalar("high/hindsight/selected_frac", selected.float().mean().item())
 
     def _prepare_episode_batch(self, episodes):
         if isinstance(episodes, EpisodeBatch):
@@ -605,10 +602,7 @@ class GoalAgent(PPO):
         sigma = self._goal_sigma(goal_dist, key_padding_mask)
         if sigma is None or sigma.numel() == 0:
             return
-        sigma = sigma
         self.logger.log_scalar(f"{prefix}/dist_std_mean", sigma.mean().item())
-        self.logger.log_scalar(f"{prefix}/dist_std_min", sigma.min().item())
-        self.logger.log_scalar(f"{prefix}/dist_std_max", sigma.max().item())
 
     def _log_training_stats(self, actions_batch):
         goal = flatten_padded(actions_batch["goal"], torch.zeros(

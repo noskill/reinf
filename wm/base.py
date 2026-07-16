@@ -60,61 +60,78 @@ class PredictionLossMixin:
             raise ValueError(f"{self.__class__.__name__} expects dict observation")
         rollout = episode_start is not None
 
-        required = ["sensor", "prev_actions"] if rollout else ["sensor", "actions"]
+        required = ["prev_actions"] if rollout else ["actions"]
         missing = [k for k in required if k not in obs]
         if missing:
             mode = "rollout" if rollout else "train"
             raise ValueError(f"{self.__class__.__name__} {mode} obs missing keys: {missing}")
 
-        sensor = obs["sensor"]
+        sensor = obs.get("sensor")
+        sensor_latent = obs.get("sensor_latent")
         actions = obs.get("actions")
         prev_actions = obs.get("prev_actions")
         key_padding_mask = obs.get("key_padding_mask")
-        if rollout and actions is None:
-            actions = prev_actions
+        if (sensor is None) == (sensor_latent is None):
+            raise ValueError("Exactly one of sensor or sensor_latent must be provided")
 
-        if not isinstance(sensor, torch.Tensor):
-            sensor = torch.as_tensor(sensor)
-        if actions is None:
-            raise ValueError("actions must be provided (or inferred from prev_actions in rollout)")
-        if not isinstance(actions, torch.Tensor):
-            actions = torch.as_tensor(actions, device=sensor.device)
-        if sensor.ndim == 2:
-            sensor = sensor.unsqueeze(1)
-        if actions.ndim == 2:
-            actions = actions.unsqueeze(1)
-        if sensor.ndim != 3:
-            raise ValueError(f"Expected sensor [B,T,S] or [B,S], got {tuple(sensor.shape)}")
-        if actions.ndim != 3:
-            raise ValueError(f"Expected actions [B,T,A] or [B,A], got {tuple(actions.shape)}")
-        if sensor.shape[:2] != actions.shape[:2]:
-            raise ValueError(f"sensor/actions shape mismatch: {tuple(sensor.shape)} vs {tuple(actions.shape)}")
+        state_input = sensor if sensor is not None else sensor_latent
+        if not isinstance(state_input, torch.Tensor):
+            state_input = torch.as_tensor(state_input)
+        if state_input.ndim == 2:
+            state_input = state_input.unsqueeze(1)
+        if state_input.ndim != 3:
+            name = "sensor" if sensor is not None else "sensor_latent"
+            raise ValueError(f"Expected {name} [B,T,D] or [B,D], got {tuple(state_input.shape)}")
+        if sensor is not None:
+            sensor = state_input
+        else:
+            sensor_latent = state_input
+        state_shape = state_input.shape[:2]
+        device = state_input.device
 
         expected_action_dim = getattr(self, "action_dim", None)
-        if expected_action_dim is not None and int(actions.shape[-1]) != int(expected_action_dim):
-            raise ValueError(
-                f"Expected action dim {int(expected_action_dim)}, got {int(actions.shape[-1])}"
-            )
+
+        if actions is not None:
+            if not isinstance(actions, torch.Tensor):
+                actions = torch.as_tensor(actions, device=device)
+            if actions.ndim == 2:
+                actions = actions.unsqueeze(1)
+            if actions.ndim != 3:
+                raise ValueError(f"Expected actions [B,T,A] or [B,A], got {tuple(actions.shape)}")
+            if actions.shape[:2] != state_shape:
+                raise ValueError(f"state/actions shape mismatch: {tuple(state_shape)} vs {tuple(actions.shape[:2])}")
+            if expected_action_dim is not None and int(actions.shape[-1]) != int(expected_action_dim):
+                raise ValueError(
+                    f"Expected action dim {int(expected_action_dim)}, got {int(actions.shape[-1])}"
+                )
 
         if key_padding_mask is not None:
             if not isinstance(key_padding_mask, torch.Tensor):
-                key_padding_mask = torch.as_tensor(key_padding_mask, device=sensor.device)
+                key_padding_mask = torch.as_tensor(key_padding_mask, device=device)
             if key_padding_mask.ndim == 1:
                 key_padding_mask = key_padding_mask.unsqueeze(1)
-            if key_padding_mask.ndim != 2 or key_padding_mask.shape != sensor.shape[:2]:
+            if key_padding_mask.ndim != 2 or key_padding_mask.shape != state_shape:
                 raise ValueError(
-                    f"key_padding_mask must be [B,T]={tuple(sensor.shape[:2])}, got {tuple(key_padding_mask.shape)}"
+                    f"key_padding_mask must be [B,T]={tuple(state_shape)}, got {tuple(key_padding_mask.shape)}"
                 )
             key_padding_mask = key_padding_mask.to(torch.bool)
 
         if prev_actions is not None:
             if not isinstance(prev_actions, torch.Tensor):
-                prev_actions = torch.as_tensor(prev_actions, device=sensor.device)
+                prev_actions = torch.as_tensor(prev_actions, device=device)
             if prev_actions.ndim == 2:
                 prev_actions = prev_actions.unsqueeze(1)
             if prev_actions.ndim != 3:
                 raise ValueError(f"Expected prev_actions [B,T,A] or [B,A], got {tuple(prev_actions.shape)}")
-            if prev_actions.shape != actions.shape:
+            if prev_actions.shape[:2] != state_shape:
+                raise ValueError(
+                    f"state/prev_actions shape mismatch: {tuple(state_shape)} vs {tuple(prev_actions.shape[:2])}"
+                )
+            if expected_action_dim is not None and int(prev_actions.shape[-1]) != int(expected_action_dim):
+                raise ValueError(
+                    f"Expected previous action dim {int(expected_action_dim)}, got {int(prev_actions.shape[-1])}"
+                )
+            if actions is not None and prev_actions.shape != actions.shape:
                 raise ValueError(
                     f"prev_actions shape must match actions: {tuple(prev_actions.shape)} vs {tuple(actions.shape)}"
                 )
@@ -122,14 +139,17 @@ class PredictionLossMixin:
         if rollout:
             if key_padding_mask is not None:
                 raise ValueError("rollout obs must not include key_padding_mask")
-            if sensor.shape[1] != 1:
-                raise ValueError("rollout obs expects single-step [B,S] or [B,1,S]")
+            if state_shape[1] != 1:
+                raise ValueError("rollout obs expects a single-step sensor or sensor_latent")
         if prev_actions is None:
+            if actions is None:
+                raise ValueError("prev_actions are required when actions are not provided")
             prev_actions = self._shift_prev_actions(actions)
 
         return (
-            sensor.to(torch.float32),
-            actions.to(torch.float32),
+            None if sensor is None else sensor.to(torch.float32),
+            None if sensor_latent is None else sensor_latent.to(torch.float32),
+            None if actions is None else actions.to(torch.float32),
             prev_actions.to(torch.float32),
             key_padding_mask,
             rollout,
@@ -1058,10 +1078,14 @@ class DiscreteLatentPredictorBase(PredictionLossMixin, nn.Module):
         return {**base_losses, **aux_losses}
 
     def _encode_obs(self, obs, *, episode_start=None):
-        sensor, actions, prev_actions, key_padding_mask, _ = self._validate_obs_contract(
+        sensor, sensor_latent, actions, prev_actions, key_padding_mask, _ = self._validate_obs_contract(
             obs,
             episode_start=episode_start,
         )
+        if sensor is None or sensor_latent is not None:
+            raise ValueError("Discrete latent models require raw sensor observations")
+        if actions is None:
+            raise ValueError("Discrete latent models require current actions")
         obs_features = sensor[..., :3]      # use only left/front/right sensors
         B, T, _ = actions.shape
         obs_embed = self.obs_encoder(obs_features)
