@@ -850,6 +850,7 @@ def create_maze_world_model(
     step_bins: int,
     contrastive_temp: float = 0.1,
     contrastive_horizon_discount: float = 0.75,
+    contrastive_uncertainty_weight: float = 0.05,
     sensor_weight: float = 1.0,
     loc_weight: float = 0.0,
     head_weight: float = 0.0,
@@ -912,6 +913,7 @@ def create_maze_world_model(
         turn_weight=turn_weight,
         step_weight=step_weight,
         contrastive_weight=1.0,  # CPC term kept explicit in trainer loss.
+        contrastive_uncertainty_weight=float(contrastive_uncertainty_weight),
         contrastive_temp=float(contrastive_temp),
         contrastive_horizon_discount=float(contrastive_horizon_discount),
         loc_min=loc_min,

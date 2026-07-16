@@ -162,6 +162,7 @@ def parse_args():
     )
     parser.add_argument("--wm-contrastive-temp", type=float, default=0.1)
     parser.add_argument("--wm-contrastive-discount", type=float, default=0.75)
+    parser.add_argument("--wm-contrastive-uncertainty-weight", type=float, default=0.05)
     parser.add_argument("--wm-sensor-max-bin", type=int, default=64)
     parser.add_argument("--wm-sensor-weight", type=float, default=1.0)
     parser.add_argument("--wm-loc-weight", type=float, default=0.0)
@@ -224,6 +225,8 @@ def main():
         raise ValueError("--wm-contrastive-dim must be > 0")
     if args.wm_contrastive_steps < 1:
         raise ValueError("--wm-contrastive-steps must be >= 1")
+    if args.wm_contrastive_uncertainty_weight < 0:
+        raise ValueError("--wm-contrastive-uncertainty-weight must be >= 0")
     if args.wm_sensor_max_bin < 1:
         raise ValueError("--wm-sensor-max-bin must be >= 1")
 
@@ -239,6 +242,7 @@ def main():
         step_bins=step_bins,
         contrastive_temp=args.wm_contrastive_temp,
         contrastive_horizon_discount=args.wm_contrastive_discount,
+        contrastive_uncertainty_weight=args.wm_contrastive_uncertainty_weight,
         sensor_weight=args.wm_sensor_weight,
         loc_weight=args.wm_loc_weight,
         head_weight=args.wm_head_weight,

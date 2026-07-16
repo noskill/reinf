@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Base mixins and base latent predictor class."""
 
+import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -21,6 +22,7 @@ from utils import (
     masked_mse,
     masked_rmse,
     make_probe_head,
+    isotropic_normal_from_params,
     sg,
     soft_cross_entropy,
 )
@@ -39,6 +41,7 @@ class LossConfig:
     turn_weight: float = 1.0
     step_weight: float = 1.0
     contrastive_weight: float = 0.0
+    contrastive_uncertainty_weight: float = 0.05
     contrastive_temp: float = 0.1
     contrastive_horizon_discount: float = 1.0
     loc_min: Optional[torch.Tensor] = None
@@ -259,6 +262,96 @@ class PredictionLossMixin:
             horizon_discount=horizon_discount,
         )
 
+    @staticmethod
+    def compute_contrastive_uncertainty_loss(
+        aux_inputs: Optional[Dict[str, torch.Tensor]],
+        key_padding_mask: torch.Tensor,
+        horizon_discount: float = 1.0,
+    ) -> Dict[str, torch.Tensor]:
+        device = key_padding_mask.device
+        zero = torch.tensor(0.0, device=device)
+        if aux_inputs is None:
+            return {"loss": zero, "scale": zero, "entropy": zero, "error_corr": zero}
+
+        pred_steps = aux_inputs.get("contrastive_pred_emb_steps")
+        scale_steps = aux_inputs.get("contrastive_pred_scale_steps")
+        target_emb = aux_inputs.get("contrastive_tgt_emb")
+        if not pred_steps or not scale_steps or target_emb is None:
+            return {"loss": zero, "scale": zero, "entropy": zero, "error_corr": zero}
+        if len(pred_steps) != len(scale_steps):
+            raise ValueError(
+                f"contrastive mean/scale horizon mismatch: {len(pred_steps)} vs {len(scale_steps)}"
+            )
+        if horizon_discount <= 0:
+            raise ValueError("horizon_discount must be > 0")
+
+        losses = []
+        scales = []
+        entropies = []
+        errors = []
+        weights = []
+        norm_denom = sum(float(horizon_discount) ** k for k in range(len(pred_steps)))
+        for k, (pred, scale) in enumerate(zip(pred_steps, scale_steps)):
+            offset = k + 1
+            target = target_emb[:, offset:, :].detach()
+            if pred.shape != target.shape:
+                raise ValueError(
+                    f"contrastive mean/target mismatch at horizon {offset}: "
+                    f"{tuple(pred.shape)} vs {tuple(target.shape)}"
+                )
+            if scale.shape != pred.shape[:-1] + (1,):
+                raise ValueError(
+                    f"contrastive scale must be {tuple(pred.shape[:-1] + (1,))}, got {tuple(scale.shape)}"
+                )
+            if not torch.all(scale > 0):
+                raise ValueError("contrastive isotropic scale must be strictly positive")
+
+            valid = (~key_padding_mask[:, :-offset]) & (~key_padding_mask[:, offset:])
+            if not valid.any():
+                continue
+            squared_error = (pred - target).pow(2).mean(dim=-1)
+            variance = scale.squeeze(-1).pow(2)
+            # Per-dimension Gaussian NLL keeps its scale comparable to InfoNCE
+            # while calibrating the shared isotropic variance in raw CPC space.
+            nll = 0.5 * (
+                squared_error / variance
+                + variance.log()
+                + math.log(2.0 * math.pi)
+            )
+            entropy = 0.5 * pred.shape[-1] * (
+                1.0
+                + math.log(2.0 * math.pi)
+                + variance.log()
+            )
+            weight = pred.new_tensor((float(horizon_discount) ** k) / norm_denom)
+            losses.append(nll[valid].mean())
+            scales.append(scale.squeeze(-1)[valid])
+            entropies.append(entropy[valid])
+            errors.append(squared_error[valid].sqrt())
+            weights.append(weight)
+
+        if not losses:
+            return {"loss": zero, "scale": zero, "entropy": zero, "error_corr": zero}
+
+        loss = (torch.stack(losses) * torch.stack(weights)).sum()
+        scale_values = torch.cat(scales)
+        entropy_values = torch.cat(entropies)
+        error_values = torch.cat(errors)
+        scale_centered = scale_values - scale_values.mean()
+        error_centered = error_values - error_values.mean()
+        corr_denom = scale_centered.square().sum().sqrt() * error_centered.square().sum().sqrt()
+        error_corr = torch.where(
+            corr_denom > 0,
+            (scale_centered * error_centered).sum() / corr_denom,
+            corr_denom.new_zeros(()),
+        )
+        return {
+            "loss": loss,
+            "scale": scale_values.mean(),
+            "entropy": entropy_values.mean(),
+            "error_corr": error_corr,
+        }
+
     def compute_sfa_loss(self,
         aux_inputs: Optional[Dict[str, torch.Tensor]],
         key_padding_mask: torch.Tensor):
@@ -333,6 +426,11 @@ class PredictionLossMixin:
             temperature=cfg.contrastive_temp,
             horizon_discount=cfg.contrastive_horizon_discount,
         )
+        uncertainty_results = self.compute_contrastive_uncertainty_loss(
+            aux_inputs=aux_inputs,
+            key_padding_mask=targets["key_padding_mask"],
+            horizon_discount=cfg.contrastive_horizon_discount,
+        )
         sfa_results = self.compute_sfa_loss(aux_inputs=aux_inputs,
                                             key_padding_mask=targets["key_padding_mask"])
 
@@ -341,7 +439,11 @@ class PredictionLossMixin:
         valid = ~targets["key_padding_mask"]
         loss_sensor_cpc = F.mse_loss(pred[valid], target[valid].detach())
 
-        losses["contrastive"] = contrastive_results["loss"]
+        losses["contrastive_nll"] = uncertainty_results["loss"]
+        losses["contrastive"] = (
+            contrastive_results["loss"]
+            + cfg.contrastive_uncertainty_weight * uncertainty_results["loss"]
+        )
         losses["sfa"] = sfa_results['loss']
         losses["sensor_cpc"] = loss_sensor_cpc
         return losses
@@ -378,6 +480,14 @@ class PredictionLossMixin:
             horizon_discount=cfg.contrastive_horizon_discount,
         )
         metrics["contrastive_acc"] = contrastive_stats["acc"]
+        uncertainty_stats = self.compute_contrastive_uncertainty_loss(
+            aux_inputs=aux_inputs,
+            key_padding_mask=targets["key_padding_mask"],
+            horizon_discount=cfg.contrastive_horizon_discount,
+        )
+        metrics["contrastive_scale"] = uncertainty_stats["scale"]
+        metrics["contrastive_entropy"] = uncertainty_stats["entropy"]
+        metrics["contrastive_uncertainty_error_corr"] = uncertainty_stats["error_corr"]
         return metrics
 
     def compute_predictions_metrics(
@@ -577,6 +687,7 @@ class DiscreteLatentPredictorBase(PredictionLossMixin, nn.Module):
         self.post_head = nn.Linear(self.hidden_size + obs_latent_dim, self.stoch_flat)
 
         feat_dim = self.hidden_size + self.stoch_flat
+        self.feat_dim = feat_dim
         self.z_obs_head: Optional[nn.Module] = None
         self.h_obs_head: Optional[nn.Module] = None
         if self.obs_loss_mode == "soft":
@@ -612,7 +723,7 @@ class DiscreteLatentPredictorBase(PredictionLossMixin, nn.Module):
             self.contrastive_head = nn.Sequential(
                 nn.Linear(feat_dim, self.hidden_size),
                 nn.ReLU(),
-                nn.Linear(self.hidden_size, self.contrastive_dim),
+                nn.Linear(self.hidden_size, self.contrastive_dim + 1),
             )
             # Twister-style action-conditioned predictors for horizons 1..K.
             self.contrastive_action_heads = nn.ModuleList(
@@ -620,7 +731,7 @@ class DiscreteLatentPredictorBase(PredictionLossMixin, nn.Module):
                     nn.Sequential(
                         nn.Linear(feat_dim + h * self.action_dim, self.hidden_size),
                         nn.ReLU(),
-                        nn.Linear(self.hidden_size, self.contrastive_dim),
+                        nn.Linear(self.hidden_size, self.contrastive_dim + 1),
                     )
                     for h in range(1, self.contrastive_steps + 1)
                 ]
@@ -1006,30 +1117,35 @@ class DiscreteLatentPredictorBase(PredictionLossMixin, nn.Module):
             return (pred_sensor, loc_x, loc_y, heading_out, turn, step), None
         return (pred_sensor, loc_x, loc_y, heading_out, turn, step), pred_sensor
 
-    def _project_contrastive_pred(self, prior_feat: torch.Tensor) -> Optional[torch.Tensor]:
+    def _project_contrastive_pred(self, prior_feat: torch.Tensor):
         """Project prior branch features for contrastive prediction."""
         if self.contrastive_head is None:
-            return None
-        return self.contrastive_head(prior_feat)
+            return None, None
+        dist = isotropic_normal_from_params(
+            self.contrastive_head(prior_feat),
+            self.contrastive_dim,
+        )
+        return dist.base_dist.loc, dist.base_dist.scale[..., :1]
 
     def _project_contrastive_pred_steps(
         self,
         prior_feat: torch.Tensor,
         actions: torch.Tensor,
-    ) -> List[torch.Tensor]:
+    ):
         """Project action-conditioned prior features for horizons 1..K.
 
         Horizon h uses input [prior_feat_t, a_t, ..., a_{t+h-1}] and predicts target at t+h.
         """
         if self.contrastive_dim <= 0:
-            return []
+            return [], []
         if self.contrastive_action_heads is None or len(self.contrastive_action_heads) == 0:
-            pred = self._project_contrastive_pred(prior_feat)
+            pred, scale = self._project_contrastive_pred(prior_feat)
             if pred is None or pred.shape[1] <= 1:
-                return []
-            return [pred[:, :-1, :]]
+                return [], []
+            return [pred[:, :-1, :]], [scale[:, :-1, :]]
         B, T, _ = prior_feat.shape
-        pred_steps: List[torch.Tensor] = []
+        mean_steps: List[torch.Tensor] = []
+        scale_steps: List[torch.Tensor] = []
         for h, head in enumerate(self.contrastive_action_heads, start=1):
             if h >= T:
                 break
@@ -1037,8 +1153,31 @@ class DiscreteLatentPredictorBase(PredictionLossMixin, nn.Module):
             action_chunks = [actions[:, i : i + th, :] for i in range(h)]
             action_ctx = torch.cat(action_chunks, dim=-1) if action_chunks else actions.new_zeros((B, th, 0))
             pred_in = torch.cat([prior_feat[:, :th, :], action_ctx], dim=-1)
-            pred_steps.append(head(pred_in))
-        return pred_steps
+            dist = isotropic_normal_from_params(head(pred_in), self.contrastive_dim)
+            mean_steps.append(dist.base_dist.loc)
+            scale_steps.append(dist.base_dist.scale[..., :1])
+        return mean_steps, scale_steps
+
+    def predict_next_contrastive_dist(
+        self,
+        state: torch.Tensor,
+        action: torch.Tensor,
+    ) -> torch.distributions.Independent:
+        assert state.dim() == 2, f"Expected state [B,F], got {tuple(state.shape)}"
+        assert state.shape[-1] == self.feat_dim, f"Expected state dim {self.feat_dim}, got {state.shape[-1]}"
+        assert action.dim() == 2, f"Expected action [B,A], got {tuple(action.shape)}"
+        assert action.shape[0] == state.shape[0], "state and action batch sizes must match"
+        assert action.shape[-1] == self.action_dim, f"Expected action dim {self.action_dim}, got {action.shape[-1]}"
+        assert self.contrastive_action_heads is not None, "contrastive_action_heads is not initialized"
+        assert len(self.contrastive_action_heads) >= 1, "At least one contrastive action head is required"
+        pred_input = torch.cat([state, action.to(dtype=state.dtype, device=state.device)], dim=-1)
+        return isotropic_normal_from_params(
+            self.contrastive_action_heads[0](pred_input),
+            self.contrastive_dim,
+        )
+
+    def predict_next_contrastive_emb(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        return self.predict_next_contrastive_dist(state, action).mean
 
     def _project_contrastive_target_z(self, z_flat: torch.Tensor) -> Optional[torch.Tensor]:
         """Project posterior stochastic latent z_t for contrastive targets."""

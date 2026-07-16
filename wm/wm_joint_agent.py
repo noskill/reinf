@@ -963,7 +963,8 @@ class BaseWMOnPolicy:
             + losses.get("aux_total", default)
         )
         total_loss = total_loss + cfg.contrastive_weight * losses.get(
-            "contrastive", default)  + losses.get('sfa', default) + losses['sensor_cpc'] * 0.1
+            "contrastive", default)
+        total_loss = total_loss + losses.get('sfa', default) + losses['sensor_cpc'] * 0.1
         assert 'sfa' in losses
         return total_loss
 

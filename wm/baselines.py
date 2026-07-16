@@ -11,7 +11,7 @@ from base import PredictionLossMixin
 from transformer import LlamaConfig, LlamaModel, LlamaRMSNorm
 from transformer_cached import CachedTransformer
 from rnn_cached import CachedRNN
-from utils import make_probe_head, scale_upstream_grad
+from utils import isotropic_normal_from_params, make_probe_head, scale_upstream_grad
 from recurrent_mlp import RecurrentMLP
 from recurrent_cache import clear_cache, reset_cache
 
@@ -90,7 +90,7 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
                 nn.Sequential(
                     nn.Linear(cpc_context_dim + s * self.action_latent_dim, config.hidden_size),
                     nn.ReLU(),
-                    nn.Linear(config.hidden_size, self.contrastive_dim),
+                    nn.Linear(config.hidden_size, self.contrastive_dim + 1),
                 )
                 for s in range(1, self.contrastive_steps + 1)
             ]
@@ -122,11 +122,12 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
             return None
         return self.contrastive_target_head(h)
 
-    def _project_contrastive_pred_steps(self, h: torch.Tensor, actions: torch.Tensor) -> List[torch.Tensor]:
+    def _project_contrastive_pred_steps(self, h: torch.Tensor, actions: torch.Tensor):
         if self.contrastive_dim <= 0 or self.contrastive_action_heads is None:
-            return []
+            return [], []
         B, T, _ = h.shape
-        pred_steps: List[torch.Tensor] = []
+        mean_steps: List[torch.Tensor] = []
+        scale_steps: List[torch.Tensor] = []
         for horizon, head in enumerate(self.contrastive_action_heads, start=1):
             if horizon >= T:
                 break
@@ -134,10 +135,16 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
             action_chunks = [actions[:, i : i + th, :] for i in range(horizon)]
             action_ctx = torch.cat(action_chunks, dim=-1) if action_chunks else actions.new_zeros((B, th, 0))
             pred_in = torch.cat([h[:, :th, :], action_ctx], dim=-1)
-            pred_steps.append(head(pred_in))
-        return pred_steps
+            dist = isotropic_normal_from_params(head(pred_in), self.contrastive_dim)
+            mean_steps.append(dist.base_dist.loc)
+            scale_steps.append(dist.base_dist.scale[..., :1])
+        return mean_steps, scale_steps
 
-    def predict_next_contrastive_emb(self, h: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+    def predict_next_contrastive_dist(
+        self,
+        h: torch.Tensor,
+        action: torch.Tensor,
+    ) -> torch.distributions.Independent:
         assert h.dim() == 2, f"Expected h [B,H], got {tuple(h.shape)}"
         assert action.dim() == 2, f"Expected action [B,A], got {tuple(action.shape)}"
         assert action.shape[0] == h.shape[0], "h and action batch sizes must match"
@@ -148,7 +155,13 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         context = self.contrastive_context(h)
         action_latent = self.action_encoder(action.to(dtype=h.dtype, device=h.device))
         pred_input = torch.cat([context, action_latent], dim=-1)
-        return self.contrastive_action_heads[0](pred_input)
+        return isotropic_normal_from_params(
+            self.contrastive_action_heads[0](pred_input),
+            self.contrastive_dim,
+        )
+
+    def predict_next_contrastive_emb(self, h: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        return self.predict_next_contrastive_dist(h, action).mean
 
     def _forward_core(
         self,
@@ -215,7 +228,9 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         aux_inputs = {}
         contrastive_input = self.contrastive_context(h)
         aux_inputs["contrastive_tgt_emb"] = self._project_contrastive_target_h(contrastive_input)
-        aux_inputs["contrastive_pred_emb_steps"] = self._project_contrastive_pred_steps(contrastive_input, action_latent)
+        pred_steps, scale_steps = self._project_contrastive_pred_steps(contrastive_input, action_latent)
+        aux_inputs["contrastive_pred_emb_steps"] = pred_steps
+        aux_inputs["contrastive_pred_scale_steps"] = scale_steps
         aux_inputs["sensor_latent"] = sensor_latent
         aux_inputs["cpc_sensor_latent_pred"] = self.cpc_sensor_latent_head(aux_inputs["contrastive_tgt_emb"])
 

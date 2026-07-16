@@ -200,10 +200,12 @@ class RSSMDiscretePredictor(DiscreteLatentPredictorBase):
                 "h_only_pred": h_only_pred,
             }
             # Twister-style action-conditioned contrastive predictors for horizons 1..K.
-            aux_inputs["contrastive_pred_emb_steps"] = self._project_contrastive_pred_steps(
+            pred_steps, scale_steps = self._project_contrastive_pred_steps(
                 feat_prior,
                 actions,
             )
+            aux_inputs["contrastive_pred_emb_steps"] = pred_steps
+            aux_inputs["contrastive_pred_scale_steps"] = scale_steps
             aux_inputs["contrastive_tgt_emb"] = self._project_contrastive_target_z(z_post)
             if obs_hat is not None:
                 aux_inputs["obs_hat"] = obs_hat

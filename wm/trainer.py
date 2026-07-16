@@ -34,7 +34,11 @@ def run_epoch_joint(
         "h_only": 0.0,
         "recon": 0.0,
         "contrastive": 0.0,
+        "contrastive_nll": 0.0,
         "contrastive_acc": 0.0,
+        "contrastive_scale": 0.0,
+        "contrastive_entropy": 0.0,
+        "contrastive_uncertainty_error_corr": 0.0,
     }
     total_batches = 0
     cfg = model.config
@@ -115,6 +119,9 @@ def run_epoch_joint(
             "turn_acc",
             "step_acc",
             "contrastive_acc",
+            "contrastive_scale",
+            "contrastive_entropy",
+            "contrastive_uncertainty_error_corr",
         ):
             val = metrics.get(key, torch.tensor(0.0, device=device))
             totals[key] += float(val.detach().cpu())
@@ -126,6 +133,7 @@ def run_epoch_joint(
             ("h_only_sensor", "h_only"),
             ("recon", "recon"),
             ("contrastive", "contrastive"),
+            ("contrastive_nll", "contrastive_nll"),
         ):
             totals[total_key] += float(
                 loss_dict.get(loss_key, torch.tensor(0.0, device=device)).detach().cpu()

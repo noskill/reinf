@@ -29,6 +29,20 @@ def make_probe_head(in_dim: int, out_dim: int, hidden_dim: int, num_layers: int)
     return nn.Sequential(*blocks)
 
 
+def isotropic_normal_from_params(
+    params: torch.Tensor,
+    event_dim: int,
+    min_scale: float = 1e-4,
+) -> torch.distributions.Independent:
+    if params.shape[-1] != event_dim + 1:
+        raise ValueError(
+            f"Expected isotropic Normal params [..., {event_dim + 1}], got {tuple(params.shape)}"
+        )
+    mean = params[..., :event_dim]
+    scale = F.softplus(params[..., event_dim:]) + min_scale
+    return torch.distributions.Independent(torch.distributions.Normal(mean, scale), 1)
+
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)

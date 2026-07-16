@@ -116,6 +116,12 @@ def main():
         help="Exponential horizon weighting for CPC (horizon h uses weight discount**h).",
     )
     parser.add_argument(
+        "--contrastive-uncertainty-weight",
+        type=float,
+        default=0.05,
+        help="Weight of isotropic Gaussian CPC NLL inside the contrastive loss.",
+    )
+    parser.add_argument(
         "--train-recon-heads-only",
         action="store_true",
         help="Freeze backbone/dynamics and train only sensor reconstruction heads from [z,h], z-only, and h-only.",
@@ -167,6 +173,8 @@ def main():
         raise ValueError("--contrastive-temp must be > 0")
     if args.contrastive_horizon_discount <= 0:
         raise ValueError("--contrastive-horizon-discount must be > 0")
+    if args.contrastive_uncertainty_weight < 0:
+        raise ValueError("--contrastive-uncertainty-weight must be >= 0")
     if args.contrastive_weight > 0 and args.contrastive_dim <= 0:
         raise ValueError("--contrastive-dim must be > 0 when --contrastive-weight > 0")
     if args.contrastive_steps < 1:
@@ -330,6 +338,7 @@ def main():
         turn_weight=args.turn_weight,
         step_weight=args.step_weight,
         contrastive_weight=args.contrastive_weight,
+        contrastive_uncertainty_weight=args.contrastive_uncertainty_weight,
         contrastive_temp=args.contrastive_temp,
         contrastive_horizon_discount=args.contrastive_horizon_discount,
         loc_min=loc_min,
@@ -387,6 +396,7 @@ def main():
                 "rssm_residual_scale": args.rssm_residual_scale,
                 "rssm_state_norm": args.rssm_state_norm,
                 "contrastive_weight": args.contrastive_weight,
+                "contrastive_uncertainty_weight": args.contrastive_uncertainty_weight,
                 "contrastive_dim": args.contrastive_dim,
                 "contrastive_temp": args.contrastive_temp,
                 "contrastive_steps": args.contrastive_steps,
