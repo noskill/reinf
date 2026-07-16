@@ -11,6 +11,19 @@ class RecurrentMLP(nn.Module, CacheModuleMixin):
         self.mlp = mlp
         self._prev = None
 
+    def get_cache_state(self):
+        if self._prev is None:
+            return None
+        return self._prev.detach().clone()
+
+    def set_cache_state(self, state):
+        self._prev = None if state is None else state.detach().clone()
+
+    def index_cache_state(self, state, batch_indices: torch.Tensor):
+        if state is None:
+            return None
+        return state[batch_indices].detach().clone()
+
     def forward(self, e_seq, reset_mask):
         # e_seq shape: (batch_size, sequence_length, input_dim)
         batch_size, seq_len, _ = e_seq.size()

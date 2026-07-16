@@ -69,6 +69,37 @@ class LayerCache(CacheLayerMixin):
     def __len__(self) -> int:
         return max(len(self._k_rows), len(self._v_rows))
 
+    @staticmethod
+    def _share_row(row: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if row is None:
+            return None
+        # KV prefixes are immutable: updates allocate a new row with torch.cat
+        # and rebind the list entry, so rollout branches can safely share storage.
+        return row.detach()
+
+    def clone(self):
+        result = LayerCache(detach_on_pop=self.detach_on_pop)
+        result._k_rows = [self._share_row(row) for row in self._k_rows]
+        result._v_rows = [self._share_row(row) for row in self._v_rows]
+        return result
+
+    def index_batch(self, batch_indices: torch.Tensor):
+        if not isinstance(batch_indices, torch.Tensor):
+            raise TypeError("batch_indices must be a tensor")
+        if batch_indices.dim() != 1:
+            raise ValueError(f"batch_indices must be 1D, got {tuple(batch_indices.shape)}")
+        if len(self._k_rows) != len(self._v_rows):
+            raise RuntimeError("key and value cache row counts must match")
+
+        indices = batch_indices.detach().to(device="cpu", dtype=torch.long).tolist()
+        if indices and (min(indices) < 0 or max(indices) >= len(self._k_rows)):
+            raise IndexError(f"batch index outside cache size {len(self._k_rows)}")
+
+        result = LayerCache(detach_on_pop=self.detach_on_pop)
+        result._k_rows = [self._share_row(self._k_rows[index]) for index in indices]
+        result._v_rows = [self._share_row(self._v_rows[index]) for index in indices]
+        return result
+
     def _ensure_rows(self, batch: int) -> None:
         if len(self._k_rows) < batch:
             self._k_rows.extend([None] * (batch - len(self._k_rows)))
@@ -243,6 +274,27 @@ class PositionBasedDynamicCache(Cache):
         if layer_idx not in self._layers:
             self._layers[layer_idx] = LayerCache(detach_on_pop=self.detach_on_pop)
         return self._layers[layer_idx]
+
+    def _new_empty_like(self):
+        if hasattr(self, "window_size"):
+            return self.__class__(self.window_size, detach_on_pop=self.detach_on_pop)
+        return self.__class__(detach_on_pop=self.detach_on_pop)
+
+    def clone(self):
+        result = self._new_empty_like()
+        result._layers = {
+            layer_idx: layer.clone()
+            for layer_idx, layer in self._layers.items()
+        }
+        return result
+
+    def index_batch(self, batch_indices: torch.Tensor):
+        result = self._new_empty_like()
+        result._layers = {
+            layer_idx: layer.index_batch(batch_indices)
+            for layer_idx, layer in self._layers.items()
+        }
+        return result
 
     def to(self, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None):
         for layer in self._layers.values():

@@ -2,7 +2,16 @@ import torch
 
 
 class CacheModuleMixin:
-                                                
+
+    def get_cache_state(self):
+        raise NotImplementedError
+
+    def set_cache_state(self, state):
+        raise NotImplementedError
+
+    def index_cache_state(self, state, batch_indices: torch.Tensor):
+        raise NotImplementedError
+                                                 
     def reset_cache(self, reset_mask: torch.Tensor):
         pass
 

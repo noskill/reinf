@@ -18,6 +18,19 @@ class CachedRNN(torch.nn.Module, CacheModuleMixin):
         self.attention_window = config.attention_window
         self._state_h: Optional[torch.Tensor] = None
 
+    def get_cache_state(self):
+        if self._state_h is None:
+            return None
+        return self._state_h.detach().clone()
+
+    def set_cache_state(self, state):
+        self._state_h = None if state is None else state.detach().clone()
+
+    def index_cache_state(self, state, batch_indices: torch.Tensor):
+        if state is None:
+            return None
+        return state[:, batch_indices, :].detach().clone()
+
     def forward(self, x, key_padding_mask, reset_mask):
         self.backbone.flatten_parameters()
         using_cache = reset_mask is not None
