@@ -241,7 +241,15 @@ class GoalAgent(PPO):
             return
         self.train_policy_batch(batch, num_minibatches=num_minibatches)
 
-    def train_goal_hindsight(self, episodes, targets_per_episode, weights_per_episode, num_epochs=None, switch_only=True):
+    def train_goal_hindsight(
+        self,
+        episodes,
+        targets_per_episode,
+        weights_per_episode,
+        num_epochs=None,
+        switch_only=True,
+        train_sigma=True,
+    ):
         if num_epochs is None:
             num_epochs = self.goal_hindsight_epochs
         if num_epochs < 1:
@@ -288,9 +296,7 @@ class GoalAgent(PPO):
         target_selected = target_flat[selected]
         delta_selected = target_selected - state_sfa_flat[selected]
         sigma_target = delta_selected.std(dim=0, unbiased=False).clamp_min(1e-4).detach()
-
-        last_mu_target_dist = None
-        last_std_mean = None
+        
         for epoch_idx in range(num_epochs):
             self.optimizer_policy.zero_grad()
             params = self.policy(states_padded, reset_mask=None, key_padding_mask=padding_mask)
@@ -307,14 +313,20 @@ class GoalAgent(PPO):
 
             mu_loss_items = (mu_selected - target_selected).pow(2).mean(dim=-1) * weights_selected
             sigma_loss_items = (sigma_selected - sigma_target).pow(2).mean(dim=-1) * weights_selected
-       
-            loss = self.goal_hindsight_coef * (mu_loss_items.mean() + sigma_loss_items.mean())
+            import pdb;pdb.set_trace()
+            loss = self.goal_hindsight_coef * mu_loss_items.mean()
+            if train_sigma:
+                loss = loss + self.goal_hindsight_coef * sigma_loss_items.mean()
 
             if epoch_idx == 0:
-                self._log_loss_grad_stats({
+                grad_losses = {
                     "goal_hindsight_mu": self._grad_probe_loss(self.goal_hindsight_coef * mu_loss_items),
-                    "goal_hindsight_sigma": self._grad_probe_loss(self.goal_hindsight_coef * sigma_loss_items),
-                })
+                }
+                if train_sigma:
+                    grad_losses["goal_hindsight_sigma"] = self._grad_probe_loss(
+                        self.goal_hindsight_coef * sigma_loss_items
+                    )
+                self._log_loss_grad_stats(grad_losses)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1)
             self.optimizer_policy.step()
@@ -326,7 +338,10 @@ class GoalAgent(PPO):
                 dim=-1,
             ).mean().detach()
         self.logger.log_scalar("high/hindsight/loss", loss.item())
-        self.logger.log_scalar("high/hindsight/loss_sigma", sigma_loss_items.detach().mean().item())
+        self.logger.log_scalar(
+            "high/hindsight/loss_sigma",
+            sigma_loss_items.detach().mean().item() if train_sigma else 0.0,
+        )
         self.logger.log_scalar("high/hindsight/mu_target_dist", last_mu_target_dist.item())
         self.logger.log_scalar("high/hindsight/std", sigma_selected.mean().detach().item())
         self.logger.log_scalar("high/hindsight/target_std", sigma_target.mean().item())
@@ -341,15 +356,33 @@ class GoalAgent(PPO):
             return None
 
         episode_batch = episode_batch.to(self.device)
-        episode_batch.data["goal_returns"] = compute_returns_list(
+        episode_batch.data["goal_returns"] = self._compute_goal_option_returns(
             episode_batch.data["goal_rewards"],
-            self.discount,
+            episode_batch.data["actions"],
         )
         episode_batch.data["switch_returns"] = compute_returns_list(
             episode_batch.data["switch_rewards"],
             self.discount,
         )
         return episode_batch
+
+    def _compute_goal_option_returns(self, rewards_per_episode, actions_per_episode):
+        assert len(rewards_per_episode) == len(actions_per_episode), \
+            "Goal reward/action episode counts must match"
+        returns_per_episode = []
+        for rewards, actions in zip(rewards_per_episode, actions_per_episode):
+            switches = actions["switch"].view(-1).to(rewards)
+            assert rewards.shape == switches.shape, \
+                f"Expected aligned goal rewards/switches, got {rewards.shape} and {switches.shape}"
+            returns = torch.zeros_like(rewards)
+            next_return = rewards.new_zeros(())
+            for step_idx in range(rewards.shape[0] - 1, -1, -1):
+                if step_idx + 1 < rewards.shape[0] and switches[step_idx + 1] > 0.5:
+                    next_return = rewards.new_zeros(())
+                next_return = rewards[step_idx] + self.discount * next_return
+                returns[step_idx] = next_return
+            returns_per_episode.append(returns)
+        return returns_per_episode
 
     def _extract_episode_data(self, episodes):
         data_lists = {data_type: [] for data_type in self.data_types}
@@ -386,7 +419,6 @@ class GoalAgent(PPO):
         states_padded = to_device(padded["states"], self.device)
         actions_padded = to_device(padded["actions"], self.device)
         old_logp_padded = to_device(padded["log_probs"], self.device)
-        goal_rewards_padded = padded["goal_rewards"].to(self.device)
         switch_rewards_padded = padded["switch_rewards"].to(self.device)
         goal_returns_padded = padded["goal_returns"].to(self.device)
         switch_returns_padded = padded["switch_returns"].to(self.device)
@@ -396,9 +428,9 @@ class GoalAgent(PPO):
         switch_returns_flat = flatten_padded(switch_returns_padded.unsqueeze(-1), padding_mask).squeeze(-1)
         self.train_value_heads(states_flat, goal_returns_flat, switch_returns_flat, num_minibatches=num_minibatches)
 
-        goal_advantages = self.compute_advantage_head(
+        goal_advantages = self.compute_return_advantage_head(
             states_padded,
-            goal_rewards_padded,
+            goal_returns_padded,
             padding_mask,
             head="goal",
         )
@@ -430,7 +462,10 @@ class GoalAgent(PPO):
             switch_old = flatten_padded(mb_old_logp["switch"], mb_padding).detach()
             goal_adv = flatten_padded(mb_goal_adv, mb_padding)
             switch_adv = flatten_padded(mb_switch_adv, mb_padding)
-            switch = flatten_padded(mb_actions["switch"].squeeze(), mb_padding).to(goal_adv)
+            switch_padded = mb_actions["switch"]
+            assert switch_padded.dim() == 3 and switch_padded.shape[-1] == 1, \
+                f'Expected switch actions [B,T,1], got {tuple(switch_padded.shape)}'
+            switch = flatten_padded(switch_padded.squeeze(-1), mb_padding).to(goal_adv)
             new_goal_mask = switch
 
             if goal_old.numel() == 0:
@@ -519,6 +554,15 @@ class GoalAgent(PPO):
             values = self.value_head(states_batch, head)
             values = values * (1 - padding_mask.float())
         advantages = gae(self.discount, self.lambda_discount, rewards_batch, values)
+        advantages, advantage_mean, advantage_std = normalize_padded_returns(advantages, padding_mask)
+        self.logger.log_scalar(f"{head}/advantage_mean", advantage_mean.item())
+        self.logger.log_scalar(f"{head}/advantage_std", advantage_std.item())
+        return advantages
+
+    def compute_return_advantage_head(self, states_batch, returns_batch, padding_mask, head):
+        with torch.no_grad():
+            values = self.value_head(states_batch, head)
+        advantages = returns_batch - values
         advantages, advantage_mean, advantage_std = normalize_padded_returns(advantages, padding_mask)
         self.logger.log_scalar(f"{head}/advantage_mean", advantage_mean.item())
         self.logger.log_scalar(f"{head}/advantage_std", advantage_std.item())

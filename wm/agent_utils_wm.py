@@ -715,9 +715,6 @@ def create_single_policy_agent(args, wm_model_args, wm_model, logger, maze_dim, 
         wm_train_episodes=args.wm_train_episodes,
         wm_divergence_novelty_coef=args.wm_divergence_novelty_coef,
         wm_fixed=args.wm_fixed,
-        low_warmup_updates=getattr(args, "low_warmup_updates", 0),
-        low_warmup_goal_noise=getattr(args, "low_warmup_goal_noise", 0.1),
-        high_warmup_horizon=getattr(args, "high_warmup_horizon", 5),
         high_warmup_goal_coef=getattr(args, "high_warmup_goal_coef", 0.005),
         high_warmup_goal_epochs=getattr(args, "high_warmup_goal_epochs", 1),
         reset_high_agent_on_load=getattr(args, "reset_high_agent", False),
@@ -750,9 +747,18 @@ def create_double_policy_agent(args, wm_model_args, wm_model, logger, maze_dim, 
     )
 
     sampler_low = DiscreteActionSampler()
+
+    # used to guide agent when it has no goal
     value_low = WMValueHeadPolicy(
         device=device,
         input_dim=low_policy_input_dim
+    )
+
+    # if goal can be achieved by low-level agent
+    achievability_low = WMValueHeadPolicy(
+        device=device,
+        input_dim=low_policy_input_dim,
+        output_dim=3,
     )
 
     agent_low = LowLevelAgent(
@@ -771,6 +777,7 @@ def create_double_policy_agent(args, wm_model_args, wm_model, logger, maze_dim, 
         num_learning_epochs=getattr(args, "num_learning_epochs", 4),
         clip_param=getattr(args, "clip_param", None),
         exp_adv=getattr(args, "exp_adv", False),
+        achievability_head=achievability_low,
     )
 
     surprise_dim = progress_dim = steps_dim = 1
@@ -827,11 +834,13 @@ def create_double_policy_agent(args, wm_model_args, wm_model, logger, maze_dim, 
         wm_train_episodes=args.wm_train_episodes,
         wm_divergence_novelty_coef=args.wm_divergence_novelty_coef,
         wm_fixed=args.wm_fixed,
-        low_warmup_updates=getattr(args, "low_warmup_updates", 0),
-        low_warmup_goal_noise=getattr(args, "low_warmup_goal_noise", 0.1),
-        high_warmup_horizon=getattr(args, "high_warmup_horizon", 5),
         high_warmup_goal_coef=getattr(args, "high_warmup_goal_coef", 0.005),
         high_warmup_goal_epochs=getattr(args, "high_warmup_goal_epochs", 1),
+        low_virtual_cpc_error_threshold=getattr(args, "low_virtual_cpc_error_threshold", 2.0),
+        achievability_warmup_updates=getattr(args, "achievability_warmup_updates", 100),
+        high_goal_ramp_updates=getattr(args, "high_goal_ramp_updates", 500),
+        high_goal_max_fraction=getattr(args, "high_goal_max_fraction", 0.5),
+        high_achievability_coef=getattr(args, "high_achievability_coef", 0.1),
         reset_high_agent_on_load=getattr(args, "reset_high_agent", False),
         sensor_max_bin=args.wm_sensor_max_bin,
         maze_dim=maze_dim,
