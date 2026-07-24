@@ -31,6 +31,15 @@ class CachedRNN(torch.nn.Module, CacheModuleMixin):
             return None
         return state[:, batch_indices, :].detach().clone()
 
+    def prime_cache(self, x):
+        self.backbone.flatten_parameters()
+        if self.attention_window is not None and self.attention_window > 0:
+            h, h_n = self.window_iterate(x, None)
+        else:
+            h, h_n = self.backbone(x)
+        self._state_h = h_n.detach()
+        return h
+
     def forward(self, x, key_padding_mask, reset_mask):
         self.backbone.flatten_parameters()
         using_cache = reset_mask is not None

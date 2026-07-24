@@ -117,6 +117,66 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
     def clear_cache(self):
         clear_cache(self)
 
+    def get_cache_state(self):
+        return {
+            "backbone": self.backbone.get_cache_state(),
+            "sfa": self.cpc_sfa.get_cache_state(),
+        }
+
+    def set_cache_state(self, state):
+        self.backbone.set_cache_state(state["backbone"])
+        self.cpc_sfa.set_cache_state(state["sfa"])
+
+    def index_cache_state(self, state, batch_indices: torch.Tensor):
+        return {
+            "backbone": self.backbone.index_cache_state(state["backbone"], batch_indices),
+            "sfa": self.cpc_sfa.index_cache_state(state["sfa"], batch_indices),
+        }
+
+    def _prepare_prime_cache_inputs(self, obs):
+        prime_obs = dict(obs)
+        prime_obs.setdefault("actions", None)
+        sensor, sensor_latent, actions, prev_actions, key_padding_mask, _ = self._validate_obs_contract(
+            prime_obs,
+            episode_start=None,
+        )
+        if key_padding_mask is not None and key_padding_mask.any():
+            raise ValueError("prime_cache does not support padded sequence steps")
+
+        state_input = sensor if sensor is not None else sensor_latent
+        batch_size, sequence_length = state_input.shape[:2]
+        if sequence_length < 1:
+            raise ValueError("prime_cache requires at least one sequence step")
+        return sensor, sensor_latent, actions, prev_actions, state_input
+
+    def prime_cache(self, obs):
+        sensor, sensor_latent, actions, prev_actions, state_input = self._prepare_prime_cache_inputs(obs)
+        batch_size, sequence_length = state_input.shape[:2]
+
+        self.clear_cache()
+        result = None
+        for step_idx in range(sequence_length):
+            step_obs = {
+                "actions": None if actions is None else actions[:, step_idx],
+                "prev_actions": prev_actions[:, step_idx],
+            }
+            if sensor is not None:
+                step_obs["sensor"] = sensor[:, step_idx]
+            else:
+                step_obs["sensor_latent"] = sensor_latent[:, step_idx]
+            result = self.forward(
+                step_obs,
+                episode_start=torch.full(
+                    (batch_size,),
+                    step_idx == 0,
+                    dtype=torch.bool,
+                    device=state_input.device,
+                ),
+            )
+
+        assert result is not None
+        return result
+
     def _project_contrastive_target_h(self, h: torch.Tensor) -> Optional[torch.Tensor]:
         if self.contrastive_target_head is None:
             return None
@@ -253,7 +313,7 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
                             reset_mask)
 
         if reset_mask is not None:
-            assert sfa.shape[1] == 1
+            assert reset_mask.numel() == sfa.shape[0]
 
         aux_inputs['sfa'] = sfa
         return aux_inputs
@@ -302,3 +362,39 @@ class RNNPredictor(TransformerBaseline):
             logger=logger
         )
         self.backbone = CachedRNN(config)
+
+    @staticmethod
+    def _last_time_step(value):
+        if value is None:
+            return None
+        if isinstance(value, tuple):
+            return tuple(RNNPredictor._last_time_step(item) for item in value)
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"Expected tensor, tuple, or None, got {type(value).__name__}")
+        return value[:, -1:]
+
+    def prime_cache(self, obs):
+        sensor, sensor_latent, actions, prev_actions, state_input = self._prepare_prime_cache_inputs(obs)
+        self.clear_cache()
+        if sensor_latent is None:
+            sensor_latent = self.sensor_encoder(sensor)
+        prev_action_latent = self.action_encoder(prev_actions)
+        x = torch.cat([sensor_latent, prev_action_latent], dim=-1)
+        if x.shape[-1] != self.input_size:
+            raise ValueError(f"Expected input_size {self.input_size}, got {x.shape[-1]}")
+
+        h = self.backbone.prime_cache(x)
+        reset_mask = torch.ones(state_input.shape[0], dtype=torch.bool, device=state_input.device)
+        preds, aux_inputs = self.forward_preds(h, actions, sensor_latent, reset_mask)
+        preds = self._last_time_step(preds)
+        aux_inputs = {
+            key: [] if isinstance(value, list) else self._last_time_step(value)
+            for key, value in aux_inputs.items()
+        }
+        return {
+            "preds": preds,
+            "aux": aux_inputs,
+            "state": h[:, -1, :],
+            "state_last": h[:, -1, :],
+            "state_seq": h[:, -1:],
+        }

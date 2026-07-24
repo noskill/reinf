@@ -23,7 +23,7 @@ class WMActionHeadPolicy(nn.Module):
 
 
 class WMValueHeadPolicy(nn.Module):
-    """Policy head that maps precomputed WM state to action logits."""
+    """Prediction head that maps precomputed WM state to scalar or vector outputs."""
 
     def __init__(
         self,

@@ -12,6 +12,31 @@ class CachedTransformer(torch.nn.Module, CacheModuleMixin):
         self._cache_position: Optional[torch.Tensor] = None
         self._cache = None
 
+    def get_cache_state(self):
+        if self._cache is None:
+            assert self._cache_position is None
+            return None
+        assert self._cache_position is not None
+        return {
+            "cache": self._cache.clone(),
+            "position": self._cache_position.detach().clone(),
+        }
+
+    def set_cache_state(self, state):
+        if state is None:
+            self.clear_cache()
+            return
+        self._cache = state["cache"].clone()
+        self._cache_position = state["position"].detach().clone()
+
+    def index_cache_state(self, state, batch_indices: torch.Tensor):
+        if state is None:
+            return None
+        return {
+            "cache": state["cache"].index_batch(batch_indices),
+            "position": state["position"][batch_indices].detach().clone(),
+        }
+
     def reset_cache(self, reset_mask: torch.Tensor):
         if reset_mask is None:
             return
@@ -61,5 +86,4 @@ class CachedTransformer(torch.nn.Module, CacheModuleMixin):
         
         
         
-
 
