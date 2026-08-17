@@ -3,6 +3,7 @@ from typing import Dict
 
 from ppo import PPOBase
 from wm_joint_agent import BaseWMOnPolicy
+from util import EpisodeBatch
 
 
 class DoubleAgent(BaseWMOnPolicy):
@@ -201,13 +202,10 @@ class DoubleAgent(BaseWMOnPolicy):
         return surprise.detach()
 
     def _replay_wm_to_step(self, episodes, step_idx):
-        if step_idx < 0:
+        if (step_idx < 0).any():
             raise ValueError(f"step_idx must be >= 0, got {step_idx}")
-        episode_indices = [idx for idx, episode in enumerate(episodes) if len(episode) > step_idx]
-        if not episode_indices:
-            raise ValueError(f"No episodes contain step {step_idx}")
 
-        replay_episodes = [episodes[idx] for idx in episode_indices]
+        replay_episodes = episodes
         batch_size = len(replay_episodes)
         live_cache = self.wm_model.get_cache_state()
         was_training = self.wm_model.training
@@ -217,36 +215,39 @@ class DoubleAgent(BaseWMOnPolicy):
         try:
             self.wm_model.eval()
             with torch.no_grad():
-                sensor = torch.stack([
-                    torch.stack([
+                sensor = [torch.stack([
                         torch.as_tensor(episode[current_step][0]["sensor"], dtype=torch.float32)
-                        for current_step in range(step_idx + 1)
-                    ])
-                    for episode in replay_episodes
-                ]).to(self.device)
-                action_indices = torch.stack([
-                    torch.stack([
+                        for current_step in range(step_idx[i] + 1)]).to(self.device)
+                    for i, episode in enumerate(replay_episodes)]
+
+                action_indices = [torch.stack([
                         torch.as_tensor(episode[current_step][1], dtype=torch.long).view(-1)[0]
-                        for current_step in range(step_idx + 1)
-                    ])
-                    for episode in replay_episodes
-                ]).to(self.device)
-                actions = self.action_idx_to_val(action_indices.reshape(-1)).reshape(
-                    batch_size,
-                    step_idx + 1,
-                    -1,
-                ).to(sensor)
-                replay_out = self.wm_model.prime_cache({
-                    "sensor": sensor,
+                        for current_step in range(step_idx[i] + 1)]).to(self.device)
+                    for i, episode in enumerate(replay_episodes)]
+
+                actions = [self.action_idx_to_val(ai).to(sensor[0]) for ai in action_indices]
+                prefix_batch = EpisodeBatch({
                     "actions": actions,
-                })
+                    "sensor": sensor,
+                }).to(self.device)
+                padded, key_padding_mask, lengths = prefix_batch.left_pad()
+                row_indices = torch.arange(key_padding_mask.size(0), device=lengths.device)
+                cache_reset = key_padding_mask.clone()
+                cache_reset[row_indices, -lengths] = True
+
+                replay_out = self.wm_model.prime_cache({
+                    "sensor": padded["sensor"],
+                    "actions": padded["actions"],
+                }, episode_start=cache_reset)
+
                 replay_cache = self.wm_model.get_cache_state()
         finally:
             self.wm_model.set_cache_state(live_cache)
             self.wm_model.train(was_training)
 
         assert replay_out is not None and replay_cache is not None
-        return replay_out, replay_cache, torch.tensor(episode_indices, dtype=torch.long, device=self.device)
+        episode_indices = torch.arange(batch_size, dtype=torch.long, device=self.device)
+        return replay_out, replay_cache, episode_indices
 
     def _collect_low_virtual_hindsight(
         self,
@@ -262,11 +263,7 @@ class DoubleAgent(BaseWMOnPolicy):
         if horizon < 1:
             raise ValueError(f"horizon must be >= 1, got {horizon}")
         if not 0.0 <= step_effect_threshold <= 1.0:
-            raise ValueError(
-                f"step_effect_threshold must be in [0, 1], got {step_effect_threshold}"
-            )
-        if not hasattr(self.wm_model, "cpc_sensor_latent_head"):
-            raise TypeError("virtual low-level rollouts require cpc_sensor_latent_head")
+            raise ValueError(f"step_effect_threshold must be in [0, 1], got {step_effect_threshold}")
 
         replay_out, replay_cache, _ = self._replay_wm_to_step(episodes, step_idx)
         replay_h = replay_out["state_last"]
@@ -868,7 +865,7 @@ class DoubleAgent(BaseWMOnPolicy):
         sampled_goal = self.agent_high.get_action(high_state, episode_start).detach()
 
         goal_enabled = self._update_high_goal_enabled(episode_start, batch_size)
-        
+
         if goal_enabled.any() and not self.br:
             self.br = True
             print('goal enabled')
@@ -891,7 +888,7 @@ class DoubleAgent(BaseWMOnPolicy):
         self._wm_pool.add_transition_batch(wm_states, actions_cpu, log_probs_cpu, entropy_cpu)
         self.record_sampled_actions(actions)
         return actions
-    
+
     def update(self, rewards, dones, info=None, **kwargs):
         """
         Train the WM and both policy levels after a complete environment batch.
@@ -962,11 +959,11 @@ class DoubleAgent(BaseWMOnPolicy):
         divergence_novelty = self._compute_state_divergence_novelty(
             state_seq=embs,
             key_padding_mask=obs_new["key_padding_mask"])
-        
+
         episode_novelty = self._compute_episode_novelty(
             state_seq=embs,
             key_padding_mask=obs_new["key_padding_mask"])
-        
+
         for _ in range(wm_updates):
             # World-model update on mixed dataset.
             self.wm_optimizer.zero_grad()
@@ -1049,22 +1046,26 @@ class DoubleAgent(BaseWMOnPolicy):
             low_h_states, low_h_actions, low_h_weights, low_h_negative_states = self._compute_low_hindsight(low_episodes, intrinsic_rewards)
             virtual_achievability = None
             if low_virtual_ready:
-                max_prefix_step = min(len(episode) for episode in wm_new_episodes) - 1
-                virtual_step_idx = self.version % max_prefix_step
+                horizon = 3
+                max_prefix_step = torch.tensor(list(len(episode) - 1 for episode in wm_new_episodes), dtype=torch.long)
+                # randomize ep start
+                virtual_step_idx = (torch.rand(len(max_prefix_step)) * (max_prefix_step + 1)).long()
+
                 virtual_hindsight, candidate_goals = self._collect_low_virtual_hindsight(
                     wm_new_episodes,
                     step_idx=virtual_step_idx,
+                    horizon=horizon
                 )
                 virtual_achievability = self._collect_low_virtual_achievability(
                     wm_new_episodes,
                     step_idx=virtual_step_idx,
                     goals=candidate_goals,
+                    horizon=horizon
                 )
                 low_h_states.extend(virtual_hindsight[0])
                 low_h_actions.extend(virtual_hindsight[1])
                 low_h_weights.extend(virtual_hindsight[2])
                 low_h_negative_states.extend(virtual_hindsight[3])
-                self.logger.log_scalar("low/virtual_prefix_step", float(virtual_step_idx))
             self.agent_low.learn_from_episodes(
                 low_episodes,
                 hindsight=(low_h_states, low_h_actions, low_h_weights, low_h_negative_states),
@@ -1105,7 +1106,15 @@ class DoubleAgent(BaseWMOnPolicy):
         # if self.br:
         #     import pdb;pdb.set_trace()
         if high_episodes:
-            if not low_virtual_ready:
+            if low_virtual_ready:
+                enabled_high_episodes = [
+                    episode
+                    for episode, enabled in zip(high_episodes, goal_enabled)
+                    if enabled
+                ]
+                if enabled_high_episodes:
+                    self.agent_high.learn_from_episodes(enabled_high_episodes)
+            else:
                 goal_targets, goal_weights = self._compute_high_current_sfa_targets(high_episodes)
                 old_coef = self.agent_high.goal_hindsight_coef
                 self.agent_high.goal_hindsight_coef = self.high_warmup_goal_coef
@@ -1118,15 +1127,6 @@ class DoubleAgent(BaseWMOnPolicy):
                     train_sigma=False,
                 )
                 self.agent_high.goal_hindsight_coef = old_coef
-            else:
-                enabled_high_episodes = [
-                    episode
-                    for episode, enabled in zip(high_episodes, goal_enabled)
-                    if enabled
-                ]
-                if enabled_high_episodes:
-                    self.agent_high.learn_from_episodes(enabled_high_episodes)
-
         scalar_sums = {
             "joint/loss_total": total_loss_sum,
             "reward/intrinsic_mean": float(intrinsic_rewards.mean().detach().cpu()) * wm_updates_for_logging,

@@ -578,6 +578,52 @@ class EpisodeBatch:
                 raise TypeError(f"Unsupported episode item type for field '{k}'")
         return padded, key_padding_mask, lengths
 
+    def left_pad(
+        self,
+        pad_value: float = 0.0,
+        fields: Optional[Sequence[str]] = None) -> Tuple[Dict[str, Any], torch.Tensor, torch.Tensor]:
+        """
+        Left-pad specified fields into [B, T, ...].
+        """
+        if fields is None:
+            fields = list(self.data.keys())
+        lengths = self.lengths
+        max_len = int(lengths.max().item()) if lengths.numel() > 0 else 0
+        # Vectorized left-padding mask layout
+        positions = torch.arange(max_len, device=lengths.device)
+        key_padding_mask = positions.unsqueeze(0) < (max_len - lengths).unsqueeze(1)
+        def left_pad_tensors(seq_list: List[torch.Tensor]) -> torch.Tensor:
+            if not seq_list:
+                raise ValueError("Cannot left-pad an empty sequence list")
+            # Your clever flip trick executed cleanly
+            reversed_sequences = [tensor.flip(dims=(0,)) for tensor in seq_list]
+            padded = torch.nn.utils.rnn.pad_sequence(
+                reversed_sequences,
+                batch_first=True,
+                padding_value=pad_value,
+            )
+            return padded.flip(dims=(1,))
+        padded: Dict[str, Any] = {}
+        for field in fields:
+            if field not in self.data:
+                continue
+            episodes = self.data[field]
+            if not episodes:
+                raise ValueError(f"Field '{field}' contains no episodes")
+            first = episodes[0]
+            if isinstance(first, dict):
+                keys = list(first.keys())
+                padded[field] = {}
+                # Fix: Extract sequences per key across all episodes and pad them
+                for key in keys:
+                    seq_list = [episode[key] for episode in episodes]
+                    padded[field][key] = left_pad_tensors(seq_list)
+            elif isinstance(first, torch.Tensor):
+                padded[field] = left_pad_tensors(episodes)
+            else:
+                raise TypeError(f"Unsupported episode item type for field '{field}'")
+        return padded, key_padding_mask, lengths
+
     def flatten(self, fields: Optional[Sequence[str]] = None) -> Dict[str, Any]:
           if fields is None:
               fields = list(self.data.keys())

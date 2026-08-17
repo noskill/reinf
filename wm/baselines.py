@@ -149,9 +149,19 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
             raise ValueError("prime_cache requires at least one sequence step")
         return sensor, sensor_latent, actions, prev_actions, state_input
 
-    def prime_cache(self, obs):
+    def prime_cache(self, obs, episode_start=None):
         sensor, sensor_latent, actions, prev_actions, state_input = self._prepare_prime_cache_inputs(obs)
         batch_size, sequence_length = state_input.shape[:2]
+        if episode_start is None:
+            episode_start = torch.zeros(
+                (batch_size, sequence_length),
+                dtype=torch.bool,
+                device=state_input.device,
+            )
+            episode_start[:, 0] = True
+        assert episode_start.shape == (batch_size, sequence_length), \
+            f"Expected episode_start [B,T], got {tuple(episode_start.shape)}"
+        episode_start = episode_start.to(device=state_input.device, dtype=torch.bool)
 
         self.clear_cache()
         result = None
@@ -166,12 +176,7 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
                 step_obs["sensor_latent"] = sensor_latent[:, step_idx]
             result = self.forward(
                 step_obs,
-                episode_start=torch.full(
-                    (batch_size,),
-                    step_idx == 0,
-                    dtype=torch.bool,
-                    device=state_input.device,
-                ),
+                episode_start=episode_start[:, step_idx],
             )
 
         assert result is not None
@@ -362,39 +367,3 @@ class RNNPredictor(TransformerBaseline):
             logger=logger
         )
         self.backbone = CachedRNN(config)
-
-    @staticmethod
-    def _last_time_step(value):
-        if value is None:
-            return None
-        if isinstance(value, tuple):
-            return tuple(RNNPredictor._last_time_step(item) for item in value)
-        if not isinstance(value, torch.Tensor):
-            raise TypeError(f"Expected tensor, tuple, or None, got {type(value).__name__}")
-        return value[:, -1:]
-
-    def prime_cache(self, obs):
-        sensor, sensor_latent, actions, prev_actions, state_input = self._prepare_prime_cache_inputs(obs)
-        self.clear_cache()
-        if sensor_latent is None:
-            sensor_latent = self.sensor_encoder(sensor)
-        prev_action_latent = self.action_encoder(prev_actions)
-        x = torch.cat([sensor_latent, prev_action_latent], dim=-1)
-        if x.shape[-1] != self.input_size:
-            raise ValueError(f"Expected input_size {self.input_size}, got {x.shape[-1]}")
-
-        h = self.backbone.prime_cache(x)
-        reset_mask = torch.ones(state_input.shape[0], dtype=torch.bool, device=state_input.device)
-        preds, aux_inputs = self.forward_preds(h, actions, sensor_latent, reset_mask)
-        preds = self._last_time_step(preds)
-        aux_inputs = {
-            key: [] if isinstance(value, list) else self._last_time_step(value)
-            for key, value in aux_inputs.items()
-        }
-        return {
-            "preds": preds,
-            "aux": aux_inputs,
-            "state": h[:, -1, :],
-            "state_last": h[:, -1, :],
-            "state_seq": h[:, -1:],
-        }
