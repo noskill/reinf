@@ -1,8 +1,10 @@
 import numpy as np
+import math
 import torch
+from torch.distributions import Independent, Normal, kl_divergence
 
 from ppo import PPO
-from util import EpisodeBatch, compute_returns_list, flatten_padded, gae, normalize_padded_returns, to_device
+from util import EpisodeBatch, compute_returns_list, flatten_padded, gae, to_device
 
 
 
@@ -10,11 +12,14 @@ class GoalAgent(PPO):
     """PPO policy for option-like SFA goals.
 
     The policy outputs two action heads through GoalSwitchSampler:
-    - goal: Normal sample in embedding/SFA space
+    - goal: Normal sample in absolute SFA space or as an SFA delta
     - switch: Bernoulli switch flag, where 1 samples/uses a new goal
 
     The executed high-level goal is:
         active_goal_t = prev_goal * (1 - switch) + sampled_goal * switch
+
+    With goal_output_delta enabled, sampled_goal is first converted to
+    current_sfa + sampled_delta while replay keeps the sampled delta action.
 
     Goal and switch heads can receive separate rewards and therefore use
     separate log-probs, returns and advantages.
@@ -23,7 +28,11 @@ class GoalAgent(PPO):
     def __init__(self, *args, **kwargs):
         self.goal_hindsight_coef = kwargs.pop("goal_hindsight_coef", 0.05)
         self.goal_hindsight_epochs = kwargs.pop("goal_hindsight_epochs", 4)
+        self.goal_output_delta = kwargs.pop("goal_output_delta", False)
         self.goal_target_entropy = kwargs.pop("goal_target_entropy", None)
+        self.switch_target_entropy = float(kwargs.pop("switch_target_entropy", 0.65))
+        if not 0.0 <= self.switch_target_entropy <= math.log(2.0):
+            raise ValueError("switch_target_entropy must be in [0, log(2)]")
         super().__init__(*args, **kwargs)
         self.data_types = [
             "states",
@@ -63,10 +72,7 @@ class GoalAgent(PPO):
         target_entropy = target_entropy.to(device=device, dtype=dtype)
         entropy_error = entropy - target_entropy
         normalizer = target_entropy.abs().clamp_min(1.0)
-        self.logger.log_scalar("entropy mean:", entropy.mean())
-        self.logger.log_scalar("goal/entropy_target", target_entropy.detach().mean())
-        self.logger.log_scalar("goal/entropy_error", entropy_error.detach().mean())
-        entropy_loss_items = entropy_error.abs() / normalizer
+        entropy_loss_items = (entropy_error / normalizer).square()
         entropy_loss = entropy_loss_items.mean()
         if return_parts:
             return entropy_loss, entropy_loss_items
@@ -141,12 +147,16 @@ class GoalAgent(PPO):
         policy_params = policy(active_states, **policy_kwargs)
         actions, log_probs, dist = self.sampler(policy_params)
 
-        goal = actions["goal"]
-        switch = actions["switch"].to(goal)
-        reset_mask = torch.as_tensor(episode_start, dtype=torch.bool, device=goal.device).view(-1)
-        assert reset_mask.numel() == goal.shape[0], "episode_start must match batch size"
+        goal_action = actions["goal"]
+        switch = actions["switch"].to(goal_action)
+        reset_mask = torch.as_tensor(
+            episode_start,
+            dtype=torch.bool,
+            device=goal_action.device,
+        ).view(-1)
+        assert reset_mask.numel() == goal_action.shape[0], "episode_start must match batch size"
 
-        self.init_goal_cache(goal)
+        self.init_goal_cache(goal_action)
 
         force_switch_mask = reset_mask | (self.steps_since_switch.view(-1) >= 10.0)
         if force_switch_mask.any():
@@ -169,10 +179,11 @@ class GoalAgent(PPO):
                 switch_logp = switch_logp.squeeze(-1)
             log_probs["switch"] = switch_logp
 
-        active_goal = self._active_goal * (1.0 - switch) + goal * switch
+        assert self._goal_reference is not None, "goal_context must be called before get_action"
+        sampled_goal = self._goal_action_to_absolute(self._goal_reference, goal_action)
+        active_goal = self._active_goal * (1.0 - switch) + sampled_goal * switch
         self._active_goal = active_goal.detach()
         self._last_switch = switch.detach()
-        assert self._goal_reference is not None, "goal_context must be called before get_action"
         self._goal_start = self._goal_start * (1.0 - switch.detach()) + self._goal_reference * switch.detach()
 
         entropy = self._dist_entropy(dist)
@@ -235,11 +246,15 @@ class GoalAgent(PPO):
         self.process_dones(dones)
         return False
 
-    def learn_from_episodes(self, episodes, num_minibatches=4):
+    def learn_from_episodes(self, episodes, num_minibatches=4, virtual_imitation=None):
         batch = self._prepare_episode_batch(episodes)
         if batch is None:
             return
-        self.train_policy_batch(batch, num_minibatches=num_minibatches)
+        self.train_policy_batch(
+            batch,
+            num_minibatches=num_minibatches,
+            virtual_imitation=virtual_imitation,
+        )
 
     def train_goal_hindsight(
         self,
@@ -248,8 +263,7 @@ class GoalAgent(PPO):
         weights_per_episode,
         num_epochs=None,
         switch_only=True,
-        train_sigma=True,
-    ):
+        train_sigma=True):
         if num_epochs is None:
             num_epochs = self.goal_hindsight_epochs
         if num_epochs < 1:
@@ -289,11 +303,13 @@ class GoalAgent(PPO):
         assert hasattr(self.sampler, "goal_sampler"), "hindsight goal training expects GoalSwitchSampler"
 
         goal_dim = targets_padded.shape[-1]
-        state_sfa = states_padded[..., -(2 * goal_dim + 3):-(goal_dim + 3)]
-        assert state_sfa.shape[-1] == goal_dim, "failed to extract current SFA from high-level state"
+        state_sfa = self._current_sfa(states_padded, goal_dim)
+        target_actions_padded = self._absolute_goal_to_action(states_padded, targets_padded)
         target_flat = flatten_padded(targets_padded, padding_mask).detach()
+        target_action_flat = flatten_padded(target_actions_padded, padding_mask).detach()
         state_sfa_flat = flatten_padded(state_sfa, padding_mask).detach()
         target_selected = target_flat[selected]
+        target_action_selected = target_action_flat[selected]
         delta_selected = target_selected - state_sfa_flat[selected]
         sigma_target = delta_selected.std(dim=0, unbiased=False).clamp_min(1e-4).detach()
         
@@ -302,7 +318,7 @@ class GoalAgent(PPO):
             params = self.policy(states_padded, reset_mask=None, key_padding_mask=padding_mask)
             _, _, dist = self.sampler.goal_sampler(
                 params["goal"],
-                actions=targets_padded,
+                actions=target_actions_padded,
                 return_distribution=True,
             )
             mu_flat = self._goal_mu(dist, padding_mask)
@@ -311,9 +327,11 @@ class GoalAgent(PPO):
             mu_selected = mu_flat[selected]
             sigma_selected = sigma_flat[selected]
 
-            mu_loss_items = (mu_selected - target_selected).pow(2).mean(dim=-1) * weights_selected
+            mu_loss_items = (
+                (mu_selected - target_action_selected).pow(2).mean(dim=-1)
+                * weights_selected
+            )
             sigma_loss_items = (sigma_selected - sigma_target).pow(2).mean(dim=-1) * weights_selected
-            import pdb;pdb.set_trace()
             loss = self.goal_hindsight_coef * mu_loss_items.mean()
             if train_sigma:
                 loss = loss + self.goal_hindsight_coef * sigma_loss_items.mean()
@@ -334,7 +352,7 @@ class GoalAgent(PPO):
         self.policy_old.load_state_dict(self.policy.state_dict())
 
         last_mu_target_dist = torch.linalg.vector_norm(
-                mu_selected - target_selected,
+                mu_selected - target_action_selected,
                 dim=-1,
             ).mean().detach()
         self.logger.log_scalar("high/hindsight/loss", loss.item())
@@ -346,6 +364,439 @@ class GoalAgent(PPO):
         self.logger.log_scalar("high/hindsight/std", sigma_selected.mean().detach().item())
         self.logger.log_scalar("high/hindsight/target_std", sigma_target.mean().item())
         self.logger.log_scalar("high/hindsight/selected_frac", selected.float().mean().item())
+
+    def _select_goal_policy_params(self, episodes, step_indices, policy):
+        assert len(episodes) == len(step_indices), \
+            "Goal policy episode and step counts must match"
+        assert episodes, "Goal policy selection requires at least one episode"
+
+        states_per_episode = [
+            torch.stack([step[0] for step in episode], dim=0)
+            for episode in episodes
+        ]
+        batch = EpisodeBatch({"states": states_per_episode}).to(self.device)
+        padded, padding_mask, lengths = batch.pad(fields=["states"])
+        states_padded = padded["states"].to(self.device)
+        padding_mask = padding_mask.to(self.device)
+        lengths = lengths.to(self.device)
+        step_indices = torch.as_tensor(step_indices, dtype=torch.long, device=self.device)
+        assert step_indices.shape == lengths.shape, \
+            f"Expected one goal step per episode, got {step_indices.shape}"
+        assert ((step_indices >= 0) & (step_indices < lengths)).all(), \
+            "Goal step index is outside its episode"
+
+        params = policy(
+            states_padded,
+            reset_mask=None,
+            key_padding_mask=padding_mask,
+        )
+        assert isinstance(params, dict) and "goal" in params, \
+            "Goal policy selection expects goal parameters"
+        goal_params = params["goal"]
+        assert goal_params.dim() == 3, \
+            f"Expected padded goal parameters [B,T,2D], got {goal_params.shape}"
+        row_indices = torch.arange(lengths.shape[0], device=self.device)
+        selected_states = states_padded[row_indices, step_indices]
+        selected_goal_params = goal_params[row_indices, step_indices]
+        return selected_states, selected_goal_params
+
+    def _current_sfa(self, states, goal_dim):
+        assert states.dim() in (2, 3), \
+            f"Expected high-level states [B,D] or [B,T,D], got {states.shape}"
+        current_sfa = states[..., -(2 * goal_dim + 3):-(goal_dim + 3)]
+        assert current_sfa.shape[-1] == goal_dim, \
+            f"Expected current SFA dim {goal_dim}, got {current_sfa.shape}"
+        return current_sfa
+
+    def _goal_action_to_absolute(self, states_or_sfa, goal_action):
+        """
+        if policy outputs delta apply it, otherwise it's just goal_action
+        """
+        if not self.goal_output_delta:
+            return goal_action
+        current_sfa = states_or_sfa
+        if current_sfa.shape[-1] != goal_action.shape[-1]:
+            current_sfa = self._current_sfa(states_or_sfa, goal_action.shape[-1])
+        while current_sfa.dim() < goal_action.dim():
+            current_sfa = current_sfa.unsqueeze(-2)
+        assert current_sfa.shape[:-2] == goal_action.shape[:-2], \
+            f"Current SFA batch {current_sfa.shape} does not match goal action {goal_action.shape}"
+        assert current_sfa.shape[-2] in (1, goal_action.shape[-2]), \
+            f"Current SFA candidates {current_sfa.shape} do not match goal action {goal_action.shape}"
+        absolute_goal = current_sfa + goal_action
+        assert absolute_goal.shape == goal_action.shape
+        return absolute_goal
+
+    def _absolute_goal_to_action(self, states, absolute_goal):
+        if not self.goal_output_delta:
+            return absolute_goal
+        current_sfa = self._current_sfa(states, absolute_goal.shape[-1])
+        while current_sfa.dim() < absolute_goal.dim():
+            current_sfa = current_sfa.unsqueeze(-2)
+        assert current_sfa.shape[:-2] == absolute_goal.shape[:-2], \
+            f"Current SFA batch {current_sfa.shape} does not match absolute goal {absolute_goal.shape}"
+        assert current_sfa.shape[-2] in (1, absolute_goal.shape[-2]), \
+            f"Current SFA candidates {current_sfa.shape} do not match goal {absolute_goal.shape}"
+        goal_action = absolute_goal - current_sfa
+        assert goal_action.shape == absolute_goal.shape
+        return goal_action
+
+    def sample_goal_candidates(self, episodes, step_indices, num_samples=1):
+        assert num_samples >= 1, f"num_samples must be >= 1, got {num_samples}"
+        with torch.no_grad():
+            selected_states, selected_goal_params = self._select_goal_policy_params(
+                episodes,
+                step_indices,
+                self.get_policy_for_action(),
+            )
+            samples = []
+            log_probs = []
+            for _ in range(num_samples):
+                goal_action, log_prob, _ = self.sampler.goal_sampler(selected_goal_params)
+                samples.append(self._goal_action_to_absolute(selected_states, goal_action))
+                log_probs.append(log_prob)
+        goals = torch.stack(samples, dim=1).detach()
+        old_log_probs = torch.stack(log_probs, dim=1).detach()
+        assert goals.dim() == 3, f"Expected sampled goals [B,N,G], got {goals.shape}"
+        assert old_log_probs.shape == goals.shape[:2], \
+            f"Expected sampled goal log-probs [B,N], got {old_log_probs.shape}"
+        return goals, old_log_probs
+
+    def train_virtual_goal_ppo(self, episodes, step_indices, goals, old_log_probs, rewards):
+        assert goals.dim() == 3, f"Expected virtual goals [B,N,G], got {goals.shape}"
+        assert old_log_probs.shape == goals.shape[:2], \
+            "Virtual goal old log-probs must match [B,N]"
+        assert rewards.shape == goals.shape[:2], \
+            "Virtual goal rewards must match [B,N]"
+        assert goals.shape[1] > 1, \
+            "Virtual goal PPO requires multiple candidates per source state"
+        assert torch.isfinite(goals).all(), "Non-finite virtual goals"
+        assert torch.isfinite(old_log_probs).all(), "Non-finite virtual goal old log-probs"
+        assert torch.isfinite(rewards).all(), "Non-finite virtual goal rewards"
+
+        self.optimizer_policy.zero_grad()
+        selected_states, selected_goal_params = self._select_goal_policy_params(
+            episodes,
+            step_indices,
+            self.policy,
+        )
+        candidate_count = goals.shape[1]
+        goal_params = selected_goal_params.unsqueeze(1).expand(-1, candidate_count, -1)
+        goal_actions = self._absolute_goal_to_action(
+            selected_states,
+            goals.to(self.device),
+        )
+        _, new_log_probs, goal_dist = self.sampler.goal_sampler(
+            goal_params,
+            actions=goal_actions,
+            return_distribution=True,
+        )
+        old_log_probs = old_log_probs.to(new_log_probs)
+        rewards = rewards.to(new_log_probs)
+        entropy = self._one_dist_entropy(goal_dist)
+        assert entropy.shape == new_log_probs.shape, \
+            f"Expected virtual goal entropy {new_log_probs.shape}, got {entropy.shape}"
+
+        # Compare candidate goals sampled from the same source state. This removes
+        # source-state difficulty while preserving which sampled goal made more
+        # virtual progress than the alternatives.
+        advantages = (rewards - rewards.mean(dim=1, keepdim=True)).detach()
+        target_entropy = self._goal_target_entropy(
+            goals.shape[-1],
+            entropy.device,
+            entropy.dtype,
+        )
+        loss = self.policy_loss(
+            old_log_probs,
+            advantages,
+            entropy,
+            new_log_probs,
+            target_entropy=target_entropy,
+            loss_log_prefix="virtual_goal",
+        )
+        assert loss.shape == (), f"Expected scalar virtual goal PPO loss, got {loss.shape}"
+        assert torch.isfinite(loss), "Non-finite virtual goal PPO loss"
+
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
+        self.log_grads()
+        self.optimizer_policy.step()
+        self.policy_old.load_state_dict(self.policy.state_dict())
+
+        self.logger.log_scalar("high/virtual_goal/loss", loss.detach())
+        self.logger.log_scalar("high/virtual_goal/reward_mean", rewards.mean().detach())
+        self.logger.log_scalar("high/virtual_goal/entropy", entropy.mean().detach())
+        self.logger.log_scalar(
+            "high/virtual_goal/advantage_abs_mean",
+            advantages.abs().mean(),
+        )
+
+    def train_virtual_goal_imitation(self, episodes, step_indices, target_goals, coef=1.0, num_epochs=1):
+        assert target_goals.dim() in (2, 3), \
+            f"Expected virtual imitation targets [B,G] or [B,N,G], got {target_goals.shape}"
+        assert target_goals.shape[0] == len(episodes), \
+            "Expected one virtual imitation target per source episode"
+        assert torch.isfinite(target_goals).all(), "Non-finite virtual imitation targets"
+        assert coef > 0.0, f"Expected positive virtual imitation coefficient, got {coef}"
+        assert num_epochs >= 1, f"Expected at least one virtual imitation epoch, got {num_epochs}"
+
+        last_loss = None
+        for _ in range(num_epochs):
+            self.optimizer_policy.zero_grad()
+            loss, target_goals = self.compute_virtual_goal_imitation_loss(
+                episodes,
+                step_indices,
+                target_goals,
+                coef=coef,
+            )
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
+            self.log_grads()
+            self.optimizer_policy.step()
+
+            last_loss = loss.detach()
+
+        self.policy_old.load_state_dict(self.policy.state_dict())
+        self._log_virtual_goal_imitation_metrics(
+            episodes,
+            step_indices,
+            target_goals,
+            last_loss,
+        )
+
+    def compute_virtual_goal_imitation_loss(self, episodes, step_indices, target_goals,coef=1.0):
+        assert target_goals.dim() in (2, 3), f"Expected virtual imitation targets [B,G] or [B,N,G], got {target_goals.shape}"
+        assert target_goals.shape[0] == len(episodes), "Expected one virtual imitation target per source episode"
+        assert torch.isfinite(target_goals).all(), "Non-finite virtual imitation targets"
+        assert coef > 0.0, f"Expected positive virtual imitation coefficient, got {coef}"
+
+        target_goals = target_goals.to(self.device)
+        if target_goals.dim() == 2:
+            target_goals = target_goals.unsqueeze(1)
+        selected_states, goal_params = self._select_goal_policy_params(
+            episodes,
+            step_indices,
+            self.policy,
+        )
+        goal_dist = self._goal_distribution(goal_params)
+        mu = goal_dist.base_dist.loc
+        assert mu.shape == target_goals.shape[:1] + target_goals.shape[2:], \
+            f"Expected goal mean [B,G] for targets {target_goals.shape}, got {mu.shape}"
+        target_actions = self._absolute_goal_to_action(selected_states, target_goals)
+        mu_expanded = mu.unsqueeze(1).expand_as(target_actions)
+        loss = coef * (mu_expanded - target_actions).pow(2).mean()
+        assert loss.shape == (), f"Expected scalar virtual imitation loss, got {loss.shape}"
+        assert torch.isfinite(loss), "Non-finite virtual imitation loss"
+        return loss, target_goals
+
+    def _log_virtual_goal_imitation_metrics(self, episodes, step_indices, target_goals, loss):
+        with torch.no_grad():
+            updated_states, updated_goal_params = self._select_goal_policy_params(
+                episodes,
+                step_indices,
+                self.policy,
+            )
+            updated_mu = self._goal_distribution(updated_goal_params).base_dist.loc
+            target_actions = self._absolute_goal_to_action(updated_states, target_goals)
+            updated_mu_expanded = updated_mu.unsqueeze(1).expand_as(target_actions)
+            target_mean = target_actions.mean(dim=1)
+            oracle_mse = (target_actions - target_mean.unsqueeze(1)).pow(2).mean()
+            model_mse = (updated_mu_expanded - target_actions).pow(2).mean()
+            mu_target_dist = torch.linalg.vector_norm(
+                updated_mu_expanded - target_actions,
+                dim=-1,
+            ).mean()
+            mu_target_mean_dist = torch.linalg.vector_norm(
+                updated_mu - target_mean,
+                dim=-1,
+            ).mean()
+            mu_nearest_target_dist = torch.linalg.vector_norm(
+                updated_mu_expanded - target_actions,
+                dim=-1,
+            ).min(dim=1).values.mean()
+        self.logger.log_scalar("high/virtual_imitation/loss", loss)
+        self.logger.log_scalar(
+            "high/virtual_imitation/mu_target_dist",
+            mu_target_dist,
+        )
+        self.logger.log_scalar("high/virtual_imitation/model_mse", model_mse)
+        self.logger.log_scalar("high/virtual_imitation/oracle_mse", oracle_mse)
+        self.logger.log_scalar(
+            "high/virtual_imitation/excess_mse",
+            model_mse - oracle_mse,
+        )
+        self.logger.log_scalar(
+            "high/virtual_imitation/mu_target_mean_dist",
+            mu_target_mean_dist,
+        )
+        self.logger.log_scalar(
+            "high/virtual_imitation/mu_nearest_target_dist",
+            mu_nearest_target_dist,
+        )
+
+    def train_goal_constraint(self, episodes, step_indices, constraint_fn, max_kl, lr_scale, num_goal_samples):
+        assert max_kl > 0.0, f"Expected positive goal constraint max KL, got {max_kl}"
+        assert lr_scale > 0.0, f"Expected positive goal constraint LR scale, got {lr_scale}"
+        assert num_goal_samples >= 1, \
+            f"Expected at least one goal constraint sample, got {num_goal_samples}"
+        selected_states, initial_goal_params = self._select_goal_policy_params(
+            episodes,
+            step_indices,
+            self.policy,
+        )
+        old_goal_dist = self._goal_distribution(initial_goal_params.detach())
+        expanded_goal_params = initial_goal_params.unsqueeze(1).expand(
+            -1,
+            num_goal_samples,
+            -1,
+        )
+        _, sample_noise = self._sample_goal_with_noise(expanded_goal_params)
+        sampled_goal, _ = self._sample_goal_with_noise(
+            expanded_goal_params,
+            noise=sample_noise,
+        )
+        expanded_states = selected_states.unsqueeze(1).expand(
+            -1,
+            num_goal_samples,
+            -1,
+        )
+        flat_states = expanded_states.reshape(
+            selected_states.shape[0] * num_goal_samples,
+            selected_states.shape[1],
+        )
+        sampled_absolute_goal = self._goal_action_to_absolute(
+            expanded_states,
+            sampled_goal,
+        )
+        flat_goals = sampled_absolute_goal.reshape(
+            selected_states.shape[0] * num_goal_samples,
+            sampled_absolute_goal.shape[-1],
+        )
+        loss, expected_distance_before = constraint_fn(flat_states, flat_goals)
+        assert loss.shape == (), f"Expected scalar goal constraint loss, got {loss.shape}"
+        assert torch.isfinite(loss), "Non-finite goal constraint loss"
+        assert loss.requires_grad, "Goal constraint loss must backpropagate to the high policy"
+
+        policy_parameters = list(self.policy.parameters())
+        old_parameters = [parameter.detach().clone() for parameter in policy_parameters]
+        self.optimizer_policy.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(policy_parameters, 1.0)
+        self.log_grads()
+        policy_lrs = [group["lr"] for group in self.optimizer_policy.param_groups]
+        try:
+            for group, policy_lr in zip(self.optimizer_policy.param_groups, policy_lrs):
+                group["lr"] = policy_lr * lr_scale
+            self.optimizer_policy.step()
+        finally:
+            for group, policy_lr in zip(self.optimizer_policy.param_groups, policy_lrs):
+                group["lr"] = policy_lr
+
+        new_parameters = [parameter.detach().clone() for parameter in policy_parameters]
+        projection_scale = 1.0
+        with torch.no_grad():
+            _, updated_goal_params = self._select_goal_policy_params(
+                episodes,
+                step_indices,
+                self.policy,
+            )
+            updated_goal_dist = self._goal_distribution(updated_goal_params)
+            kl_before_projection = kl_divergence(old_goal_dist, updated_goal_dist).mean()
+            kl_after_projection = kl_before_projection
+            for _ in range(20):
+                if kl_after_projection <= max_kl:
+                    break
+                projection_scale *= 0.5
+                for parameter, old_parameter, new_parameter in zip(
+                    policy_parameters,
+                    old_parameters,
+                    new_parameters,
+                ):
+                    parameter.copy_(
+                        old_parameter + projection_scale * (new_parameter - old_parameter)
+                    )
+                _, updated_goal_params = self._select_goal_policy_params(
+                    episodes,
+                    step_indices,
+                    self.policy,
+                )
+                updated_goal_dist = self._goal_distribution(updated_goal_params)
+                kl_after_projection = kl_divergence(old_goal_dist, updated_goal_dist).mean()
+            assert kl_after_projection <= max_kl, \
+                f"Failed to project goal policy update below KL {max_kl}: {kl_after_projection}"
+
+            expanded_updated_goal_params = updated_goal_params.unsqueeze(1).expand(
+                -1,
+                num_goal_samples,
+                -1,
+            )
+            updated_goal, _ = self._sample_goal_with_noise(
+                expanded_updated_goal_params,
+                noise=sample_noise,
+            )
+            updated_absolute_goal = self._goal_action_to_absolute(
+                expanded_states,
+                updated_goal,
+            )
+            flat_updated_goals = updated_absolute_goal.reshape(
+                selected_states.shape[0] * num_goal_samples,
+                updated_absolute_goal.shape[-1],
+            )
+            _, expected_distance_after = constraint_fn(flat_states, flat_updated_goals)
+        self.logger.log_scalar("high/achievability_constraint/loss", loss.detach())
+        self.logger.log_scalar(
+            "high/achievability_constraint/expected_distance_before",
+            expected_distance_before,
+        )
+        self.logger.log_scalar(
+            "high/achievability_constraint/expected_distance_after",
+            expected_distance_after.detach(),
+        )
+        self.logger.log_scalar(
+            "high/achievability_constraint/kl_before_projection",
+            kl_before_projection,
+        )
+        self.logger.log_scalar(
+            "high/achievability_constraint/kl_after_projection",
+            kl_after_projection,
+        )
+        self.logger.log_scalar(
+            "high/achievability_constraint/projection_scale",
+            projection_scale,
+        )
+        self.policy_old.load_state_dict(self.policy.state_dict())
+
+    def _goal_distribution(self, goal_params):
+        goal_sampler = self.sampler.goal_sampler
+        assert not goal_sampler.transform, \
+            "Goal distribution diagnostics require an untransformed Normal distribution"
+        reference_goal = goal_params.new_zeros(
+            (*goal_params.shape[:-1], goal_sampler.action_dim)
+        )
+        _, _, goal_dist = goal_sampler(
+            goal_params,
+            actions=reference_goal,
+            return_distribution=True,
+        )
+        assert isinstance(goal_dist, Independent), \
+            f"Expected Independent goal distribution, got {type(goal_dist).__name__}"
+        assert isinstance(goal_dist.base_dist, Normal), \
+            f"Expected Normal goal base distribution, got {type(goal_dist.base_dist).__name__}"
+        return goal_dist
+
+    def _sample_goal_with_noise(self, goal_params, noise=None):
+        goal_sampler = self.sampler.goal_sampler
+        goal_dist = self._goal_distribution(goal_params)
+        loc = goal_dist.base_dist.loc
+        scale = goal_dist.base_dist.scale
+        if noise is None:
+            noise = torch.randn_like(loc)
+        else:
+            assert noise.shape == loc.shape, \
+                f"Expected shared goal noise {loc.shape}, got {noise.shape}"
+        goal = loc + scale * noise
+        goal = goal.clamp(goal_sampler.a_min + 1e-4, goal_sampler.a_max - 1e-4)
+        return goal, noise.detach()
 
     def _prepare_episode_batch(self, episodes):
         if isinstance(episodes, EpisodeBatch):
@@ -413,7 +864,12 @@ class GoalAgent(PPO):
 
         return EpisodeBatch(data_lists)
 
-    def train_policy_batch(self, episode_batch, num_minibatches=4):
+    def train_policy_batch(self, episode_batch, num_minibatches=4, virtual_imitation=None):
+        if virtual_imitation is not None:
+            assert num_minibatches == 1, \
+                "Combined high PPO and virtual imitation requires one full-batch policy step"
+            assert len(virtual_imitation) == 4, \
+                "virtual_imitation must be (episodes, step_indices, target_goals, coef)"
         padded, padding_mask, _ = episode_batch.pad(fields=self.pad_fields)
         padding_mask = padding_mask.to(self.device)
         states_padded = to_device(padded["states"], self.device)
@@ -445,6 +901,7 @@ class GoalAgent(PPO):
         self.policy.load_state_dict(self.policy_old.state_dict())
         obs_for_policy = self._build_policy_obs(states_padded, padding_mask)
         update_idx = 0
+        imitation_metrics = None
         for minibatch in self.iterate_minibatches(
             num_minibatches,
             padding_mask.shape[0],
@@ -487,9 +944,30 @@ class GoalAgent(PPO):
                 switch_adv,
                 entropy["switch"],
                 logp_new["switch"],
+                target_entropy=self.switch_target_entropy,
                 return_parts=True,
+                loss_log_prefix="switch",
             )
             policy_loss = goal_loss + switch_loss
+
+            imitation_loss = None
+            if virtual_imitation is not None:
+                imitation_episodes, imitation_steps, imitation_targets, imitation_coef = \
+                    virtual_imitation
+                imitation_loss, normalized_targets = self.compute_virtual_goal_imitation_loss(
+                    imitation_episodes,
+                    imitation_steps,
+                    imitation_targets,
+                    coef=imitation_coef,
+                )
+                policy_loss = policy_loss + imitation_loss
+                imitation_metrics = (
+                    imitation_episodes,
+                    imitation_steps,
+                    normalized_targets,
+                    imitation_loss.detach(),
+                )
+                self.logger.log_scalar("combined/policy_loss", policy_loss.detach())
             if update_idx == 0:
                 grad_losses = {}
                 if "ppo" in goal_loss_parts:
@@ -498,6 +976,8 @@ class GoalAgent(PPO):
                     grad_losses["goal_entropy"] = self._grad_probe_loss(goal_loss_parts["entropy"])
                 grad_losses["switch_ppo"] = self._grad_probe_loss(switch_loss_parts["ppo"])
                 grad_losses["switch_entropy"] = self._grad_probe_loss(switch_loss_parts["entropy"])
+                if imitation_loss is not None:
+                    grad_losses["virtual_imitation"] = imitation_loss
                 self._log_loss_grad_stats(grad_losses)
             policy_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1)
@@ -505,7 +985,12 @@ class GoalAgent(PPO):
             self.optimizer_policy.step()
             update_idx += 1
 
+        if virtual_imitation is not None:
+            assert update_idx == 1, \
+                f"Combined high policy update must take one optimizer step, got {update_idx}"
         self.policy_old.load_state_dict(self.policy.state_dict())
+        if imitation_metrics is not None:
+            self._log_virtual_goal_imitation_metrics(*imitation_metrics)
 
     def train_value_heads(self, states_flat, goal_returns, switch_returns, value_epochs=2, num_minibatches=2):
         if goal_returns.numel() == 0:
@@ -554,7 +1039,10 @@ class GoalAgent(PPO):
             values = self.value_head(states_batch, head)
             values = values * (1 - padding_mask.float())
         advantages = gae(self.discount, self.lambda_discount, rewards_batch, values)
-        advantages, advantage_mean, advantage_std = normalize_padded_returns(advantages, padding_mask)
+        advantages, advantage_mean, advantage_std = self._center_advantages(
+            advantages,
+            padding_mask,
+        )
         self.logger.log_scalar(f"{head}/advantage_mean", advantage_mean.item())
         self.logger.log_scalar(f"{head}/advantage_std", advantage_std.item())
         return advantages
@@ -563,10 +1051,23 @@ class GoalAgent(PPO):
         with torch.no_grad():
             values = self.value_head(states_batch, head)
         advantages = returns_batch - values
-        advantages, advantage_mean, advantage_std = normalize_padded_returns(advantages, padding_mask)
+        advantages, advantage_mean, advantage_std = self._center_advantages(
+            advantages,
+            padding_mask,
+        )
         self.logger.log_scalar(f"{head}/advantage_mean", advantage_mean.item())
         self.logger.log_scalar(f"{head}/advantage_std", advantage_std.item())
         return advantages
+
+    def _center_advantages(self, advantages, padding_mask):
+        valid = ~padding_mask
+        assert valid.any(), "High-level advantage batch must contain valid steps"
+        valid_advantages = advantages[valid]
+        advantage_mean = valid_advantages.mean()
+        advantage_std = valid_advantages.std()
+        centered = torch.zeros_like(advantages)
+        centered[valid] = valid_advantages - advantage_mean
+        return centered, advantage_mean, advantage_std
 
     def compute_distribution_params(self, observations, actions, key_padding_mask):
         policy_params = self.policy(observations, reset_mask=None)
@@ -608,6 +1109,7 @@ class GoalAgent(PPO):
             mu=mu_selected,
             target_entropy=target_entropy,
             return_parts=return_parts,
+            loss_log_prefix="goal",
         )
 
     def _dist_entropy(self, dist):

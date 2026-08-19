@@ -11,30 +11,28 @@ from util import EpisodeBatch, compute_returns_list, flatten_padded, gae, normal
 class LowLevelAgent(PPO):
     grad_probe_episodes = 10
 
-    def __init__(self, *args, achievability_head, **kwargs):
+    def __init__(
+        self,
+        *args,
+        achievability_head,
+        achievability_lr=3e-4,
+        achievability_epochs=4,
+        **kwargs,
+    ):
         self.achievability_head = achievability_head
+        self.achievability_lr = achievability_lr
+        self.achievability_epochs = achievability_epochs
+        if self.achievability_lr <= 0.0:
+            raise ValueError("achievability_lr must be positive")
+        if self.achievability_epochs < 1:
+            raise ValueError("achievability_epochs must be >= 1")
         super().__init__(*args, **kwargs)
         self.optimizer_achievability = optim.Adam(
             self.achievability_head.parameters(),
-            lr=self.value_lr,
+            lr=self.achievability_lr,
         )
 
-    def train_achievability(self, states, min_distances, achieved):
-        states = states.to(self.device)
-        min_distances = min_distances.to(self.device)
-        achieved = achieved.to(self.device)
-        assert states.dim() == 2, f"Expected achievability states [N,D], got {states.shape}"
-        assert min_distances.shape == (states.shape[0],), \
-            f"Expected min distances [N], got {min_distances.shape}"
-        assert achieved.shape == (states.shape[0],), \
-            f"Expected achieved labels [N], got {achieved.shape}"
-        assert torch.isfinite(states).all(), "Non-finite achievability states"
-        assert torch.isfinite(min_distances).all(), "Non-finite achievability distance targets"
-        assert torch.isfinite(achieved).all(), "Non-finite achievability labels"
-        assert (min_distances >= 0.0).all(), "Achievability distances must be non-negative"
-        assert ((achieved == 0.0) | (achieved == 1.0)).all(), \
-            "Achievability labels must be binary"
-
+    def _achievability_loss(self, states, attempt_min_distances, success_rates):
         prediction = self.achievability_head(states)
         assert prediction.shape == (states.shape[0], 3), \
             f"Expected achievability output [N,3], got {prediction.shape}"
@@ -42,42 +40,91 @@ class LowLevelAgent(PPO):
         log_distance_scale = F.softplus(prediction[:, 1]) + 1e-4
         success_logit = prediction[:, 2]
 
-        shifted_distance = min_distances + 1e-6
-        distance_nll = -LogNormal(log_distance_mean, log_distance_scale).log_prob(shifted_distance).mean()
-        success_bce = F.binary_cross_entropy_with_logits(success_logit, achieved)
-        loss = distance_nll + success_bce
+        distance_dist = LogNormal(log_distance_mean, log_distance_scale)
+        # Distance represents potential reachability: one successful branch is
+        # enough to make a goal useful. The success head separately models how
+        # reliably the low-level policy reaches it across all attempts.
+        best_distance = attempt_min_distances.min(dim=-1).values
+        shifted_distance = best_distance + 1e-6
+        distance_nll = -distance_dist.log_prob(shifted_distance).mean()
+        success_bce = F.binary_cross_entropy_with_logits(success_logit, success_rates)
+        return distance_nll + success_bce, distance_nll, success_bce, prediction
 
-        self.optimizer_achievability.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.achievability_head.parameters(), 1.0)
-        self.optimizer_achievability.step()
+    def train_achievability(
+        self,
+        states,
+        attempt_min_distances,
+        success_rates,
+    ):
+        states = states.to(self.device)
+        attempt_min_distances = attempt_min_distances.to(self.device)
+        success_rates = success_rates.to(self.device)
+        assert states.dim() == 2, f"Expected achievability states [N,D], got {states.shape}"
+        assert attempt_min_distances.dim() == 2, \
+            f"Expected attempt distances [N,A], got {attempt_min_distances.shape}"
+        assert attempt_min_distances.shape[0] == states.shape[0], \
+            "Achievability state and attempt batches must match"
+        assert success_rates.shape == (states.shape[0],), \
+            f"Expected success rates [N], got {success_rates.shape}"
+        assert torch.isfinite(states).all(), "Non-finite achievability states"
+        assert torch.isfinite(attempt_min_distances).all(), \
+            "Non-finite achievability distance targets"
+        assert torch.isfinite(success_rates).all(), "Non-finite achievability success rates"
+        assert (attempt_min_distances >= 0.0).all(), \
+            "Achievability distances must be non-negative"
+        assert ((success_rates >= 0.0) & (success_rates <= 1.0)).all(), \
+            "Achievability success rates must be in [0,1]"
+
+        for _ in range(self.achievability_epochs):
+            loss, _, _, _ = self._achievability_loss(
+                states,
+                attempt_min_distances,
+                success_rates,
+            )
+            self.optimizer_achievability.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.achievability_head.parameters(), 1.0)
+            self.optimizer_achievability.step()
 
         with torch.no_grad():
+            loss, distance_nll, success_bce, prediction = self._achievability_loss(
+                states,
+                attempt_min_distances,
+                success_rates,
+            )
+            log_distance_mean = prediction[:, 0]
+            log_distance_scale = F.softplus(prediction[:, 1]) + 1e-4
+            success_logit = prediction[:, 2]
             predicted_distance = (log_distance_mean.exp() - 1e-6).clamp_min(0.0)
+            predicted_expected_distance = torch.exp(
+                log_distance_mean + 0.5 * log_distance_scale.square()
+            )
+            assert torch.isfinite(predicted_expected_distance).all(), \
+                "Non-finite predicted achievability expected distance"
             success_probability = success_logit.sigmoid()
-            predicted_success = success_probability >= 0.5
-            target_success = achieved.bool()
-            true_positive = (predicted_success & target_success).sum().to(torch.float32)
-            false_positive = (predicted_success & ~target_success).sum().to(torch.float32)
-            false_negative = (~predicted_success & target_success).sum().to(torch.float32)
-            true_negative = (~predicted_success & ~target_success).sum().to(torch.float32)
-            positive_f1 = 2.0 * true_positive / (
-                2.0 * true_positive + false_positive + false_negative
-            ).clamp_min(1.0)
-            negative_f1 = 2.0 * true_negative / (
-                2.0 * true_negative + false_positive + false_negative
-            ).clamp_min(1.0)
-            balanced_f1 = 0.5 * (positive_f1 + negative_f1)
+            target_best_distance = attempt_min_distances.min(dim=-1).values
             self.logger.log_scalar("achievability/loss", loss.item())
             self.logger.log_scalar("achievability/distance_nll", distance_nll.item())
             self.logger.log_scalar("achievability/success_bce", success_bce.item())
             self.logger.log_scalar("achievability/predicted_distance_median", predicted_distance.mean().item())
             self.logger.log_scalar(
                 "achievability/distance_mae",
-                (predicted_distance - min_distances).abs().mean().item(),
+                (predicted_distance - target_best_distance).abs().mean().item(),
+            )
+            self.logger.log_scalar(
+                "achievability/expected_distance_mae",
+                (predicted_expected_distance - target_best_distance).abs().mean().item(),
             )
             self.logger.log_scalar("achievability/predicted_success_rate", success_probability.mean().item())
-            self.logger.log_scalar("achievability/success_balanced_f1", balanced_f1.item())
+            self.logger.log_scalar("achievability/target_success_rate", success_rates.mean().item())
+            self.logger.log_scalar(
+                "achievability/success_rate_mae",
+                (success_probability - success_rates).abs().mean().item(),
+            )
+            self.logger.log_scalar(
+                "achievability/success_brier",
+                (success_probability - success_rates).pow(2).mean().item(),
+            )
 
     def get_state_dict(self):
         state_dict = super().get_state_dict()
@@ -93,6 +140,8 @@ class LowLevelAgent(PPO):
         self.achievability_head.load_state_dict(state_dict["achievability_head"])
         if "optimizer_achievability" in state_dict:
             self.optimizer_achievability.load_state_dict(state_dict["optimizer_achievability"])
+            for param_group in self.optimizer_achievability.param_groups:
+                param_group["lr"] = self.achievability_lr
         else:
             self.logger.warn("Checkpoint has no achievability optimizer; using fresh optimizer state")
 
@@ -114,7 +163,7 @@ class LowLevelAgent(PPO):
         }).to(self.device)
 
     def compute_hindsight_loss(self, states_padded, negative_states_padded, actions_padded, 
-                               weights_padded, padding_mask, coef=0.05, positive_coef=0.01,
+                               weights_padded, padding_mask, coef=0.05, positive_coef=0.0,
                                margin=0.2, return_parts=False):
         weights_flat = flatten_padded(weights_padded.unsqueeze(-1).to(self.device), padding_mask).squeeze(-1)
         selected = weights_flat > 0.0

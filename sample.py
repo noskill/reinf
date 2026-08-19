@@ -45,7 +45,7 @@ class NormalActionSampler(ActionSampler):
         self.reparameterize = reparameterize
         self.transform = transform
 
-    def __call__(self, params, actions=None, return_distribution=False):
+    def __call__(self, params, actions=None, return_distribution=False, reparameterize=None):
         assert params.shape[-1] == 2 * self.action_dim, \
             f"Network output dimension {params.shape[-1]} does not match 2 * action_dim ({2 * self.action_dim})"
 
@@ -79,7 +79,8 @@ class NormalActionSampler(ActionSampler):
             log_prob = dist.log_prob(actions)
             action = actions
         else:
-            if self.reparameterize:
+            use_reparameterization = self.reparameterize if reparameterize is None else reparameterize
+            if use_reparameterization:
                 action = dist.rsample()
             else:
                 action = dist.sample()

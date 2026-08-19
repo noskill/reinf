@@ -25,6 +25,7 @@ class ReinforceBase(Agent):
         log_prefix=None,
         entropy_coef=0.005,
         target_entropy=2,
+        mu_coef=0.001,
         exp_adv=False,
         **kwargs
     ):
@@ -42,13 +43,16 @@ class ReinforceBase(Agent):
         self.entropy_thresh = 1
         super().__init__(logger=logger, log_prefix=log_prefix, **kwargs)
         self.target_entropy = torch.tensor(target_entropy, dtype=torch.float16)
-        self.mu_coef = 0.001
+        self.mu_coef = mu_coef
+        if self.mu_coef < 0.0:
+            raise ValueError("mu_coef must be non-negative")
         self.exp_adv_scale_coeff = 0.5
         self.hparams.update( {
             'policy_lr': policy_lr,
             'discount': discount,
             'entropy_coef': self.entropy_coef,
             'entropy_thresh': target_entropy,
+            'mu_coef': self.mu_coef,
             'exp_adv_scale_coeff': self.exp_adv_scale_coeff,
             'exp_adv': 'exp_adv'
         })
@@ -363,6 +367,8 @@ class ReinforceBase(Agent):
     def compute_mu_loss(self, states_batch):
         # mu loss for normal distribution (continuous action space) - keep values not too extreme
         mu_loss = torch.tensor(0.0, device=self.device)
+        if self.mu_coef == 0.0:
+            return mu_loss
         if states_batch is not None and isinstance(self.sampler, NormalActionSampler):
             out = self.policy(states_batch, episode_start=None)
             mu, _ = self.sampler.split_out(out)

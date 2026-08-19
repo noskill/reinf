@@ -144,12 +144,55 @@ def parse_args():
     parser.add_argument("--high-warmup-goal-coef", type=float, default=0.005)
     parser.add_argument("--high-warmup-goal-epochs", type=int, default=1)
     parser.add_argument("--low-virtual-cpc-error-threshold", type=float, default=2.0)
-    parser.add_argument("--achievability-warmup-updates", type=int, default=100)
-    parser.add_argument("--high-goal-ramp-updates", type=int, default=500)
+    parser.add_argument("--achievability-warmup-updates", type=int, default=300)
+    parser.add_argument("--achievability-lr", type=float, default=3e-4)
+    parser.add_argument("--achievability-epochs", type=int, default=4)
     parser.add_argument("--high-goal-max-fraction", type=float, default=0.5)
     parser.add_argument("--high-achievability-coef", type=float, default=0.1)
+    parser.add_argument("--high-achievability-max-kl", type=float, default=0.2)
+    parser.add_argument("--high-achievability-lr-scale", type=float, default=4.0)
+    parser.add_argument("--high-achievability-policy-updates", type=int, default=1)
+    parser.add_argument("--high-achievability-overfit", action="store_true", default=False)
+    parser.add_argument("--high-policy-epochs", type=int, default=1)
+    parser.add_argument("--high-policy-ppo-clip-param", type=float, default=0.1)
+    parser.add_argument("--virtual-horizon", type=int, default=3)
+    parser.add_argument("--high-virtual-goal-ppo", action="store_true", default=False)
+    parser.add_argument("--high-virtual-goal-imitation", action="store_true", default=False)
+    parser.add_argument("--high-virtual-goal-imitation-coef", type=float, default=1.0)
+    parser.add_argument("--high-virtual-goal-imitation-epochs", type=int, default=1)
+    parser.add_argument(
+        "--high-virtual-goal-imitation-all-targets",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--high-virtual-goal-imitation-fixed-dataset",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--high-virtual-goal-imitation-replay-capacity",
+        type=int,
+        default=0,
+    )
+    parser.add_argument(
+        "--high-virtual-goal-imitation-replay-samples",
+        type=int,
+        default=64,
+    )
+    parser.add_argument("--high-goal-output-delta", action="store_true", default=False)
+    parser.add_argument("--high-virtual-goal-candidates", type=int, default=4)
+    parser.add_argument("--high-virtual-goal-attempts", type=int, default=2)
+    parser.add_argument("--high-virtual-goal-distance-penalty", type=float, default=0.1)
     parser.add_argument("--high-goal-target-entropy", type=float, default=None)
+    parser.add_argument("--high-switch-target-entropy", type=float, default=0.65)
     parser.add_argument("--reset-high-agent", action="store_true", default=False)
+    parser.add_argument(
+        "--low-fixed",
+        action="store_true",
+        default=False,
+        help="Freeze low-level policy, value function, and achievability head.",
+    )
     parser.add_argument(
         "--wm-fixed",
         action="store_true",

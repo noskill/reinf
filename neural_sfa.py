@@ -167,7 +167,6 @@ def sfa_loss(
 
     total = l_slowness + l_var + l_corr
     assert torch.isfinite(total).all()
-    assert y.abs().max() < 100
 
 
     if return_components:

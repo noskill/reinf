@@ -291,7 +291,17 @@ class PPOBase(VPGBase):
 
         self.policy_old.load_state_dict(self.policy.state_dict())
 
-    def policy_loss(self, log_probs_old, advantages, entropy, log_probs_new, mu=None, target_entropy=None, return_parts=False):
+    def policy_loss(
+        self,
+        log_probs_old,
+        advantages,
+        entropy,
+        log_probs_new,
+        mu=None,
+        target_entropy=None,
+        return_parts=False,
+        loss_log_prefix=None,
+    ):
         # Shape alignment and checks
         for name, t in (('log_probs_old', log_probs_old), ('advantages', advantages), ('entropy', entropy), ('log_probs_new', log_probs_new)):
             assert t.dim() in (1, 2), f"{name} must be 1D or 2D, got {t.shape}"
@@ -318,7 +328,7 @@ class PPOBase(VPGBase):
 
         # Optional mu regularizer
         mu_loss = torch.tensor(0.0, device=self.device)
-        if mu is not None:
+        if mu is not None and self.mu_coef > 0.0:
             mu_loss = self.mu_loss(mu)
             self.logger.log_scalar("mu loss:", mu_loss.item())
 
@@ -353,8 +363,23 @@ class PPOBase(VPGBase):
         policy_loss = ppo_loss + entropy_term + mu_term
         if policy_loss > 100:
             import pdb; pdb.set_trace()
-        self.logger.log_scalar("entropy mean:", entropy.mean())
-        self.logger.log_scalar("entropy loss:", e_loss)
+        log_prefix = f"{loss_log_prefix}/" if loss_log_prefix is not None else ""
+        self.logger.log_scalar(f"{log_prefix}entropy mean:", entropy.mean())
+        self.logger.log_scalar(f"{log_prefix}entropy loss:", e_loss)
+        if target_entropy is not None:
+            target_entropy_tensor = torch.as_tensor(
+                target_entropy,
+                device=entropy.device,
+                dtype=entropy.dtype,
+            )
+            self.logger.log_scalar(
+                f"{log_prefix}entropy target:",
+                target_entropy_tensor,
+            )
+            self.logger.log_scalar(
+                f"{log_prefix}entropy error:",
+                entropy.mean() - target_entropy_tensor,
+            )
         self.logger.log_scalar("policy loss:", policy_loss.item())
         if return_parts:
             return policy_loss, {
