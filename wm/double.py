@@ -1,8 +1,9 @@
 import torch
+import torch.nn.functional as F
 from typing import Dict
 
 from ppo import PPOBase
-from wm_joint_agent import BaseWMOnPolicy
+from wm_joint_agent import BaseWMOnPolicy, _WMEpisodePool
 from util import EpisodeBatch
 
 
@@ -16,30 +17,126 @@ class DoubleAgent(BaseWMOnPolicy):
         self.agent_high = agent_high
         self.agent_low = agent_low
         self.agents = [self.agent_high, self.agent_low]
+        self.low_fixed = kwargs.pop("low_fixed", False)
         self.high_warmup_goal_coef = float(kwargs.pop("high_warmup_goal_coef", 0.005))
         self.high_warmup_goal_epochs = int(kwargs.pop("high_warmup_goal_epochs", 1))
-        self.achievability_warmup_updates = int(kwargs.pop("achievability_warmup_updates", 100))
-        self.high_goal_ramp_updates = int(kwargs.pop("high_goal_ramp_updates", 500))
+        self.achievability_warmup_updates = int(kwargs.pop("achievability_warmup_updates", 300))
         self.high_goal_max_fraction = float(kwargs.pop("high_goal_max_fraction", 0.5))
         self.high_achievability_coef = float(kwargs.pop("high_achievability_coef", 0.1))
+        self.high_achievability_max_kl = float(kwargs.pop("high_achievability_max_kl", 0.05))
+        self.high_achievability_lr_scale = float(kwargs.pop("high_achievability_lr_scale", 4.0))
+        self.high_achievability_policy_updates = int(
+            kwargs.pop("high_achievability_policy_updates", 1)
+        )
+        self.high_achievability_overfit = bool(kwargs.pop("high_achievability_overfit", False))
+        self.virtual_horizon = int(kwargs.pop("virtual_horizon", 3))
+        self.high_virtual_goal_ppo = kwargs.pop("high_virtual_goal_ppo", False)
+        self.high_virtual_goal_imitation = kwargs.pop("high_virtual_goal_imitation", False)
+        self.high_virtual_goal_imitation_coef = kwargs.pop(
+            "high_virtual_goal_imitation_coef",
+            1.0,
+        )
+        self.high_virtual_goal_imitation_epochs = kwargs.pop(
+            "high_virtual_goal_imitation_epochs",
+            1,
+        )
+        self.high_virtual_goal_imitation_all_targets = kwargs.pop(
+            "high_virtual_goal_imitation_all_targets",
+            False,
+        )
+        self.high_virtual_goal_imitation_fixed_dataset = kwargs.pop(
+            "high_virtual_goal_imitation_fixed_dataset",
+            False,
+        )
+        self.high_virtual_goal_imitation_replay_capacity = kwargs.pop(
+            "high_virtual_goal_imitation_replay_capacity",
+            0,
+        )
+        self.high_virtual_goal_imitation_replay_samples = kwargs.pop(
+            "high_virtual_goal_imitation_replay_samples",
+            self.num_envs,
+        )
+        self.high_virtual_goal_candidates = kwargs.pop("high_virtual_goal_candidates", 4)
+        self.high_virtual_goal_attempts = kwargs.pop("high_virtual_goal_attempts", 2)
+        self.high_virtual_goal_distance_penalty = kwargs.pop(
+            "high_virtual_goal_distance_penalty",
+            0.1,
+        )
         self.low_virtual_cpc_error_threshold = float(
             kwargs.pop("low_virtual_cpc_error_threshold", 2.0)
         )
         if self.achievability_warmup_updates < 0:
             raise ValueError("achievability_warmup_updates must be >= 0")
-        if self.high_goal_ramp_updates < 0:
-            raise ValueError("high_goal_ramp_updates must be >= 0")
         if not 0.0 <= self.high_goal_max_fraction <= 1.0:
             raise ValueError("high_goal_max_fraction must be in [0, 1]")
         if self.high_achievability_coef < 0.0:
             raise ValueError("high_achievability_coef must be >= 0")
+        if self.high_achievability_max_kl <= 0.0:
+            raise ValueError("high_achievability_max_kl must be positive")
+        if self.high_achievability_lr_scale <= 0.0:
+            raise ValueError("high_achievability_lr_scale must be positive")
+        if self.high_achievability_policy_updates < 1:
+            raise ValueError("high_achievability_policy_updates must be >= 1")
+        if self.virtual_horizon < 1:
+            raise ValueError("virtual_horizon must be >= 1")
+        if self.high_virtual_goal_candidates < 2:
+            raise ValueError("high_virtual_goal_candidates must be >= 2")
+        if self.high_virtual_goal_attempts < 1:
+            raise ValueError("high_virtual_goal_attempts must be >= 1")
+        if self.high_virtual_goal_distance_penalty < 0.0:
+            raise ValueError("high_virtual_goal_distance_penalty must be >= 0")
+        if self.high_virtual_goal_ppo and self.high_virtual_goal_imitation:
+            raise ValueError(
+                "--high-virtual-goal-ppo and --high-virtual-goal-imitation are mutually exclusive"
+            )
+        if self.high_virtual_goal_imitation_coef <= 0.0:
+            raise ValueError("high_virtual_goal_imitation_coef must be positive")
+        if self.high_virtual_goal_imitation_epochs < 1:
+            raise ValueError("high_virtual_goal_imitation_epochs must be >= 1")
+        if self.high_virtual_goal_imitation_replay_capacity < 0:
+            raise ValueError("high_virtual_goal_imitation_replay_capacity must be >= 0")
+        if self.high_virtual_goal_imitation_replay_samples < 1:
+            raise ValueError("high_virtual_goal_imitation_replay_samples must be >= 1")
+        if self.high_virtual_goal_imitation_fixed_dataset \
+                and self.high_virtual_goal_imitation_replay_capacity > 0:
+            raise ValueError(
+                "Fixed high imitation dataset and high imitation replay are mutually exclusive"
+            )
         self._low_virtual_cpc_error_ema = None
+        self._virtual_sfa_delta_mean = None
         self._virtual_sfa_delta_std_ema = None
         self._low_virtual_started = False
         self._achievability_updates = 0
         self._high_goal_enabled = None
+        self._high_virtual_imitation_dataset = None
+        self._high_virtual_imitation_pool = None
+        if self.high_virtual_goal_imitation_replay_capacity > 0:
+            self._high_virtual_imitation_pool = _WMEpisodePool(
+                num_envs=self.high_virtual_goal_imitation_replay_samples,
+                pool_size=self.high_virtual_goal_imitation_replay_capacity,
+            )
         self.reset_high_agent_on_load = bool(kwargs.pop("reset_high_agent_on_load", False))
         BaseWMOnPolicy.__init__(self, device=device, logger=logger, **kwargs)
+        if self.low_fixed:
+            for module in (
+                self.agent_low.policy,
+                self.agent_low.value,
+                self.agent_low.achievability_head,
+            ):
+                module.requires_grad_(False)
+                module.eval()
+        if self.high_achievability_overfit:
+            if not self.wm_fixed:
+                raise ValueError("high_achievability_overfit requires --wm-fixed")
+            if self.high_goal_max_fraction != 0.0:
+                raise ValueError("high_achievability_overfit requires --high-goal-max-fraction 0")
+            if self.high_virtual_goal_ppo:
+                raise ValueError("high_achievability_overfit is incompatible with --high-virtual-goal-ppo")
+            if self.high_virtual_goal_imitation:
+                raise ValueError(
+                    "high_achievability_overfit is incompatible with "
+                    "--high-virtual-goal-imitation"
+                )
         self.br = False
 
     @property
@@ -77,10 +174,16 @@ class DoubleAgent(BaseWMOnPolicy):
         self.agent_high.process_dones(dones)
 
     def train(self):
-        for agent in self.agents:
-            agent.policy.train()
-            agent.value.train()
-        self.agent_low.achievability_head.train()
+        self.agent_high.policy.train()
+        self.agent_high.value.train()
+        if self.low_fixed:
+            self.agent_low.policy.eval()
+            self.agent_low.value.eval()
+            self.agent_low.achievability_head.eval()
+        else:
+            self.agent_low.policy.train()
+            self.agent_low.value.train()
+            self.agent_low.achievability_head.train()
 
     def clear_completed(self):
         self.agent_low.clear_completed()
@@ -133,16 +236,9 @@ class DoubleAgent(BaseWMOnPolicy):
         )
 
     def _high_goal_mix_probability(self):
-        if not self._low_virtual_started:
+        if not self._high_goal_ready():
             return 0.0
-        trained_updates = self._achievability_updates - self.achievability_warmup_updates
-        if trained_updates < 0:
-            return 0.0
-        if self.high_goal_ramp_updates == 0:
-            ramp = 1.0
-        else:
-            ramp = min(1.0, trained_updates / self.high_goal_ramp_updates)
-        return self.high_goal_max_fraction * ramp
+        return self.high_goal_max_fraction
 
     def _high_goal_ready(self):
         return self._low_virtual_started and self._achievability_updates >= self.achievability_warmup_updates
@@ -179,6 +275,11 @@ class DoubleAgent(BaseWMOnPolicy):
             assert x.shape[1] == 1, f"Expected online one-step feature, got time dim {x.shape[1]}"
             return x[:, -1, :]
         return x
+
+    def _achievability_success_threshold(self):
+        assert self._virtual_sfa_delta_mean is not None, \
+            "Achievability success threshold requires initialized virtual SFA delta statistics"
+        return float(self._virtual_sfa_delta_mean)
 
     def _cpc_surprise(self, cpc, episode_start):
         prev_h, prev_action = self.agent_high.prediction_context()
@@ -373,11 +474,15 @@ class DoubleAgent(BaseWMOnPolicy):
         sfa_delta = torch.linalg.vector_norm(next_sfa_seq - sfa_seq, dim=-1)
         cpc_delta = torch.linalg.vector_norm(next_cpc_seq - cpc_seq, dim=-1)
         sensor_delta = torch.linalg.vector_norm(next_sensor_latent_seq - sensor_latent_seq, dim=-1)
+        sfa_delta_mean = sfa_delta.mean()
         sfa_delta_std = sfa_delta.std(unbiased=False)
         cpc_delta_std = cpc_delta.std(unbiased=False)
         sensor_delta_std = sensor_delta.std(unbiased=False)
+        if not torch.isfinite(sfa_delta_mean) or sfa_delta_mean <= 0.0:
+            raise ValueError(f"Expected positive finite virtual SFA delta mean, got {sfa_delta_mean}")
         if not torch.isfinite(sfa_delta_std) or sfa_delta_std <= 0.0:
             raise ValueError(f"Expected positive finite virtual SFA delta std, got {sfa_delta_std}")
+        self._virtual_sfa_delta_mean = float(sfa_delta_mean.detach())
         sfa_delta_std_value = float(sfa_delta_std.detach())
         if self._virtual_sfa_delta_std_ema is None:
             self._virtual_sfa_delta_std_ema = sfa_delta_std_value
@@ -415,7 +520,7 @@ class DoubleAgent(BaseWMOnPolicy):
         self.logger.log_scalar("low/virtual_step_effect_mean", step_effect.mean())
         self.logger.log_scalar("low/virtual_step_valid_frac", step_valid.to(torch.float32).mean())
         self.logger.log_scalar("low/virtual_weight_mean", weights.mean())
-        self.logger.log_scalar("low/virtual_sfa_delta_mean", sfa_delta.mean())
+        self.logger.log_scalar("low/virtual_sfa_delta_mean", sfa_delta_mean)
         self.logger.log_scalar("low/virtual_sfa_delta_std", sfa_delta_std)
         self.logger.log_scalar("low/virtual_sfa_delta_std_ema", self._virtual_sfa_delta_std_ema)
         self.logger.log_scalar("low/virtual_cpc_delta_mean", cpc_delta.mean())
@@ -424,11 +529,24 @@ class DoubleAgent(BaseWMOnPolicy):
         self.logger.log_scalar("low/virtual_sensor_delta_std", sensor_delta_std)
 
         terminal_sfa = sfa.reshape(batch_size, num_rollouts, sfa.shape[-1])
+        rollout_goal_distances = episode_goal_distance.reshape(batch_size, num_rollouts)
+        rollout_valid = valid.reshape(batch_size, num_rollouts)
+        assert rollout_valid.any(dim=1).all(), \
+            "Every source state must have at least one valid virtual rollout"
+        best_scores = rollout_goal_distances.masked_fill(~rollout_valid, float("-inf"))
+        best_indices = best_scores.argmax(dim=1)
+        row_indices = torch.arange(batch_size, device=self.device)
+        best_goals = terminal_sfa[row_indices, best_indices]
+        best_goal_distances = rollout_goal_distances[row_indices, best_indices]
         candidate_indices = torch.randint(num_rollouts, (batch_size,), device=self.device)
-        candidate_goals = terminal_sfa[torch.arange(batch_size, device=self.device), candidate_indices]
+        candidate_goals = terminal_sfa[row_indices, candidate_indices]
         source_sfa = replay_sfa
         candidate_goal_distance = torch.linalg.vector_norm(candidate_goals - source_sfa, dim=-1)
         self.logger.log_scalar("low/virtual_candidate_goal_distance", candidate_goal_distance.mean())
+        self.logger.log_scalar(
+            "high/virtual_imitation/target_distance",
+            best_goal_distances.mean(),
+        )
 
         hindsight = (
             [s.detach().cpu() for s in states],
@@ -436,9 +554,82 @@ class DoubleAgent(BaseWMOnPolicy):
             [w.detach().cpu() for w in weights],
             [neg.detach().cpu() for neg in negative_states],
         )
-        return hindsight, candidate_goals.detach()
+        return (
+            hindsight,
+            candidate_goals.detach(),
+            best_goals.detach(),
+            terminal_sfa.detach(),
+        )
 
-    def _collect_low_virtual_achievability(
+    def _get_high_virtual_imitation_dataset(
+        self,
+        high_episodes,
+        step_indices,
+        target_goals,
+    ):
+        """Return a fixed dataset for the imitation overfitting test."""
+        if not self.high_virtual_goal_imitation_fixed_dataset:
+            return high_episodes, step_indices, target_goals
+        if self._high_virtual_imitation_dataset is None:
+            frozen_episodes = [
+                [(step[0].detach().cpu(),) for step in episode]
+                for episode in high_episodes
+            ]
+            self._high_virtual_imitation_dataset = (
+                frozen_episodes,
+                step_indices.detach().cpu(),
+                target_goals.detach().cpu(),
+            )
+        return self._high_virtual_imitation_dataset
+
+    def _get_high_virtual_imitation_replay(
+        self,
+        high_episodes,
+        step_indices,
+        target_goals,
+    ):
+        if self._high_virtual_imitation_pool is None:
+            return high_episodes, step_indices, target_goals
+        assert len(high_episodes) == len(step_indices) == target_goals.shape[0], \
+            "High imitation replay inputs must have one record per source episode"
+
+        for episode, step_idx, targets in zip(high_episodes, step_indices, target_goals):
+            source_step = int(step_idx.item())
+            assert 0 <= source_step < len(episode), \
+                f"High imitation source step {source_step} outside episode length {len(episode)}"
+            prefix = [
+                (step[0].detach().cpu(),)
+                for step in episode[:source_step + 1]
+            ]
+            record = (prefix, targets.detach().cpu())
+            self._high_virtual_imitation_pool.add_completed_episode(record)
+
+        records = self._high_virtual_imitation_pool.get_train_episodes()
+        assert records, "High imitation replay must return records after insertion"
+        replay_episodes = [record[0] for record in records]
+        replay_steps = torch.tensor(
+            [len(episode) - 1 for episode in replay_episodes],
+            dtype=torch.long,
+        )
+        replay_targets = torch.stack([record[1] for record in records], dim=0)
+        return replay_episodes, replay_steps, replay_targets
+
+    def _sample_temporally_distant_steps(self, episodes, source_steps, min_delta=30):
+        source_steps = torch.as_tensor(source_steps, dtype=torch.long)
+        assert source_steps.shape == (len(episodes),), \
+            "Expected one source step per episode"
+        distant_steps = []
+        for episode_idx, (episode, source_step) in enumerate(zip(episodes, source_steps)):
+            source_step = int(source_step.item())
+            episode_steps = torch.arange(len(episode), dtype=torch.long)
+            valid_steps = episode_steps[(episode_steps - source_step).abs() >= int(min_delta)]
+            assert valid_steps.numel() > 0, \
+                f"Episode {episode_idx} has no step with |delta_t| >= {min_delta} from {source_step}"
+            sampled_idx = torch.randint(valid_steps.numel(), (1,)).item()
+            distant_steps.append(valid_steps[sampled_idx])
+        return torch.stack(distant_steps)
+
+    def _rollout_low_virtual_goals(
         self,
         wm_episodes,
         step_idx,
@@ -462,12 +653,17 @@ class DoubleAgent(BaseWMOnPolicy):
         replay_sfa = self._squeeze_time(replay_out["aux"]["sfa"])
         batch_size = replay_h.shape[0]
         goals = goals.to(self.device)
-        assert goals.shape == replay_sfa.shape, \
-            f"Expected candidate goals {replay_sfa.shape}, got {goals.shape}"
+        assert goals.dim() == 3 and goals.shape[0] == batch_size \
+            and goals.shape[2] == replay_sfa.shape[-1], \
+            f"Expected achievability goals [B,C,G], got {goals.shape}"
+        goal_count = goals.shape[1]
         assert torch.isfinite(goals).all(), "Non-finite virtual achievability goals"
 
-        branch_indices = torch.arange(batch_size, device=self.device).repeat_interleave(num_attempts)
-        goals = goals[branch_indices]
+        goal_source_indices = torch.arange(batch_size, device=self.device).unsqueeze(1).expand(-1, goal_count).reshape(-1)
+        flat_goals = goals.reshape(batch_size * goal_count, goals.shape[-1])
+        attempt_goal_indices = torch.arange(flat_goals.shape[0], device=self.device).repeat_interleave(num_attempts)
+        branch_indices = goal_source_indices[attempt_goal_indices]
+        goals = flat_goals[attempt_goal_indices]
         h = replay_h[branch_indices]
         cpc = replay_cpc[branch_indices]
         sfa = replay_sfa[branch_indices]
@@ -518,25 +714,161 @@ class DoubleAgent(BaseWMOnPolicy):
         assert future_sfa.shape == (branch_indices.numel(), horizon, goals.shape[-1])
         distances = torch.linalg.vector_norm(future_sfa - goals.unsqueeze(1), dim=-1)
         min_distances = distances.min(dim=1).values
-        success_threshold = float(self._virtual_sfa_delta_std_ema)
+        success_threshold = self._achievability_success_threshold()
         achieved = min_distances <= success_threshold
+
+        goal_distances = torch.linalg.vector_norm(
+            flat_goals.reshape(batch_size, goal_count, -1) - replay_sfa.unsqueeze(1),
+            dim=-1,
+        )
+        min_distances_by_type = min_distances.reshape(batch_size, goal_count, num_attempts)
+        achieved_by_type = achieved.reshape(batch_size, goal_count, num_attempts)
+        source_states_by_type = source_states.reshape(
+            batch_size,
+            goal_count,
+            num_attempts,
+            source_states.shape[-1],
+        )[:, :, 0, :]
+        return (
+            source_states_by_type,
+            goal_distances,
+            min_distances_by_type,
+            achieved_by_type,
+            success_threshold,
+        )
+
+    def _collect_low_virtual_achievability(
+        self,
+        wm_episodes,
+        step_idx,
+        goals,
+        goal_names,
+        num_attempts=4,
+        horizon=3,
+    ):
+        goal_count = goals.shape[1]
+        assert len(goal_names) == goal_count, \
+            "Achievability goal names must match the goal-type dimension"
+        assert len(set(goal_names)) == goal_count, "Achievability goal names must be unique"
+        (
+            source_states_by_type,
+            goal_distances,
+            min_distances_by_type,
+            achieved_by_type,
+            success_threshold,
+        ) = self._rollout_low_virtual_goals(
+            wm_episodes,
+            step_idx,
+            goals,
+            num_attempts=num_attempts,
+            horizon=horizon,
+        )
+        batch_size = goals.shape[0]
+        best_distances_by_type = min_distances_by_type.min(dim=-1).values
+        min_distances = best_distances_by_type.reshape(-1)
+        achieved = achieved_by_type.reshape(-1)
 
         self.logger.log_scalar("low/achievability_virtual/success_threshold", success_threshold)
         self.logger.log_scalar("low/achievability_virtual/min_distance_mean", min_distances.mean())
         self.logger.log_scalar("low/achievability_virtual/min_distance_std", min_distances.std(unbiased=False))
         self.logger.log_scalar("low/achievability_virtual/success_rate", achieved.float().mean())
+        with torch.no_grad():
+            achievability_prediction = self.agent_low.achievability_head(
+                source_states_by_type.reshape(batch_size * goal_count, -1)
+            ).reshape(batch_size, goal_count, 3)
+            predicted_distance = achievability_prediction[..., 0].exp()
+            predicted_success = achievability_prediction[..., 2].sigmoid()
+        for goal_idx, goal_name in enumerate(goal_names):
+            target_distance = best_distances_by_type[:, goal_idx]
+            target_success = achieved_by_type[:, goal_idx].float().mean(dim=-1)
+            self.logger.log_scalar(
+                f"low/achievability_virtual/{goal_name}_goal_distance",
+                goal_distances[:, goal_idx].mean(),
+            )
+            self.logger.log_scalar(
+                f"low/achievability_virtual/{goal_name}_min_distance",
+                target_distance.mean(),
+            )
+            self.logger.log_scalar(
+                f"low/achievability_virtual/{goal_name}_success_rate",
+                target_success.mean(),
+            )
+            self.logger.log_scalar(
+                f"low/achievability_virtual/{goal_name}_predicted_success_rate",
+                predicted_success[:, goal_idx].mean(),
+            )
+            self.logger.log_scalar(
+                f"low/achievability_virtual/{goal_name}_success_rate_mae",
+                (predicted_success[:, goal_idx] - target_success).abs().mean(),
+            )
+            self.logger.log_scalar(
+                f"low/achievability_virtual/{goal_name}_distance_mae",
+                (predicted_distance[:, goal_idx] - target_distance).abs().mean(),
+            )
 
-        return (
-            source_states.detach().cpu(),
-            min_distances.detach().cpu(),
-            achieved.float().detach().cpu(),
+        source_states_by_goal = source_states_by_type.reshape(batch_size * goal_count, -1)
+        attempt_distances_by_goal = min_distances_by_type.reshape(
+            batch_size * goal_count,
+            num_attempts,
         )
+        success_rates_by_goal = achieved_by_type.float().mean(dim=-1).reshape(
+            batch_size * goal_count,
+        )
+        return (
+            source_states_by_goal.detach().cpu(),
+            attempt_distances_by_goal.detach().cpu(),
+            success_rates_by_goal.detach().cpu(),
+        )
+
+    def _collect_high_virtual_goal_rewards(self, wm_episodes, step_idx, goals):
+        _, initial_distances, min_distances, _, _ = self._rollout_low_virtual_goals(
+            wm_episodes,
+            step_idx,
+            goals,
+            num_attempts=self.high_virtual_goal_attempts,
+            horizon=self.virtual_horizon,
+        )
+        final_distances = min_distances.mean(dim=-1)
+        progress = initial_distances - final_distances
+        rewards = progress - self.high_virtual_goal_distance_penalty * final_distances
+        assert rewards.shape == goals.shape[:2], \
+            f"Expected virtual high rewards [B,N], got {rewards.shape}"
+        assert torch.isfinite(rewards).all(), "Non-finite virtual high goal rewards"
+        self.logger.log_scalar(
+            "high/virtual_goal/initial_distance",
+            initial_distances.mean(),
+        )
+        self.logger.log_scalar(
+            "high/virtual_goal/final_distance",
+            final_distances.mean(),
+        )
+        return rewards.detach()
 
     def _low_goal_distances(self, episode):
         states = torch.stack([step[0] for step in episode], dim=0).to(self.device)
         goal_dim = self.wm_model.contrastive_dim
         goal_delta = states[:, -(goal_dim + 1):-1]
         return torch.linalg.vector_norm(goal_delta, dim=-1)
+
+    def _low_goal_transition_distances(self, episode):
+        states = torch.stack([step[0] for step in episode], dim=0).to(self.device)
+        goal_dim = self.wm_model.contrastive_dim
+        base, sfa = self._extract_low_base_sfa(states)
+        del base
+        goals = states[:, -(2 * goal_dim + 1):-(goal_dim + 1)]
+        assert goals.shape == sfa.shape, "Failed to align low-level goals with SFA"
+
+        current_distances = torch.linalg.vector_norm(goals - sfa, dim=-1)
+        next_distances = current_distances.clone()
+        if states.shape[0] > 1:
+            # Keep goal[t] fixed when measuring the result of action[t]. Using
+            # the stored distance at t+1 would compare against a newly switched
+            # goal and corrupt progress exactly at option boundaries.
+            next_distances[:-1] = torch.linalg.vector_norm(
+                goals[:-1] - sfa[1:],
+                dim=-1,
+            )
+        return current_distances, next_distances
 
     def _log_real_achievability_ranking(
         self,
@@ -545,11 +877,9 @@ class DoubleAgent(BaseWMOnPolicy):
         negative_offset=20,
     ):
         assert 0 < positive_offset < negative_offset
-        assert self._virtual_sfa_delta_std_ema is not None, \
-            "Real achievability ranking requires an initialized success threshold"
         positive_states = []
         negative_states = []
-        success_threshold = float(self._virtual_sfa_delta_std_ema)
+        success_threshold = self._achievability_success_threshold()
 
         for episode in episodes:
             states = torch.stack([step[0] for step in episode], dim=0).to(self.device)
@@ -643,10 +973,10 @@ class DoubleAgent(BaseWMOnPolicy):
         return torch.cat([base, goal, goal - sfa, goal_valid.to(goal)], dim=-1)
 
     def _compute_low_actual_rewards(self, episode, intrinsic_rewards=None, goal_coef=1.0, intrinsic_coef=0.1):
-        distances = self._low_goal_distances(episode)
-        goal_rewards = torch.zeros_like(distances)
-        if distances.shape[0] > 1:
-            goal_rewards[:-1] = distances[:-1] - distances[1:]
+        current_distances, next_distances = self._low_goal_transition_distances(episode)
+        goal_rewards = torch.zeros_like(current_distances)
+        if current_distances.shape[0] > 1:
+            goal_rewards[:-1] = current_distances[:-1] - next_distances[:-1]
         rewards = float(goal_coef) * goal_rewards
         if intrinsic_rewards is not None:
             intrinsic_bonus = torch.zeros_like(rewards)
@@ -673,11 +1003,15 @@ class DoubleAgent(BaseWMOnPolicy):
             "low/actual_reward_mean",
             torch.cat(rewards_per_episode).mean() if rewards_per_episode else torch.tensor(0.0),
         )
-        self.logger.log_scalar(
-            "low/goal_distance_mean",
-            torch.cat([self._low_goal_distances(ep).detach().cpu() for ep in episodes]).mean()
-            if episodes else torch.tensor(0.0),
-        )
+        goal_episodes = [episode for episode in episodes if self._episode_goal_enabled(episode)]
+        if goal_episodes:
+            self.logger.log_scalar(
+                "low/goal_distance_mean",
+                torch.cat([
+                    self._low_goal_distances(episode).detach().cpu()
+                    for episode in goal_episodes
+                ]).mean(),
+            )
 
     def _log_low_reward_components(self, low_episodes, intrinsic_rewards, goal_enabled):
         assert len(low_episodes) == len(goal_enabled), "Low episode/mode count mismatch"
@@ -780,31 +1114,66 @@ class DoubleAgent(BaseWMOnPolicy):
         rewards[stalled] -= 1.0
         return rewards.detach()
 
-    def _compute_high_goal_rewards(self, episode, low_rewards):
-        states = torch.stack([step[0] for step in episode], dim=0).to(self.device)
-        sampled_goals = torch.stack([step[1]["goal"] for step in episode], dim=0).to(self.device)
-        switches = torch.stack([step[1]["switch"] for step in episode], dim=0).to(self.device).view(-1)
-        assert sampled_goals.dim() == 2, f"Expected sampled high goals [T,D], got {sampled_goals.shape}"
-        assert switches.shape == (states.shape[0],), "High switch sequence must match episode length"
-        assert low_rewards.shape == switches.shape, "Low rewards must align with high episode"
+    def _compute_high_goal_rewards(self, high_episode, low_episode, low_rewards):
+        assert len(high_episode) == len(low_episode), "High and low episodes must align"
+        assert low_rewards.shape == (len(high_episode),), "Low rewards must align with high episode"
+
+        switches = torch.stack(
+            [step[1]["switch"] for step in high_episode],
+            dim=0,
+        ).to(self.device).to(torch.float32).view(-1)
+        _, next_distances = self._low_goal_transition_distances(low_episode)
+        assert switches.shape == next_distances.shape, "Switches and goal distances must align"
+
+        option_ends = torch.zeros_like(switches, dtype=torch.bool)
+        option_ends[-1] = True
+        if option_ends.shape[0] > 1:
+            option_ends[:-1] = switches[1:] > 0.5
+
+        distance_penalties = torch.zeros_like(next_distances)
+        distance_penalties[option_ends] = (
+            self.high_virtual_goal_distance_penalty * next_distances[option_ends]
+        )
+        rewards = low_rewards.to(self.device) - distance_penalties
+        return rewards.detach(), distance_penalties.detach()
+
+    def _compute_high_achievability_constraint(self, high_states, goal):
+        assert high_states.dim() == 2, \
+            f"Expected selected high states [N,D], got {high_states.shape}"
+        assert goal.dim() == 2, f"Expected sampled goals [N,G], got {goal.shape}"
+        assert high_states.shape[0] == goal.shape[0], \
+            "High states and sampled goals must have matching batches"
 
         goal_dim = self.wm_model.contrastive_dim
-        base = states[:, :-(goal_dim + 3)]
+        assert goal.shape[1] == goal_dim, \
+            f"Expected goal dimension {goal_dim}, got {goal.shape[1]}"
+        base = high_states[:, :-(goal_dim + 3)].detach()
         sfa = base[:, -goal_dim:]
-        assert sfa.shape == sampled_goals.shape, "Failed to align high goals with current SFA"
-        goal_valid = sfa.new_ones((sfa.shape[0], 1))
-        achievability_states = self._build_low_state(base, sfa, sampled_goals, goal_valid)
-        with torch.no_grad():
-            prediction = self.agent_low.achievability_head(achievability_states)
-            assert prediction.shape == (states.shape[0], 3), \
-                f"Expected achievability prediction [T,3], got {prediction.shape}"
-            success_probability = prediction[:, 2].sigmoid()
+        assert sfa.shape == goal.shape, "Failed to align current SFA with sampled goal"
+        goal_valid = goal.new_ones((goal.shape[0], 1))
+        achievability_states = self._build_low_state(base, sfa, goal, goal_valid)
 
-        penalty = self.high_achievability_coef * (1.0 - success_probability) * switches.to(success_probability)
-        rewards = low_rewards.to(self.device) - penalty
-        selected = switches > 0.5
-        assert selected.any(), "Every high-level episode must contain at least one goal switch"
-        return rewards.detach(), success_probability[selected].detach(), penalty[selected].detach()
+        head_parameters = list(self.agent_low.achievability_head.parameters())
+        requires_grad = [parameter.requires_grad for parameter in head_parameters]
+        for parameter in head_parameters:
+            parameter.requires_grad_(False)
+        try:
+            prediction = self.agent_low.achievability_head(achievability_states)
+        finally:
+            for parameter, enabled in zip(head_parameters, requires_grad):
+                parameter.requires_grad_(enabled)
+        assert prediction.shape == (goal.shape[0], 3), \
+            f"Expected achievability prediction [N,3], got {prediction.shape}"
+
+        log_distance_mean = prediction[:, 0]
+        log_distance_scale = F.softplus(prediction[:, 1]) + 1e-4
+        expected_distance = torch.exp(
+            log_distance_mean + 0.5 * log_distance_scale.square()
+        )
+        assert torch.isfinite(expected_distance).all(), \
+            "Non-finite expected achievability distance"
+        loss = self.high_achievability_coef * expected_distance.mean()
+        return loss, expected_distance.mean()
 
     def _extract_high_sfa(self, states):
         assert states.dim() == 2, f"Expected high states [T,D], got {tuple(states.shape)}"
@@ -898,11 +1267,11 @@ class DoubleAgent(BaseWMOnPolicy):
         2. Train low-level PPO on real episodes. Goal-free episodes use intrinsic
            reward; goal-conditioned episodes use goal progress plus a small intrinsic
            bonus.
-        3. Train the low-level goal conditioning with hindsight ranking: replace the
-           requested goal with an actually reached future SFA and prefer the recorded
-           action over actions paired with negative goals.
-        4. Before virtual rollout training is available, real episodes remain
-           goal-free (zero goal SFA with goal_valid=0).
+        3. Before virtual rollout training is available, train low-level with
+           intrinsic-reward PPO and real-trajectory hindsight ranking. Real episodes
+           remain goal-free during collection (zero goal SFA with goal_valid=0).
+        4. Once virtual rollout training is available, extend low-level goal
+           conditioning with virtual hindsight ranking.
         5. During that phase, supervise the high-level goal mean toward current SFA.
            The high-level scale is not trained by this pretraining loss.
         6. Once the WM CPC error passes the virtual-readiness threshold, generate short
@@ -912,16 +1281,23 @@ class DoubleAgent(BaseWMOnPolicy):
            for every recorded transition. Train the low-level policy to increase
            pi(a_t | s_t, achieved_terminal_sfa) and rank that action above the same
            action conditioned on a negative goal from another virtual trajectory.
-        7. From the same source state, run four virtual attempts conditioned on a
-           sampled actual SFA goal. Train the achievability head to predict the minimum
-           SFA distance reached and the probability of reaching the goal within the
-           virtual horizon.
-        8. After the achievability-head warmup, gradually mix real episodes whose goals
-           are sampled by the high-level agent. Continue training the low-level agent
-           on both goal-free real episodes and virtual hindsight data.
-        9. Train high-level PPO only on those real goal-conditioned episodes. The goal
-           reward is the low-level reward accumulated until the next switch, minus a
-           soft penalty for goals the achievability head predicts to be difficult.
+        7. From the same source state, run four virtual attempts for each of four
+           goals: a reachable virtual goal, a goal from another episode, a goal
+           sampled at least 30 real timesteps away in the same episode, and a goal
+           sampled from the current high-level policy. Train the achievability head
+           to predict the attempt-distance distribution and empirical success rate.
+        8. After the achievability-head warmup, mix the configured fraction of real
+           episodes whose goals are sampled by the high-level agent. Continue training
+           the low-level agent on both goal-free real episodes and virtual hindsight data.
+        9. Train the high-level goal head either by imitating achieved terminal SFA
+           from the goal-free virtual rollouts, through the frozen achievability
+           critic, or with optional goal-only PPO on virtual progress. The imitation
+           diagnostic can use all rollout endpoints, freeze its first virtual
+           dataset, or replay source prefixes sampled from a bounded episode pool.
+           When real high-level PPO and imitation are both active, combine their
+           losses into one full-batch policy optimizer step.
+        10. Train high-level PPO only on real goal-conditioned episodes. Its goal
+            reward is the low-level reward accumulated until the next switch.
         """
         env_rewards = self.env_reward_scale * rewards
         for env_idx in range(self.num_envs):
@@ -1042,79 +1418,195 @@ class DoubleAgent(BaseWMOnPolicy):
             goal_enabled,
         )
         self._overwrite_low_rewards(low_episodes, low_rewards)
+        high_virtual_imitation_batch = None
         if low_episodes:
-            low_h_states, low_h_actions, low_h_weights, low_h_negative_states = self._compute_low_hindsight(low_episodes, intrinsic_rewards)
+            low_h_states, low_h_actions, low_h_weights, low_h_negative_states = \
+                self._compute_low_hindsight(low_episodes, intrinsic_rewards)
             virtual_achievability = None
             if low_virtual_ready:
-                horizon = 3
                 max_prefix_step = torch.tensor(list(len(episode) - 1 for episode in wm_new_episodes), dtype=torch.long)
                 # randomize ep start
                 virtual_step_idx = (torch.rand(len(max_prefix_step)) * (max_prefix_step + 1)).long()
 
-                virtual_hindsight, candidate_goals = self._collect_low_virtual_hindsight(
-                    wm_new_episodes,
-                    step_idx=virtual_step_idx,
-                    horizon=horizon
+                virtual_hindsight, candidate_goals, best_virtual_goals, \
+                    all_virtual_goals = \
+                    self._collect_low_virtual_hindsight(
+                        wm_new_episodes,
+                        step_idx=virtual_step_idx,
+                        horizon=self.virtual_horizon,
+                    )
+                assert candidate_goals.shape[0] > 1, \
+                    "Other-episode achievability goals require at least two episodes"
+                other_episode_offset = int(torch.randint(1, candidate_goals.shape[0], (1,)).item())
+                other_episode_goals = candidate_goals.roll(other_episode_offset, dims=0)
+                distant_step_idx = self._sample_temporally_distant_steps(
+                    low_episodes,
+                    virtual_step_idx,
+                    min_delta=30,
+                )
+                distant_out, _, _ = self._replay_wm_to_step(wm_new_episodes, distant_step_idx)
+                distant_goals = self._squeeze_time(distant_out["aux"]["sfa"]).detach()
+                if self.high_virtual_goal_ppo:
+                    high_virtual_goals, high_virtual_old_log_probs = \
+                        self.agent_high.sample_goal_candidates(
+                            high_episodes,
+                            virtual_step_idx,
+                            num_samples=self.high_virtual_goal_candidates,
+                        )
+                    high_policy_goals = high_virtual_goals[:, 0]
+                else:
+                    sampled_high_goals, _ = self.agent_high.sample_goal_candidates(
+                        high_episodes,
+                        virtual_step_idx,
+                        num_samples=1,
+                    )
+                    high_policy_goals = sampled_high_goals.squeeze(1)
+                assert high_policy_goals.shape == candidate_goals.shape, \
+                    "Sampled high-policy goals must match virtual candidate goals"
+                achievability_goals = torch.stack(
+                    [candidate_goals, other_episode_goals, distant_goals, high_policy_goals],
+                    dim=1,
                 )
                 virtual_achievability = self._collect_low_virtual_achievability(
                     wm_new_episodes,
                     step_idx=virtual_step_idx,
-                    goals=candidate_goals,
-                    horizon=horizon
+                    goals=achievability_goals,
+                    goal_names=("reachable", "other_episode", "distant_time", "high_policy"),
+                    horizon=self.virtual_horizon,
                 )
                 low_h_states.extend(virtual_hindsight[0])
                 low_h_actions.extend(virtual_hindsight[1])
                 low_h_weights.extend(virtual_hindsight[2])
                 low_h_negative_states.extend(virtual_hindsight[3])
-            self.agent_low.learn_from_episodes(
-                low_episodes,
-                hindsight=(low_h_states, low_h_actions, low_h_weights, low_h_negative_states),
+            hindsight = (
+                low_h_states,
+                low_h_actions,
+                low_h_weights,
+                low_h_negative_states,
             )
+            if not self.high_achievability_overfit and not self.low_fixed:
+                self.agent_low.learn_from_episodes(
+                    low_episodes,
+                    hindsight=hindsight,
+                )
+            if low_virtual_ready and self.high_virtual_goal_imitation:
+                virtual_imitation_targets = (
+                    all_virtual_goals
+                    if self.high_virtual_goal_imitation_all_targets
+                    else best_virtual_goals
+                )
+                imitation_episodes, imitation_steps, virtual_imitation_targets = \
+                    self._get_high_virtual_imitation_dataset(
+                        high_episodes,
+                        virtual_step_idx,
+                        virtual_imitation_targets,
+                    )
+                imitation_episodes, imitation_steps, virtual_imitation_targets = \
+                    self._get_high_virtual_imitation_replay(
+                        imitation_episodes,
+                        imitation_steps,
+                        virtual_imitation_targets,
+                    )
+                high_virtual_imitation_batch = (
+                    imitation_episodes,
+                    imitation_steps,
+                    virtual_imitation_targets,
+                    self.high_virtual_goal_imitation_coef,
+                )
             if virtual_achievability is not None:
-                self.agent_low.train_achievability(*virtual_achievability)
-                self._achievability_updates += 1
+                if not self.high_achievability_overfit and not self.low_fixed:
+                    self.agent_low.train_achievability(*virtual_achievability)
+                    self._achievability_updates += 1
                 self._log_real_achievability_ranking(low_episodes)
+                if self.high_virtual_goal_ppo:
+                    high_virtual_rewards = self._collect_high_virtual_goal_rewards(
+                        wm_new_episodes,
+                        virtual_step_idx,
+                        high_virtual_goals,
+                    )
+                    self.agent_high.train_virtual_goal_ppo(
+                        high_episodes,
+                        virtual_step_idx,
+                        high_virtual_goals,
+                        high_virtual_old_log_probs,
+                        high_virtual_rewards,
+                    )
+                elif not self.high_virtual_goal_imitation \
+                        and self._high_goal_ready() \
+                        and self.high_achievability_coef > 0.0:
+                    for _ in range(self.high_achievability_policy_updates):
+                        self.agent_high.train_goal_constraint(
+                            high_episodes,
+                            virtual_step_idx,
+                            self._compute_high_achievability_constraint,
+                            max_kl=self.high_achievability_max_kl,
+                            lr_scale=self.high_achievability_lr_scale,
+                            num_goal_samples=self.high_virtual_goal_candidates,
+                        )
 
         high_goal_rewards = []
+        high_goal_distance_penalties = []
         high_switch_rewards = []
-        high_success_probabilities = []
-        high_achievability_penalties = []
-        for episode, episode_low_rewards, enabled in zip(high_episodes, low_rewards, goal_enabled):
+        for high_episode, low_episode, episode_low_rewards, enabled in zip(
+            high_episodes,
+            low_episodes,
+            low_rewards,
+            goal_enabled,
+        ):
             if enabled:
-                goal_rewards, success_probability, penalty = self._compute_high_goal_rewards(
-                    episode,
+                goal_rewards, distance_penalties = self._compute_high_goal_rewards(
+                    high_episode,
+                    low_episode,
                     episode_low_rewards,
                 )
-                switch_rewards = self._compute_high_switch_rewards(episode)
-                high_success_probabilities.append(success_probability)
-                high_achievability_penalties.append(penalty)
+                switch_rewards = self._compute_high_switch_rewards(high_episode)
             else:
-                goal_rewards = torch.zeros(len(episode), dtype=torch.float32, device=self.device)
+                goal_rewards = torch.zeros(len(high_episode), dtype=torch.float32, device=self.device)
+                distance_penalties = torch.zeros_like(goal_rewards)
                 switch_rewards = torch.zeros_like(goal_rewards)
             high_goal_rewards.append(goal_rewards)
+            high_goal_distance_penalties.append(distance_penalties)
             high_switch_rewards.append(switch_rewards)
         self._overwrite_high_rewards(high_episodes, high_goal_rewards, high_switch_rewards)
-        if high_success_probabilities:
-            self.logger.log_scalar(
-                "high/achievability_success_probability",
-                torch.cat(high_success_probabilities).mean(),
-            )
-            self.logger.log_scalar(
-                "high/achievability_penalty",
-                torch.cat(high_achievability_penalties).mean(),
-            )
+        self.logger.log_scalar(
+            "high/goal_terminal_distance_penalty_mean",
+            torch.cat(high_goal_distance_penalties).mean()
+            if high_goal_distance_penalties else torch.tensor(0.0),
+        )
         # if self.br:
         #     import pdb;pdb.set_trace()
+        high_ppo_episode_count = 0
         if high_episodes:
-            if low_virtual_ready:
+            high_virtual_imitation_trained = False
+            if self._high_goal_ready():
                 enabled_high_episodes = [
                     episode
                     for episode, enabled in zip(high_episodes, goal_enabled)
                     if enabled
                 ]
+                high_ppo_episode_count = len(enabled_high_episodes)
                 if enabled_high_episodes:
-                    self.agent_high.learn_from_episodes(enabled_high_episodes)
-            else:
+                    if high_virtual_imitation_batch is not None:
+                        assert self.high_virtual_goal_imitation_epochs == 1, \
+                            "Combined high PPO and virtual imitation supports one optimizer step"
+                    self.agent_high.learn_from_episodes(
+                        enabled_high_episodes,
+                        num_minibatches=1,
+                        virtual_imitation=high_virtual_imitation_batch,
+                    )
+                    high_virtual_imitation_trained = high_virtual_imitation_batch is not None
+            if high_virtual_imitation_batch is not None and not high_virtual_imitation_trained:
+                imitation_episodes, imitation_steps, imitation_targets, imitation_coef = \
+                    high_virtual_imitation_batch
+                self.agent_high.train_virtual_goal_imitation(
+                    imitation_episodes,
+                    imitation_steps,
+                    imitation_targets,
+                    coef=imitation_coef,
+                    num_epochs=self.high_virtual_goal_imitation_epochs,
+                )
+                high_virtual_imitation_trained = True
+            if not self._high_goal_ready() and not high_virtual_imitation_trained:
                 goal_targets, goal_weights = self._compute_high_current_sfa_targets(high_episodes)
                 old_coef = self.agent_high.goal_hindsight_coef
                 self.agent_high.goal_hindsight_coef = self.high_warmup_goal_coef
@@ -1134,18 +1626,57 @@ class DoubleAgent(BaseWMOnPolicy):
         }
         extra_scalars = {
             "wm/fixed": float(self.wm_fixed),
+            "low/fixed": float(self.low_fixed),
             "double/high_warmup_goal_coef": float(self.high_warmup_goal_coef),
             "double/high_warmup_goal_epochs": float(self.high_warmup_goal_epochs),
             "double/achievability_updates": float(self._achievability_updates),
             "double/achievability_warmup_updates": float(self.achievability_warmup_updates),
             "double/high_goal_mix_probability": self._high_goal_mix_probability(),
             "double/high_goal_max_fraction": self.high_goal_max_fraction,
-            "high/current_sfa_pretrain_active": float(not low_virtual_ready),
+            "double/high_achievability_max_kl": self.high_achievability_max_kl,
+            "double/virtual_horizon": float(self.virtual_horizon),
+            "double/high_virtual_goal_ppo": float(self.high_virtual_goal_ppo),
+            "double/high_virtual_goal_imitation": float(self.high_virtual_goal_imitation),
+            "double/high_virtual_goal_imitation_coef": self.high_virtual_goal_imitation_coef,
+            "double/high_virtual_goal_imitation_epochs": float(
+                self.high_virtual_goal_imitation_epochs
+            ),
+            "double/high_virtual_goal_imitation_all_targets": float(
+                self.high_virtual_goal_imitation_all_targets
+            ),
+            "double/high_virtual_goal_imitation_fixed_dataset": float(
+                self.high_virtual_goal_imitation_fixed_dataset
+            ),
+            "double/high_virtual_goal_imitation_replay_capacity": float(
+                self.high_virtual_goal_imitation_replay_capacity
+            ),
+            "double/high_virtual_goal_imitation_replay_samples": float(
+                self.high_virtual_goal_imitation_replay_samples
+            ),
+            "high/virtual_imitation/replay_size": float(
+                len(self._high_virtual_imitation_pool.episode_pool)
+                if self._high_virtual_imitation_pool is not None
+                else 0
+            ),
+            "double/high_goal_output_delta": float(
+                self.agent_high.goal_output_delta
+            ),
+            "double/high_achievability_overfit": float(self.high_achievability_overfit),
+            "double/high_achievability_policy_updates": float(
+                self.high_achievability_policy_updates
+            ),
+            "double/high_virtual_goal_candidates": float(self.high_virtual_goal_candidates),
+            "double/high_virtual_goal_attempts": float(self.high_virtual_goal_attempts),
+            "double/high_virtual_goal_distance_penalty": self.high_virtual_goal_distance_penalty,
+            "high/current_sfa_pretrain_active": float(not self._high_goal_ready()),
             "high/ready": float(self._high_goal_ready()),
             "high/ppo_episode_fraction": (
                 sum(goal_enabled) / len(goal_enabled) if goal_enabled else 0.0
             ),
+            "high/ppo_update_episode_count": float(high_ppo_episode_count),
+            "high/ppo_update_active": float(high_ppo_episode_count > 0),
             "low/virtual_ready": float(low_virtual_ready),
+            "low/hindsight_active": 1.0,
             "low/virtual_cpc_error_after": low_virtual_cpc_error,
             "low/virtual_cpc_error_ema": low_virtual_cpc_error_ema,
             "low/virtual_cpc_error_threshold": self.low_virtual_cpc_error_threshold,
