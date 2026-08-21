@@ -5,7 +5,7 @@ from torch import optim
 from torch.distributions import LogNormal
 
 from ppo import PPO
-from util import EpisodeBatch, compute_returns_list, flatten_padded, gae, normalize_padded_returns, to_device
+from util import EpisodeBatch, compute_returns_list, flatten_padded, gae, normalize_padded_returns, to_device, load_optimizer_state_preserve_lrs
 
 
 class LowLevelAgent(PPO):
@@ -139,9 +139,10 @@ class LowLevelAgent(PPO):
             return
         self.achievability_head.load_state_dict(state_dict["achievability_head"])
         if "optimizer_achievability" in state_dict:
-            self.optimizer_achievability.load_state_dict(state_dict["optimizer_achievability"])
-            for param_group in self.optimizer_achievability.param_groups:
-                param_group["lr"] = self.achievability_lr
+            load_optimizer_state_preserve_lrs(
+                self.optimizer_achievability,
+                state_dict["optimizer_achievability"],
+            )
         else:
             self.logger.warn("Checkpoint has no achievability optimizer; using fresh optimizer state")
 

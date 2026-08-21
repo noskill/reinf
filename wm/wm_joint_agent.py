@@ -17,7 +17,7 @@ from reinforce import Reinforce
 from ppo import PPO
 from util import RunningNorm
 from utils import make_label_smoothing_table, make_soft_table
-from util import RunningNorm, EpisodeBatch, to_device, gae, normalize_padded_returns, flatten_padded, unflatten_padded
+from util import RunningNorm, EpisodeBatch, to_device, gae, normalize_padded_returns, flatten_padded, unflatten_padded, load_optimizer_state_preserve_lrs
 from clustering import SmartClusteringNovelty
 
 
@@ -33,6 +33,8 @@ class BaseWMOnPolicy:
         wm_replay_capacity: int = 2048,
         wm_train_episodes: int = 64,
         wm_stability_coef: float = 1e-4,
+        wm_sfa_stability_coef: float = 0.1,
+        wm_sensor_lp_reward_coef: float = 1.0,
         wm_divergence_novelty_coef: float = 0.0,
         sensor_max_bin: int = 64,
         maze_dim: int = 10,
@@ -50,6 +52,8 @@ class BaseWMOnPolicy:
         self.wm_replay_capacity = int(wm_replay_capacity)
         self.wm_train_episodes = int(wm_train_episodes)
         self.wm_stability_coef = float(wm_stability_coef)
+        self.wm_sfa_stability_coef = float(wm_sfa_stability_coef)
+        self.wm_sensor_lp_reward_coef = float(wm_sensor_lp_reward_coef)
         self.wm_divergence_novelty_coef = float(wm_divergence_novelty_coef)
         self.sensor_max_bin = int(sensor_max_bin)
         self.maze_dim = int(maze_dim)
@@ -86,6 +90,8 @@ class BaseWMOnPolicy:
             "wm_replay_capacity": self.wm_replay_capacity,
             "wm_train_episodes": self.wm_train_episodes,
             "wm_stability_coef": self.wm_stability_coef,
+            "wm_sfa_stability_coef": self.wm_sfa_stability_coef,
+            "wm_sensor_lp_reward_coef": self.wm_sensor_lp_reward_coef,
             "wm_divergence_novelty_coef": self.wm_divergence_novelty_coef,
             "intrinsic_reward_scale": self.intrinsic_reward_scale,
             "env_reward_scale": self.env_reward_scale,
@@ -474,7 +480,11 @@ class BaseWMOnPolicy:
 
 
         # lp + divergence
-        reward = sensor_lp_rewards_pos + self.wm_divergence_novelty_coef * divergence_novelty + 0.02 * sensor_error_before
+        reward = (
+            self.wm_sensor_lp_reward_coef * sensor_lp_rewards_pos
+            + self.wm_divergence_novelty_coef * divergence_novelty
+            + 0.02 * sensor_error_before
+        )
 
         reward_next = reward[:, 1:]
         reward_curr = reward[:, :-1]
@@ -1053,7 +1063,7 @@ class BaseWMOnPolicy:
             self.wm_model.load_state_dict(wm_state)
         wm_opt_state = state_dict.get("wm_optimizer")
         if wm_opt_state is not None:
-            self.wm_optimizer.load_state_dict(wm_opt_state)
+            load_optimizer_state_preserve_lrs(self.wm_optimizer, wm_opt_state)
 
     # def compute_advantage(self, states_batch, returns_batch, rewards_batch, padding_mask):
     #     #return self.compute_advantage_gae(states_batch, rewards_batch, padding_mask)

@@ -7,6 +7,14 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 from torch.nn.utils.rnn import pad_sequence, pack_sequence, pad_packed_sequence
 
 
+def load_optimizer_state_preserve_lrs(optimizer, state_dict) -> None:
+    learning_rates = [group["lr"] for group in optimizer.param_groups]
+    optimizer.load_state_dict(state_dict)
+    assert len(optimizer.param_groups) == len(learning_rates)
+    for group, learning_rate in zip(optimizer.param_groups, learning_rates):
+        group["lr"] = learning_rate
+
+
 def copy_python_sources(script_dir: str, experiment_dir: str) -> None:
     """Copy all Python files from the script directory into the experiment directory."""
     script_path = Path(script_dir)

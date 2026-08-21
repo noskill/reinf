@@ -140,6 +140,8 @@ def parse_args():
     parser.add_argument("--wm-updates-per-policy", type=int, default=1)
     parser.add_argument("--wm-replay-capacity", type=int, default=2048)
     parser.add_argument("--wm-train-episodes", type=int, default=64)
+    parser.add_argument("--wm-sfa-stability-coef", type=float, default=0.1)
+    parser.add_argument("--wm-sensor-lp-reward-coef", type=float, default=1.0)
     parser.add_argument("--wm-divergence-novelty-coef", type=float, default=0.0)
     parser.add_argument("--high-warmup-goal-coef", type=float, default=0.005)
     parser.add_argument("--high-warmup-goal-epochs", type=int, default=1)

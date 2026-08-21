@@ -4,7 +4,7 @@ from torch.distributions import *
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.distributions import TransformedDistribution
-from util import RunningNorm, EpisodeBatch, to_device, normalize_padded_returns, flatten_padded
+from util import RunningNorm, EpisodeBatch, to_device, normalize_padded_returns, flatten_padded, load_optimizer_state_preserve_lrs
 from sample import *
 np = numpy
 
@@ -408,7 +408,10 @@ class ReinforceBase(Agent):
 
     def load_state_dict(self, state_dict):
         self.policy.load_state_dict(state_dict['policy'])
-        self.optimizer_policy.load_state_dict(state_dict['optimizer_policy'])
+        load_optimizer_state_preserve_lrs(
+            self.optimizer_policy,
+            state_dict['optimizer_policy'],
+        )
         self.mean_reward = state_dict['mean_reward']
         self.mean_std = state_dict['mean_std']
         self.version = state_dict.get('version', self.version)

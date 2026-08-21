@@ -7,7 +7,7 @@ import torch.nn.functional as F
 np = numpy
 from pool import EpisodesPoolMixin
 from reinforce import ReinforceBase
-from util import RunningNorm, EpisodeBatch, to_device, gae, normalize_padded_returns
+from util import RunningNorm, EpisodeBatch, to_device, gae, normalize_padded_returns, load_optimizer_state_preserve_lrs
 
 
 class Value(nn.Module):
@@ -182,7 +182,10 @@ class VPGBase(ReinforceBase):
     def load_state_dict(self, sd):
         super().load_state_dict(sd)
         self.value.load_state_dict(sd['value'])
-        self.optimizer_value.load_state_dict(sd['optimizer_value'])
+        load_optimizer_state_preserve_lrs(
+            self.optimizer_value,
+            sd['optimizer_value'],
+        )
 
 
 class VPG(VPGBase, EpisodesPoolMixin):

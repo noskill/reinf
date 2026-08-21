@@ -107,6 +107,8 @@ class DoubleAgent(BaseWMOnPolicy):
         self._virtual_sfa_delta_std_ema = None
         self._low_virtual_started = False
         self._achievability_updates = 0
+        self._high_virtual_final_distance_ema = None
+        self._high_virtual_final_distance_ready = False
         self._high_goal_enabled = None
         self._high_virtual_imitation_dataset = None
         self._high_virtual_imitation_pool = None
@@ -198,6 +200,8 @@ class DoubleAgent(BaseWMOnPolicy):
                 "virtual_sfa_delta_std_ema": self._virtual_sfa_delta_std_ema,
                 "low_virtual_started": self._low_virtual_started,
                 "achievability_updates": self._achievability_updates,
+                "high_virtual_final_distance_ema": self._high_virtual_final_distance_ema,
+                "high_virtual_final_distance_ready": self._high_virtual_final_distance_ready,
             },
         }
 
@@ -210,8 +214,10 @@ class DoubleAgent(BaseWMOnPolicy):
         else:
             self._low_virtual_cpc_error_ema = double_state["low_virtual_cpc_error_ema"]
             self._virtual_sfa_delta_std_ema = double_state["virtual_sfa_delta_std_ema"]
-            self._low_virtual_started = bool(double_state["low_virtual_started"])
-            self._achievability_updates = int(double_state["achievability_updates"])
+            self._low_virtual_started = double_state["low_virtual_started"]
+            self._achievability_updates = double_state["achievability_updates"]
+            self._high_virtual_final_distance_ema = double_state.get("high_virtual_final_distance_ema", None)
+            self._high_virtual_final_distance_ready = double_state.get("high_virtual_final_distance_ready", False)
         if self.reset_high_agent_on_load:
             self.reset_high_agent()
 
@@ -241,7 +247,11 @@ class DoubleAgent(BaseWMOnPolicy):
         return self.high_goal_max_fraction
 
     def _high_goal_ready(self):
-        return self._low_virtual_started and self._achievability_updates >= self.achievability_warmup_updates
+        if not self._low_virtual_started:
+            return False
+        if self.high_virtual_goal_ppo:
+            return self._high_virtual_final_distance_ready
+        return self._achievability_updates >= self.achievability_warmup_updates
 
     def _update_high_goal_enabled(self, episode_start, batch_size):
         reset_mask = torch.as_tensor(episode_start, dtype=torch.bool, device=self.device).view(-1)
@@ -826,22 +836,28 @@ class DoubleAgent(BaseWMOnPolicy):
             step_idx,
             goals,
             num_attempts=self.high_virtual_goal_attempts,
-            horizon=self.virtual_horizon,
-        )
+            horizon=self.virtual_horizon)
         final_distances = min_distances.mean(dim=-1)
         progress = initial_distances - final_distances
         rewards = progress - self.high_virtual_goal_distance_penalty * final_distances
-        assert rewards.shape == goals.shape[:2], \
-            f"Expected virtual high rewards [B,N], got {rewards.shape}"
+        assert rewards.shape == goals.shape[:2], f"Expected virtual high rewards [B,N], got {rewards.shape}"
         assert torch.isfinite(rewards).all(), "Non-finite virtual high goal rewards"
-        self.logger.log_scalar(
-            "high/virtual_goal/initial_distance",
-            initial_distances.mean(),
-        )
-        self.logger.log_scalar(
-            "high/virtual_goal/final_distance",
-            final_distances.mean(),
-        )
+        final_distance_mean = float(final_distances.mean().detach())
+        if self._high_virtual_final_distance_ema is None:
+            self._high_virtual_final_distance_ema = final_distance_mean
+        else:
+            self._high_virtual_final_distance_ema = 0.95 * self._high_virtual_final_distance_ema + 0.05 * final_distance_mean
+        final_distance_threshold = None
+        if self._virtual_sfa_delta_mean is not None:
+            final_distance_threshold = self._achievability_success_threshold()
+            if not self._high_virtual_final_distance_ready:
+                self._high_virtual_final_distance_ready = (self._high_virtual_final_distance_ema <= final_distance_threshold)
+        self.logger.log_scalar("high/virtual_goal/initial_distance", initial_distances.mean())
+        self.logger.log_scalar("high/virtual_goal/final_distance", final_distances.mean())
+        self.logger.log_scalar("high/virtual_goal/final_distance_ema",self._high_virtual_final_distance_ema)
+        if final_distance_threshold is not None:
+            self.logger.log_scalar("high/virtual_goal/final_distance_ready_threshold", final_distance_threshold)
+        self.logger.log_scalar("high/virtual_goal/ready", float(self._high_virtual_final_distance_ready))
         return rewards.detach()
 
     def _low_goal_distances(self, episode):
@@ -1331,6 +1347,7 @@ class DoubleAgent(BaseWMOnPolicy):
         with torch.no_grad():
             state_out_fixed = self.wm_model(obs_new)
             old_state_seq = state_out_fixed["state_seq"].detach()
+            old_sfa = state_out_fixed['aux']['sfa'].detach()
             embs = state_out_fixed['aux']['contrastive_tgt_emb']
         divergence_novelty = self._compute_state_divergence_novelty(
             state_seq=embs,
@@ -1354,15 +1371,16 @@ class DoubleAgent(BaseWMOnPolicy):
             wm_loss_base = self._compute_wm_total_loss(wm_loss_results)
             wm_stability_loss = torch.tensor(0.0, dtype=torch.float32, device=self.device)
             wm_state_drift = torch.tensor(0.0, dtype=torch.float32, device=self.device)
-            if self.wm_stability_coef > 0.0:
-                state_out = self.wm_model(obs_new)
-                new_state = state_out["state_seq"]
-                wm_stability_loss, wm_state_drift = self._compute_state_stability_loss(
-                    new_state=new_state,
-                    old_state=old_state_seq,
-                    key_padding_mask=obs_new["key_padding_mask"],
-                )
-            wm_loss = wm_loss_base + self.wm_stability_coef * wm_stability_loss
+            sfa_stability_loss = torch.tensor(0.0, dtype=torch.float32, device=self.device)
+            sfa_state_drift = torch.tensor(0.0, dtype=torch.float32, device=self.device)
+            state_out = self.wm_model(obs_new)
+            new_state = state_out["state_seq"]
+            new_sfa = state_out['aux']['sfa']
+            wm_stability_loss, wm_state_drift = self._compute_state_stability_loss(new_state=new_state, old_state=old_state_seq,
+                                                                                    key_padding_mask=obs_new["key_padding_mask"],)
+            sfa_stability_loss, sfa_state_drift = self._compute_state_stability_loss(new_state=new_sfa, old_state=old_sfa,
+                                                                                        key_padding_mask=obs_new["key_padding_mask"])
+            wm_loss = wm_loss_base + self.wm_stability_coef * wm_stability_loss + self.wm_sfa_stability_coef * sfa_stability_loss
             wm_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.wm_model.parameters(), 1.0)
             self.wm_optimizer.step()
@@ -1373,10 +1391,11 @@ class DoubleAgent(BaseWMOnPolicy):
             for key, value in wm_loss_results.items():
                 wm_loss_sums[key] = wm_loss_sums.get(key, 0.0) + self._as_scalar(value)
             wm_loss_sums["stability"] = wm_loss_sums.get("stability", 0.0) + self._as_scalar(wm_stability_loss)
+            wm_loss_sums['sfa_stability'] = wm_loss_sums.get('sfa_stability', 0.0) + self._as_scalar(sfa_stability_loss)
             for key, value in wm_loss_metrics.items():
                 wm_metric_sums[key] = wm_metric_sums.get(key, 0.0) + self._as_scalar(value)
             wm_metric_sums["state_drift"] = wm_metric_sums.get("state_drift", 0.0) + self._as_scalar(wm_state_drift)
-
+            wm_metric_sums["sfa_state_drift"] = wm_metric_sums.get("sfa_state_drift", 0.0) + self._as_scalar(sfa_state_drift)
         cpc_error_after = self._evaluate_step_cpc_error_no_grad(self.wm_model, obs_new, targets_new)
         sensor_error_after = self._evaluate_step_sensor_error_no_grad(self.wm_model, obs_new, targets_new)
         emb_pred_error = self.embedding_prediction_error(state_out_fixed['aux'],
@@ -1668,11 +1687,16 @@ class DoubleAgent(BaseWMOnPolicy):
             "double/high_virtual_goal_candidates": float(self.high_virtual_goal_candidates),
             "double/high_virtual_goal_attempts": float(self.high_virtual_goal_attempts),
             "double/high_virtual_goal_distance_penalty": self.high_virtual_goal_distance_penalty,
+            "high/virtual_goal/final_distance_ema": (
+                self._high_virtual_final_distance_ema
+                if self._high_virtual_final_distance_ema is not None else 0.0
+            ),
+            "high/virtual_goal/ready": float(self._high_virtual_final_distance_ready),
+            "high/virtual_goal/ready_threshold": (self._achievability_success_threshold()
+                if self._virtual_sfa_delta_mean is not None else 0.0),
             "high/current_sfa_pretrain_active": float(not self._high_goal_ready()),
             "high/ready": float(self._high_goal_ready()),
-            "high/ppo_episode_fraction": (
-                sum(goal_enabled) / len(goal_enabled) if goal_enabled else 0.0
-            ),
+            "high/ppo_episode_fraction": sum(goal_enabled) / len(goal_enabled) if goal_enabled else 0.0,
             "high/ppo_update_episode_count": float(high_ppo_episode_count),
             "high/ppo_update_active": float(high_ppo_episode_count > 0),
             "low/virtual_ready": float(low_virtual_ready),
@@ -1684,19 +1708,11 @@ class DoubleAgent(BaseWMOnPolicy):
             "wm/replay_size": float(len(self._wm_pool.episode_pool)),
             "wm/replay_sampled_episodes": float(len(replay_episodes)),
             "wm/joint_sampled_episodes": float(len(wm_new_episodes) + len(replay_episodes)),
-            "wm/joint_sampled_transitions": float(
-                sum(max(0, len(ep) - 1) for ep in wm_new_episodes)
-                + sum(max(0, len(ep) - 1) for ep in replay_episodes)
-            ),
+            "wm/joint_sampled_transitions": float(sum(max(0, len(ep) - 1) for ep in wm_new_episodes)
+                + sum(max(0, len(ep) - 1) for ep in replay_episodes))
         }
-        self._log_update_stats(
-            updates=wm_updates_for_logging,
-            scalar_sums=scalar_sums,
-            extra_scalars=extra_scalars,
-            wm_loss_sums=wm_loss_sums,
-            wm_metric_sums=wm_metric_sums,
-            info=info,
-        )
+        self._log_update_stats(updates=wm_updates_for_logging, scalar_sums=scalar_sums, extra_scalars=extra_scalars,
+                               wm_loss_sums=wm_loss_sums, wm_metric_sums=wm_metric_sums, info=info,)
 
         self.version += 1
         self.clear_completed()
