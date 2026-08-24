@@ -29,15 +29,10 @@ from agent_utils_wm import create_maze_world_model
 
 THIS_DIR = Path(__file__).resolve().parent
 PARENT_DIR = THIS_DIR.parent
-MAZE_DIR = THIS_DIR / "maze"
 
-if str(PARENT_DIR) not in sys.path:
-    sys.path.insert(0, str(PARENT_DIR))
-if str(MAZE_DIR) not in sys.path:
-    sys.path.insert(0, str(MAZE_DIR))
 
-from on_policy_train import OnPolicyTrainer  # noqa: E402
-from rl_env import MazeVecEnv  # noqa: E402
+from on_policy_train import OnPolicyTrainer
+from maze.rl_env import MazeVecEnv
 
 
 class MazeTrainerEnvAdapter:
