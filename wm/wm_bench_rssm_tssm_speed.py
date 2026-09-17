@@ -12,6 +12,7 @@ from statistics import mean, pstdev
 import numpy as np
 import torch
 
+from observation import create_maze_discrete_observation_codec
 from wm_train import (
     RSSMDiscretePredictor,
     TSSMDiscretePredictor,
@@ -205,18 +206,30 @@ def main():
         device=device,
     )
 
+    def create_observation_codecs():
+        stochastic_dim = args.stoch_size * args.stoch_classes
+        return create_maze_discrete_observation_codec(
+            sensor_dim=obs_dim,
+            sensor_latent_dim=args.obs_latent_dim,
+            feature_dim=args.hidden_size + stochastic_dim,
+            stochastic_dim=stochastic_dim,
+            hidden_size=args.hidden_size,
+            sensor_bins=sensor_bins,
+        )
+
+    observation_codecs = create_observation_codecs()
     rssm = RSSMDiscretePredictor(
+        observation_encoder=observation_codecs[0],
+        observation_decoder=observation_codecs[1],
+        z_observation_decoder=observation_codecs[2],
+        h_observation_decoder=observation_codecs[3],
         hidden_size=args.hidden_size,
         sensor_mode="categorical",
-        sensor_dim=3,
-        sensor_bins=sensor_bins,
         loc_x_bins=loc_x_bins,
         loc_y_bins=loc_y_bins,
         heading_dim=heading_dim,
         turn_bins=turn_bins,
         step_bins=step_bins,
-        obs_dim=obs_dim,
-        obs_latent_dim=args.obs_latent_dim,
         action_dim=action_dim,
         stoch_size=args.stoch_size,
         stoch_classes=args.stoch_classes,
@@ -224,8 +237,6 @@ def main():
         kl_dyn_beta=args.kl_dyn_beta,
         kl_rep_beta=args.kl_rep_beta,
         kl_free_nats=args.kl_free_nats,
-        recon_beta=1.0,
-        obs_loss_mode="soft",
         prior_rollout_weight=0.0,
         bptt_horizon=0,
         z_only_weight=0.0,
@@ -238,7 +249,12 @@ def main():
         state_norm="none",
     ).to(device)
 
+    observation_codecs = create_observation_codecs()
     tssm = TSSMDiscretePredictor(
+        observation_encoder=observation_codecs[0],
+        observation_decoder=observation_codecs[1],
+        z_observation_decoder=observation_codecs[2],
+        h_observation_decoder=observation_codecs[3],
         hidden_size=args.hidden_size,
         layers=args.layers,
         heads=args.heads,
@@ -246,15 +262,11 @@ def main():
         intermediate=args.intermediate,
         attention_window=None,
         sensor_mode="categorical",
-        sensor_dim=3,
-        sensor_bins=sensor_bins,
         loc_x_bins=loc_x_bins,
         loc_y_bins=loc_y_bins,
         heading_dim=heading_dim,
         turn_bins=turn_bins,
         step_bins=step_bins,
-        obs_dim=obs_dim,
-        obs_latent_dim=args.obs_latent_dim,
         action_dim=action_dim,
         stoch_size=args.stoch_size,
         stoch_classes=args.stoch_classes,
@@ -262,8 +274,6 @@ def main():
         kl_dyn_beta=args.kl_dyn_beta,
         kl_rep_beta=args.kl_rep_beta,
         kl_free_nats=args.kl_free_nats,
-        recon_beta=1.0,
-        obs_loss_mode="soft",
         prior_rollout_weight=0.0,
         bptt_horizon=0,
         z_only_weight=0.0,

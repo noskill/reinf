@@ -1,5 +1,7 @@
 import random
 
+from util import get_first_tensor, tree_index
+
 
 class EpisodesPoolMixin:
     def __init__(self, *args, **kwargs):
@@ -32,12 +34,12 @@ class EpisodesPoolMixin:
             assert env_ids.shape[0] == B, f"env_ids length {env_ids.shape[0]} must match batch size {B}"
 
         if isinstance(states, dict):
-            # Ensure all dict tensors share the same batch dimension
-            for key, tensor in states.items():
+            for key, state_value in states.items():
+                tensor = get_first_tensor(state_value)
                 assert tensor.shape[0] == B, f"states['{key}'] batch size {tensor.shape[0]} must match {B}"
 
             for idx in range(B):
-                obs = {key: states[key][idx] for key in states}
+                obs = {key: tree_index(states[key], idx) for key in states}
                 env_idx = idx if env_ids is None else int(env_ids[idx].item())
                 assert 0 <= env_idx < self.num_envs, f"env_idx {env_idx} out of range [0, {self.num_envs})"
                 self.add_transition(env_idx, obs, actions[idx], log_probs[idx], entropies[idx])

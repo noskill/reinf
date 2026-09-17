@@ -21,6 +21,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
+from observation import create_maze_baseline_observation_codec, create_maze_discrete_observation_codec
 from transformer import LlamaConfig
 from tr_cache import PositionBasedDynamicCache, WindowedPositionBasedDynamicCache
 from wm_train import (
@@ -206,6 +207,18 @@ def build_model_from_checkpoint(ckpt: dict, sensor_mode: str, device: str):
     contrastive_dim_cfg = int(cfg.get("contrastive_dim", 0))
     contrastive_steps_cfg = int(cfg.get("contrastive_steps", 1))
 
+    def create_discrete_codecs(model_section: dict):
+        hidden_size = int(model_section["hidden_size"])
+        stochastic_dim = int(model_section["stoch_size"]) * int(model_section["stoch_classes"])
+        return create_maze_discrete_observation_codec(
+            sensor_dim=obs_dim,
+            sensor_latent_dim=obs_latent_dim,
+            feature_dim=hidden_size + stochastic_dim,
+            stochastic_dim=stochastic_dim,
+            hidden_size=hidden_size,
+            sensor_bins=sensor_bins,
+        )
+
     def resolve_probe_layers(model_cfg_section: dict, probe_hidden_dim: int) -> int:
         raw = model_cfg_section.get("probe_layers", cfg.get("probe_layers", None))
         if raw is not None:
@@ -220,7 +233,12 @@ def build_model_from_checkpoint(ckpt: dict, sensor_mode: str, device: str):
         probe_layers = resolve_probe_layers(mcfg, probe_hidden_dim)
         contrastive_dim = int(mcfg.get("contrastive_dim", contrastive_dim_cfg))
         contrastive_steps = int(mcfg.get("contrastive_steps", contrastive_steps_cfg))
+        observation_codecs = create_discrete_codecs(mcfg)
         model = TSSMDiscretePredictor(
+            observation_encoder=observation_codecs[0],
+            observation_decoder=observation_codecs[1],
+            z_observation_decoder=observation_codecs[2],
+            h_observation_decoder=observation_codecs[3],
             hidden_size=int(mcfg["hidden_size"]),
             layers=int(mcfg["layers"]),
             heads=int(mcfg["heads"]),
@@ -228,15 +246,11 @@ def build_model_from_checkpoint(ckpt: dict, sensor_mode: str, device: str):
             intermediate=int(mcfg["intermediate"]),
             attention_window=mcfg["attention_window"],
             sensor_mode=sensor_mode,
-            sensor_dim=sensor_dim,
-            sensor_bins=sensor_bins if sensor_mode == "categorical" else None,
             loc_x_bins=loc_x_bins,
             loc_y_bins=loc_y_bins,
             heading_dim=heading_dim,
             turn_bins=turn_bins,
             step_bins=step_bins,
-            obs_dim=obs_dim,
-            obs_latent_dim=obs_latent_dim,
             action_dim=int(mcfg["action_dim"]),
             stoch_size=int(mcfg["stoch_size"]),
             stoch_classes=int(mcfg["stoch_classes"]),
@@ -252,10 +266,8 @@ def build_model_from_checkpoint(ckpt: dict, sensor_mode: str, device: str):
             probe_layers=probe_layers,
             contrastive_dim=contrastive_dim,
             contrastive_steps=contrastive_steps,
-            recon_beta=float(mcfg["recon_beta"]),
-            obs_loss_mode=str(mcfg["obs_loss_mode"]),
         ).to(device)
-    elif model_type == "rssm-discrete":
+    elif model_type == "rssm":
         mcfg = model_cfg["rssm"]
         probe_hidden_dim = int(mcfg.get("probe_hidden_dim", cfg.get("probe_hidden_dim", 0)))
         probe_layers = resolve_probe_layers(mcfg, probe_hidden_dim)
@@ -264,18 +276,19 @@ def build_model_from_checkpoint(ckpt: dict, sensor_mode: str, device: str):
         transition = str(mcfg.get("transition", cfg.get("rssm_transition", "gru")))
         residual_scale = float(mcfg.get("residual_scale", cfg.get("rssm_residual_scale", 1.0)))
         state_norm = str(mcfg.get("state_norm", cfg.get("rssm_state_norm", "none")))
+        observation_codecs = create_discrete_codecs(mcfg)
         model = RSSMDiscretePredictor(
+            observation_encoder=observation_codecs[0],
+            observation_decoder=observation_codecs[1],
+            z_observation_decoder=observation_codecs[2],
+            h_observation_decoder=observation_codecs[3],
             hidden_size=int(mcfg["hidden_size"]),
             sensor_mode=sensor_mode,
-            sensor_dim=sensor_dim,
-            sensor_bins=sensor_bins if sensor_mode == "categorical" else None,
             loc_x_bins=loc_x_bins,
             loc_y_bins=loc_y_bins,
             heading_dim=heading_dim,
             turn_bins=turn_bins,
             step_bins=step_bins,
-            obs_dim=obs_dim,
-            obs_latent_dim=obs_latent_dim,
             action_dim=int(mcfg["action_dim"]),
             stoch_size=int(mcfg["stoch_size"]),
             stoch_classes=int(mcfg["stoch_classes"]),
@@ -294,8 +307,6 @@ def build_model_from_checkpoint(ckpt: dict, sensor_mode: str, device: str):
             transition=transition,
             residual_scale=residual_scale,
             state_norm=state_norm,
-            recon_beta=float(mcfg["recon_beta"]),
-            obs_loss_mode=str(mcfg["obs_loss_mode"]),
         ).to(device)
     elif model_type == "transformer":
         llama_cfg = LlamaConfig(**model_cfg["llama"])
@@ -303,18 +314,26 @@ def build_model_from_checkpoint(ckpt: dict, sensor_mode: str, device: str):
         probe_layers = resolve_probe_layers(model_cfg, probe_hidden_dim)
         contrastive_dim = int(model_cfg.get("contrastive_dim", contrastive_dim_cfg))
         contrastive_steps = int(model_cfg.get("contrastive_steps", contrastive_steps_cfg))
+        sensor_latent_dim = int(model_cfg["sensor_latent_dim"])
+        observation_encoder, observation_decoder = create_maze_baseline_observation_codec(
+            sensor_dim=sensor_dim,
+            sensor_latent_dim=sensor_latent_dim,
+            feature_dim=llama_cfg.hidden_size,
+            sensor_bins=sensor_bins,
+            hidden_dim=probe_hidden_dim,
+        )
         model = TransformerBaseline(
             llama_cfg,
+            observation_encoder=observation_encoder,
+            observation_decoder=observation_decoder,
             sensor_mode=sensor_mode,
-            sensor_dim=sensor_dim,
-            sensor_bins=sensor_bins if sensor_mode == "categorical" else None,
+            action_dim=2,
             loc_x_bins=loc_x_bins,
             loc_y_bins=loc_y_bins,
             heading_dim=heading_dim,
             turn_bins=turn_bins,
             step_bins=step_bins,
-            obs_dim=obs_dim,
-            obs_latent_dim=obs_latent_dim,
+            action_latent_dim=int(model_cfg["action_latent_dim"]),
             probe_hidden_dim=probe_hidden_dim,
             probe_layers=probe_layers,
             contrastive_dim=contrastive_dim,
@@ -327,24 +346,31 @@ def build_model_from_checkpoint(ckpt: dict, sensor_mode: str, device: str):
         contrastive_dim = int(rcfg.get("contrastive_dim", model_cfg.get("contrastive_dim", contrastive_dim_cfg)))
         contrastive_steps = int(rcfg.get("contrastive_steps", model_cfg.get("contrastive_steps", contrastive_steps_cfg)))
         state_norm = str(rcfg.get("state_norm", cfg.get("rnn_state_norm", "none")))
-        default_input_size = sensor_dim + 2
         rnn_cfg = LlamaConfig(
-            input_size=int(rcfg.get("input_size", default_input_size)),
+            input_size=int(rcfg["input_size"]),
             hidden_size=int(rcfg.get("hidden_size", 128)),
             num_hidden_layers=int(rcfg.get("layers", 2)),
         )
+        sensor_latent_dim = int(rcfg["sensor_latent_dim"])
+        observation_encoder, observation_decoder = create_maze_baseline_observation_codec(
+            sensor_dim=sensor_dim,
+            sensor_latent_dim=sensor_latent_dim,
+            feature_dim=rnn_cfg.hidden_size,
+            sensor_bins=sensor_bins,
+            hidden_dim=probe_hidden_dim,
+        )
         model = RNNPredictor(
             rnn_cfg,
+            observation_encoder=observation_encoder,
+            observation_decoder=observation_decoder,
             sensor_mode=sensor_mode,
-            sensor_dim=sensor_dim,
-            sensor_bins=sensor_bins if sensor_mode == "categorical" else None,
+            action_dim=2,
             loc_x_bins=loc_x_bins,
             loc_y_bins=loc_y_bins,
             heading_dim=heading_dim,
             turn_bins=turn_bins,
             step_bins=step_bins,
-            obs_dim=obs_dim,
-            obs_latent_dim=obs_latent_dim,
+            action_latent_dim=int(rcfg["action_latent_dim"]),
             probe_hidden_dim=probe_hidden_dim,
             probe_layers=probe_layers,
             state_norm=state_norm,
@@ -356,10 +382,10 @@ def build_model_from_checkpoint(ckpt: dict, sensor_mode: str, device: str):
 
     missing, unexpected = model.load_state_dict(ckpt["model_state"], strict=False)
     allowed_missing = {
-        "z_obs_head.weight",
-        "z_obs_head.bias",
-        "h_obs_head.weight",
-        "h_obs_head.bias",
+        "z_observation_decoder.decoder.weight",
+        "z_observation_decoder.decoder.bias",
+        "h_observation_decoder.decoder.weight",
+        "h_observation_decoder.decoder.bias",
         "contrastive_head.weight",
         "contrastive_head.bias",
     }
@@ -418,10 +444,10 @@ def main():
 
     ckpt = torch.load(args.checkpoint, map_location=args.device, weights_only=False)
     model = build_model_from_checkpoint(ckpt, args.sensor_mode, args.device)
-    if args.sensor_head == "z" and getattr(model, "z_obs_head", None) is None:
-        raise RuntimeError("Selected --sensor-head z, but checkpoint/model has no z_obs_head.")
-    if args.sensor_head == "h" and getattr(model, "h_obs_head", None) is None:
-        raise RuntimeError("Selected --sensor-head h, but checkpoint/model has no h_obs_head.")
+    if args.sensor_head == "z" and getattr(model, "z_observation_decoder", None) is None:
+        raise RuntimeError("Selected --sensor-head z, but model has no z observation decoder.")
+    if args.sensor_head == "h" and getattr(model, "h_observation_decoder", None) is None:
+        raise RuntimeError("Selected --sensor-head h, but model has no h observation decoder.")
     sensor_min_idx = torch.tensor(stats.sensor_min, dtype=torch.float32, device=args.device)
     loc_min_xy = torch.tensor(stats.loc_min, dtype=torch.long, device=args.device)
     turn_max = float(ckpt["stats"]["action_turn_max"])

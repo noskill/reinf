@@ -3,17 +3,18 @@
 
 from typing import Dict, List, Optional
 
-import numpy as np
 import torch
 from torch import nn
 
 from base import PredictionLossMixin
+from observation import ObservationDecoder, ObservationEncoder
 from transformer import LlamaConfig, LlamaModel, LlamaRMSNorm
 from transformer_cached import CachedTransformer
 from rnn_cached import CachedRNN
 from utils import isotropic_normal_from_params, make_probe_head, scale_upstream_grad
 from recurrent_mlp import RecurrentMLP
 from recurrent_cache import clear_cache, reset_cache
+from util import tree_index
 
 
 class TransformerBaseline(PredictionLossMixin, nn.Module):
@@ -21,17 +22,16 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         self,
         config: LlamaConfig,
         *,
+        observation_encoder: ObservationEncoder,
+        observation_decoder: ObservationDecoder,
         sensor_mode: str,
-        sensor_dim: int,
         action_dim: int,
-        sensor_bins: Optional[np.ndarray],
         loc_x_bins: int,
         loc_y_bins: int,
         heading_dim: int,
         turn_bins: int,
         step_bins: int,
         action_latent_dim: int,
-        sensor_latent_dim: int,
         probe_hidden_dim: int = 256,
         probe_layers: int = 2,
         contrastive_dim: int = 0,
@@ -47,8 +47,7 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         self.step_bins = step_bins
         self.input_size = config.input_size
         self.action_latent_dim = action_latent_dim
-        self.sensor_latent_dim = sensor_latent_dim
-        self.sensor_dim = sensor_dim
+        self.sensor_latent_dim = observation_encoder.latent_dim
         self.action_dim = action_dim
         if self.action_dim <= 0:
             raise ValueError("action_dim inferred from config.input_size - sensor_dim must be > 0")
@@ -57,18 +56,12 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         self.contrastive_dim = contrastive_dim
         self.contrastive_steps = contrastive_steps
         self._validate_params()
-        if sensor_mode == "categorical":
-            assert sensor_bins is not None and len(sensor_bins) == 3
-            self.sensor_head_l = nn.Linear(config.hidden_size, int(sensor_bins[0]))
-            self.sensor_head_f = nn.Linear(config.hidden_size, int(sensor_bins[1]))
-            self.sensor_head_r = nn.Linear(config.hidden_size, int(sensor_bins[2]))
-        else:
-            self.sensor_head = nn.Linear(config.hidden_size, sensor_dim)
+        self.observation_encoder = observation_encoder
+        self.observation_decoder = observation_decoder
         self.loc_x_head = make_probe_head(config.hidden_size, loc_x_bins, self.probe_hidden_dim, self.probe_layers)
         self.loc_y_head = make_probe_head(config.hidden_size, loc_y_bins, self.probe_hidden_dim, self.probe_layers)
         self.heading_head = make_probe_head(config.hidden_size, heading_dim, self.probe_hidden_dim, self.probe_layers)
         self.action_encoder = make_probe_head(self.action_dim, self.action_latent_dim, self.probe_hidden_dim, 2)
-        self.sensor_encoder = make_probe_head(self.sensor_dim, self.sensor_latent_dim, self.probe_hidden_dim, 2)
         self.contrastive_context = nn.Linear(config.hidden_size, cpc_context_dim)
         self.obs_fuse = nn.Linear(config.hidden_size + self.action_latent_dim, config.hidden_size)
         self.turn_head = nn.Linear(config.hidden_size, turn_bins)
@@ -143,37 +136,36 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         if key_padding_mask is not None and key_padding_mask.any():
             raise ValueError("prime_cache does not support padded sequence steps")
 
-        state_input = sensor if sensor is not None else sensor_latent
-        batch_size, sequence_length = state_input.shape[:2]
+        batch_size, sequence_length = sensor_latent.shape[:2]
         if sequence_length < 1:
             raise ValueError("prime_cache requires at least one sequence step")
-        return sensor, sensor_latent, actions, prev_actions, state_input
+        return sensor, sensor_latent, actions, prev_actions
 
     def prime_cache(self, obs, episode_start=None):
-        sensor, sensor_latent, actions, prev_actions, state_input = self._prepare_prime_cache_inputs(obs)
-        batch_size, sequence_length = state_input.shape[:2]
+        sensor, sensor_latent, actions, prev_actions = self._prepare_prime_cache_inputs(obs)
+        batch_size, sequence_length = sensor_latent.shape[:2]
         if episode_start is None:
             episode_start = torch.zeros(
                 (batch_size, sequence_length),
                 dtype=torch.bool,
-                device=state_input.device,
+                device=sensor_latent.device,
             )
             episode_start[:, 0] = True
         assert episode_start.shape == (batch_size, sequence_length), \
             f"Expected episode_start [B,T], got {tuple(episode_start.shape)}"
-        episode_start = episode_start.to(device=state_input.device, dtype=torch.bool)
+        episode_start = episode_start.to(device=sensor_latent.device, dtype=torch.bool)
 
         self.clear_cache()
         result = None
         for step_idx in range(sequence_length):
             step_obs = {
-                "actions": None if actions is None else actions[:, step_idx],
-                "prev_actions": prev_actions[:, step_idx],
+                "actions": None if actions is None else actions[:, step_idx:step_idx + 1], # [B,1,A]
+                "prev_actions": prev_actions[:, step_idx:step_idx + 1],
             }
             if sensor is not None:
-                step_obs["sensor"] = sensor[:, step_idx]
+                step_obs["sensor"] = tree_index(sensor, (slice(None), slice(step_idx, step_idx + 1)))
             else:
-                step_obs["sensor_latent"] = sensor_latent[:, step_idx]
+                step_obs["sensor_latent"] = sensor_latent[:, step_idx:step_idx + 1]
             result = self.forward(
                 step_obs,
                 episode_start=episode_start[:, step_idx],
@@ -238,10 +230,7 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
             obs,
             episode_start=episode_start,
         )
-        using_internal_cache = episode_start is not None
         prev_action_latent = self.action_encoder(prev_actions)
-        if sensor_latent is None:
-            sensor_latent = self.sensor_encoder(sensor)
         x = torch.cat([sensor_latent, prev_action_latent], dim=-1)
         if x.shape[-1] != self.input_size:
             raise ValueError(f"Expected input_size {self.input_size}, got {x.shape[-1]}")
@@ -263,13 +252,7 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         else:
             action_latent = self.action_encoder(actions)
             obs_feat = torch.tanh(self.obs_fuse(torch.cat([h, action_latent], dim=-1)))
-            if self.sensor_mode != "categorical":
-                raise ValueError("TransformerBaseline currently supports sensor_mode='categorical' only.")
-            pred_sensor = (
-                self.sensor_head_l(obs_feat),
-                self.sensor_head_f(obs_feat),
-                self.sensor_head_r(obs_feat),
-            )
+            pred_sensor = self.observation_decoder.decode(obs_feat)
         aux_inputs = self.compute_aux(h, action_latent, episode_start, sensor_latent)
         # State probes (current-step location/heading) read detached state.
         h_probe = h.detach()
@@ -329,9 +312,9 @@ class RNNPredictor(TransformerBaseline):
         self,
         config: LlamaConfig,
         *,
+        observation_encoder: ObservationEncoder,
+        observation_decoder: ObservationDecoder,
         sensor_mode: str,
-        sensor_dim: int,
-        sensor_bins: Optional[np.ndarray],
         loc_x_bins: int,
         loc_y_bins: int,
         heading_dim: int,
@@ -339,7 +322,6 @@ class RNNPredictor(TransformerBaseline):
         step_bins: int,
         action_dim: int,
         action_latent_dim: int,
-        sensor_latent_dim: int,
         probe_hidden_dim: int = 256,
         probe_layers: int = 2,
         state_norm: str = "none",
@@ -349,9 +331,9 @@ class RNNPredictor(TransformerBaseline):
     ):
         super().__init__(
             config,
+            observation_encoder=observation_encoder,
+            observation_decoder=observation_decoder,
             sensor_mode=sensor_mode,
-            sensor_dim=sensor_dim,
-            sensor_bins=sensor_bins,
             loc_x_bins=loc_x_bins,
             loc_y_bins=loc_y_bins,
             heading_dim=heading_dim,
@@ -359,7 +341,6 @@ class RNNPredictor(TransformerBaseline):
             step_bins=step_bins,
             action_dim=action_dim,
             action_latent_dim=action_latent_dim,
-            sensor_latent_dim=sensor_latent_dim,
             probe_hidden_dim=probe_hidden_dim,
             probe_layers=probe_layers,
             contrastive_dim=contrastive_dim,

@@ -6,6 +6,7 @@ from dataclasses import asdict
 from types import SimpleNamespace
 from typing import Dict
 
+import gymnasium as gym
 import torch
 import numpy
 from ppo import PPO
@@ -22,6 +23,12 @@ from wm_joint_agent import JointWMPPO
 from double import DoubleAgent
 from goal_agent import GoalAgent
 from goal_agent_low import LowLevelAgent
+from observation import (
+    create_agimaze_baseline_observation_codec,
+    create_agimaze_discrete_observation_codec,
+    create_maze_baseline_observation_codec,
+    create_maze_discrete_observation_codec,
+)
 from utils import make_soft_table, make_label_smoothing_table
 
 
@@ -52,8 +59,6 @@ _MODEL_ARG_DEFAULTS = {
     "contrastive_steps": 1,
     "bptt_horizon": 0,
     "prior_rollout_steps": 0,
-    "recon_beta": 1.0,
-    "obs_loss_mode": "soft",
     "probe_hidden_dim": 256,
     "probe_layers": 2,
     "obs_latent_dim": 64,
@@ -107,8 +112,6 @@ _MODEL_ARG_FIELDS = (
     "contrastive_steps",
     "bptt_horizon",
     "prior_rollout_steps",
-    "recon_beta",
-    "obs_loss_mode",
     "probe_hidden_dim",
     "probe_layers",
     "obs_latent_dim",
@@ -189,7 +192,7 @@ def add_create_model_args(
         _arg_option(arg_prefix, "model_type"),
         dest=_arg_dest(arg_prefix, "model_type"),
         type=str,
-        choices=["transformer", "rnn", "rssm-discrete", "tssm"],
+        choices=["transformer", "rnn", "rssm", "tssm"],
         default=resolved_defaults["model_type"],
         help="Model architecture to train.",
     )
@@ -316,21 +319,6 @@ def add_create_model_args(
         help="Open-loop prior rollout length for prior_roll loss (0 uses full sequence).",
     )
     parser.add_argument(
-        _arg_option(arg_prefix, "recon_beta"),
-        dest=_arg_dest(arg_prefix, "recon_beta"),
-        type=float,
-        default=resolved_defaults["recon_beta"],
-        help="Weight for observation reconstruction term.",
-    )
-    parser.add_argument(
-        _arg_option(arg_prefix, "obs_loss_mode"),
-        dest=_arg_dest(arg_prefix, "obs_loss_mode"),
-        type=str,
-        choices=["soft", "recon"],
-        default=resolved_defaults["obs_loss_mode"],
-        help="Observation loss for RSSM/TSSM: soft-target heads or L2 reconstruction from [h_t, z_t].",
-    )
-    parser.add_argument(
         _arg_option(arg_prefix, "probe_hidden_dim"),
         dest=_arg_dest(arg_prefix, "probe_hidden_dim"),
         type=int,
@@ -411,99 +399,130 @@ def extract_create_model_args(
     return SimpleNamespace(**values)
 
 
-def create_model(
-    args,
-    *,
-    input_dim: int,
-    sensor_dim: int,
-    action_dim: int,
-    sensor_bins,
-    loc_x_bins: int,
-    loc_y_bins: int,
-    heading_dim: int,
-    turn_bins: int,
-    step_bins: int,
-    obs_dim: int,
-    active_attention_window,
-    model_config_extra: Dict,
-    logger=None,
-):
+def _observation_space_spec(observation_type, observation_space):
+    if observation_type not in {"maze", "agimaze"}:
+        raise ValueError(f"Unsupported observation type: {observation_type}")
+    if not isinstance(observation_space, gym.spaces.Dict) or "sensor" not in observation_space.spaces:
+        raise ValueError("observation_space must be Dict containing 'sensor'")
+    sensor_space = observation_space["sensor"]
+    if observation_type == "maze":
+        if not isinstance(sensor_space, gym.spaces.Box):
+            raise ValueError("Maze sensor space must be Box")
+        if sensor_space.shape != (3,):
+            raise ValueError(f"Expected maze sensor space shape (3,), got {sensor_space.shape}")
+        return 3, None
+    if not isinstance(sensor_space, gym.spaces.Dict):
+        raise ValueError("AgiMaze sensor space must be Dict")
+    if set(sensor_space.spaces) != {"movement_result", "inventory"}:
+        raise ValueError("AgiMaze sensor space must contain movement_result and inventory")
+    movement_result_space = sensor_space["movement_result"]
+    inventory_space = sensor_space["inventory"]
+    if not isinstance(movement_result_space, gym.spaces.Discrete):
+        raise ValueError("movement_result space must be Discrete")
+    if not isinstance(inventory_space, gym.spaces.MultiBinary) or len(inventory_space.shape) != 1:
+        raise ValueError("inventory space must be one-dimensional MultiBinary")
+    return movement_result_space.n, inventory_space.shape[0]
+
+
+def create_baseline_observation_codec(observation_type, observation_space, args, *,
+                                      feature_dim: int, sensor_bins=None):
+    first_dim, second_dim = _observation_space_spec(observation_type, observation_space)
+    if observation_type == "maze":
+        if sensor_bins is None:
+            raise ValueError("sensor_bins are required for maze observation decoder")
+        return create_maze_baseline_observation_codec(
+            sensor_dim=first_dim,
+            sensor_latent_dim=args.sensor_latent_dim,
+            feature_dim=feature_dim,
+            sensor_bins=sensor_bins,
+            hidden_dim=args.probe_hidden_dim,
+        )
+    return create_agimaze_baseline_observation_codec(
+        movement_result_classes=first_dim,
+        inventory_size=second_dim,
+        observation_latent_dim=args.sensor_latent_dim,
+        feature_dim=feature_dim,
+        hidden_dim=args.probe_hidden_dim,
+    )
+
+
+def create_discrete_observation_codec(observation_type, observation_space, args, *,
+                                      feature_dim: int, stochastic_dim: int,
+                                      hidden_size: int, sensor_bins=None):
+    first_dim, second_dim = _observation_space_spec(observation_type, observation_space)
+    if observation_type == "maze":
+        if sensor_bins is None:
+            raise ValueError("sensor_bins are required for maze observation decoder")
+        return create_maze_discrete_observation_codec(
+            sensor_dim=first_dim,
+            sensor_latent_dim=args.obs_latent_dim,
+            feature_dim=feature_dim,
+            stochastic_dim=stochastic_dim,
+            hidden_size=hidden_size,
+            sensor_bins=sensor_bins,
+        )
+    return create_agimaze_discrete_observation_codec(
+        movement_result_classes=first_dim,
+        inventory_size=second_dim,
+        observation_latent_dim=args.obs_latent_dim,
+        feature_dim=feature_dim,
+        stochastic_dim=stochastic_dim,
+        hidden_size=hidden_size,
+        hidden_dim=args.probe_hidden_dim,
+    )
+
+
+def create_baseline_model(args, *, input_dim: int, action_dim: int,
+                          observation_encoder, observation_decoder,
+                          loc_x_bins: int, loc_y_bins: int, heading_dim: int,
+                          turn_bins: int, step_bins: int, active_attention_window,
+                          model_config_extra: Dict, logger=None):
+    if args.model_type not in {"transformer", "rnn"}:
+        raise ValueError(f"Expected baseline model type, got {args.model_type}")
+    if args.model_type == "transformer" and args.hidden_size != args.heads * args.head_dim:
+        raise ValueError("hidden_size must equal heads * head_dim")
+
+    cfg = LlamaConfig(
+        input_size=input_dim,
+        hidden_size=args.hidden_size,
+        intermediate_size=args.intermediate,
+        num_hidden_layers=args.layers,
+        num_attention_heads=args.heads,
+        num_key_value_heads=args.heads,
+        head_dim=args.head_dim,
+        attention_dropout=args.attention_dropout,
+        attention_window=active_attention_window,
+    )
+    common_kwargs = {
+        "observation_encoder": observation_encoder,
+        "observation_decoder": observation_decoder,
+        "sensor_mode": args.sensor_mode,
+        "action_dim": action_dim,
+        "loc_x_bins": loc_x_bins,
+        "loc_y_bins": loc_y_bins,
+        "heading_dim": heading_dim,
+        "turn_bins": turn_bins,
+        "step_bins": step_bins,
+        "action_latent_dim": args.action_latent_dim,
+        "probe_hidden_dim": args.probe_hidden_dim,
+        "probe_layers": args.probe_layers,
+        "contrastive_dim": args.contrastive_dim,
+        "contrastive_steps": args.contrastive_steps,
+        "logger": logger,
+    }
     if args.model_type == "transformer":
-        if args.sensor_mode != "categorical":
-            raise ValueError("model-type=transformer currently supports --sensor-mode categorical only")
-        if args.hidden_size != args.heads * args.head_dim:
-            raise ValueError("hidden_size must equal heads * head_dim")
-        cfg = LlamaConfig(
-            input_size=input_dim,
-            hidden_size=args.hidden_size,
-            intermediate_size=args.intermediate,
-            num_hidden_layers=args.layers,
-            num_attention_heads=args.heads,
-            num_key_value_heads=args.heads,
-            head_dim=args.head_dim,
-            attention_dropout=args.attention_dropout,
-            attention_window=active_attention_window,
-        )
-        model = TransformerBaseline(
-            cfg,
-            sensor_mode=args.sensor_mode,
-            sensor_dim=sensor_dim,
-            action_dim=action_dim,
-            sensor_bins=sensor_bins if args.sensor_mode == "categorical" else None,
-            loc_x_bins=loc_x_bins,
-            loc_y_bins=loc_y_bins,
-            heading_dim=heading_dim,
-            turn_bins=turn_bins,
-            step_bins=step_bins,
-            action_latent_dim=args.action_latent_dim,
-            sensor_latent_dim=args.sensor_latent_dim,
-            probe_hidden_dim=args.probe_hidden_dim,
-            probe_layers=args.probe_layers,
-            contrastive_dim=args.contrastive_dim,
-            contrastive_steps=args.contrastive_steps,
-            logger=logger,
-        ).to(args.device)
+        model = TransformerBaseline(cfg, **common_kwargs)
         model_config_extra["llama"] = asdict(cfg)
-        model_config_extra["probe_hidden_dim"] = args.probe_hidden_dim
-        model_config_extra["probe_layers"] = args.probe_layers
-        model_config_extra["contrastive_dim"] = args.contrastive_dim
-        model_config_extra["contrastive_steps"] = args.contrastive_steps
-        model_config_extra["action_latent_dim"] = args.action_latent_dim
-        model_config_extra["sensor_latent_dim"] = args.sensor_latent_dim
-    elif args.model_type == "rnn":
-        if args.sensor_mode != "categorical":
-            raise ValueError("model-type=rnn currently supports --sensor-mode categorical only")
-        cfg = LlamaConfig(
-            input_size=input_dim,
-            hidden_size=args.hidden_size,
-            intermediate_size=args.intermediate,
-            num_hidden_layers=args.layers,
-            num_attention_heads=args.heads,
-            num_key_value_heads=args.heads,
-            head_dim=args.head_dim,
-            attention_dropout=args.attention_dropout,
-            attention_window=active_attention_window,
-        )
-        model = RNNPredictor(
-            cfg,
-            sensor_mode=args.sensor_mode,
-            sensor_dim=sensor_dim,
-            action_dim=action_dim,
-            sensor_bins=sensor_bins if args.sensor_mode == "categorical" else None,
-            loc_x_bins=loc_x_bins,
-            loc_y_bins=loc_y_bins,
-            heading_dim=heading_dim,
-            turn_bins=turn_bins,
-            step_bins=step_bins,
-            action_latent_dim=args.action_latent_dim,
-            sensor_latent_dim=args.sensor_latent_dim,
-            probe_hidden_dim=args.probe_hidden_dim,
-            probe_layers=args.probe_layers,
-            state_norm=args.rnn_state_norm,
-            contrastive_dim=args.contrastive_dim,
-            contrastive_steps=args.contrastive_steps,
-            logger=logger,
-        ).to(args.device)
+        model_config_extra.update({
+            "probe_hidden_dim": args.probe_hidden_dim,
+            "probe_layers": args.probe_layers,
+            "contrastive_dim": args.contrastive_dim,
+            "contrastive_steps": args.contrastive_steps,
+            "action_latent_dim": args.action_latent_dim,
+            "sensor_latent_dim": args.sensor_latent_dim,
+        })
+    else:
+        model = RNNPredictor(cfg, state_norm=args.rnn_state_norm, **common_kwargs)
         model_config_extra["rnn"] = {
             "input_size": input_dim,
             "hidden_size": args.hidden_size,
@@ -516,42 +535,53 @@ def create_model(
             "action_latent_dim": args.action_latent_dim,
             "sensor_latent_dim": args.sensor_latent_dim,
         }
-    elif args.model_type == "rssm-discrete":
+    return model.to(args.device)
+
+
+def create_rssm_tssm_model(args, *, action_dim: int, observation_codecs,
+                           loc_x_bins: int, loc_y_bins: int, heading_dim: int,
+                           turn_bins: int, step_bins: int, active_attention_window,
+                           model_config_extra: Dict, logger=None):
+    if args.model_type not in {"rssm", "tssm"}:
+        raise ValueError(f"Expected discrete model type, got {args.model_type}")
+    observation_encoder, observation_decoder, z_observation_decoder, h_observation_decoder = observation_codecs
+    common_kwargs = {
+        "observation_encoder": observation_encoder,
+        "observation_decoder": observation_decoder,
+        "z_observation_decoder": z_observation_decoder,
+        "h_observation_decoder": h_observation_decoder,
+        "hidden_size": args.hidden_size,
+        "sensor_mode": args.sensor_mode,
+        "loc_x_bins": loc_x_bins,
+        "loc_y_bins": loc_y_bins,
+        "heading_dim": heading_dim,
+        "turn_bins": turn_bins,
+        "step_bins": step_bins,
+        "action_dim": action_dim,
+        "stoch_size": args.stoch_size,
+        "stoch_classes": args.stoch_classes,
+        "stoch_temp": args.stoch_temp,
+        "kl_dyn_beta": args.kl_dyn_beta,
+        "kl_rep_beta": args.kl_rep_beta,
+        "kl_free_nats": args.kl_free_nats,
+        "prior_rollout_weight": args.prior_rollout_weight,
+        "bptt_horizon": args.bptt_horizon,
+        "z_only_weight": args.z_only_weight,
+        "h_only_weight": args.h_only_weight,
+        "prior_rollout_steps": args.prior_rollout_steps,
+        "probe_hidden_dim": args.probe_hidden_dim,
+        "probe_layers": args.probe_layers,
+        "contrastive_dim": args.contrastive_dim,
+        "contrastive_steps": args.contrastive_steps,
+        "logger": logger,
+    }
+    if args.model_type == "rssm":
         model = RSSMDiscretePredictor(
-            hidden_size=args.hidden_size,
-            sensor_mode=args.sensor_mode,
-            sensor_dim=sensor_dim,
-            sensor_bins=sensor_bins if args.sensor_mode == "categorical" else None,
-            loc_x_bins=loc_x_bins,
-            loc_y_bins=loc_y_bins,
-            heading_dim=heading_dim,
-            turn_bins=turn_bins,
-            step_bins=step_bins,
-            obs_dim=obs_dim,
-            obs_latent_dim=args.obs_latent_dim,
-            action_dim=action_dim,
-            stoch_size=args.stoch_size,
-            stoch_classes=args.stoch_classes,
-            stoch_temp=args.stoch_temp,
-            kl_dyn_beta=args.kl_dyn_beta,
-            kl_rep_beta=args.kl_rep_beta,
-            kl_free_nats=args.kl_free_nats,
-            prior_rollout_weight=args.prior_rollout_weight,
-            bptt_horizon=args.bptt_horizon,
-            z_only_weight=args.z_only_weight,
-            h_only_weight=args.h_only_weight,
-            prior_rollout_steps=args.prior_rollout_steps,
-            probe_hidden_dim=args.probe_hidden_dim,
-            probe_layers=args.probe_layers,
-            contrastive_dim=args.contrastive_dim,
-            contrastive_steps=args.contrastive_steps,
             transition=args.rssm_transition,
             residual_scale=args.rssm_residual_scale,
             state_norm=args.rssm_state_norm,
-            recon_beta=args.recon_beta,
-            obs_loss_mode=args.obs_loss_mode,
-            logger=logger,
-        ).to(args.device)
+            **common_kwargs,
+        )
         model_config_extra["rssm"] = {
             "hidden_size": args.hidden_size,
             "stoch_size": args.stoch_size,
@@ -572,47 +602,17 @@ def create_model(
             "transition": args.rssm_transition,
             "residual_scale": args.rssm_residual_scale,
             "state_norm": args.rssm_state_norm,
-            "recon_beta": args.recon_beta,
             "action_dim": action_dim,
-            "obs_loss_mode": args.obs_loss_mode,
         }
-    elif args.model_type == "tssm":
+    else:
         model = TSSMDiscretePredictor(
-            hidden_size=args.hidden_size,
             layers=args.layers,
             heads=args.heads,
             head_dim=args.head_dim,
             intermediate=args.intermediate,
             attention_window=active_attention_window,
-            sensor_mode=args.sensor_mode,
-            sensor_dim=sensor_dim,
-            sensor_bins=sensor_bins if args.sensor_mode == "categorical" else None,
-            loc_x_bins=loc_x_bins,
-            loc_y_bins=loc_y_bins,
-            heading_dim=heading_dim,
-            turn_bins=turn_bins,
-            step_bins=step_bins,
-            obs_dim=obs_dim,
-            obs_latent_dim=args.obs_latent_dim,
-            action_dim=action_dim,
-            stoch_size=args.stoch_size,
-            stoch_classes=args.stoch_classes,
-            stoch_temp=args.stoch_temp,
-            kl_dyn_beta=args.kl_dyn_beta,
-            kl_rep_beta=args.kl_rep_beta,
-            kl_free_nats=args.kl_free_nats,
-            prior_rollout_weight=args.prior_rollout_weight,
-            bptt_horizon=args.bptt_horizon,
-            z_only_weight=args.z_only_weight,
-            h_only_weight=args.h_only_weight,
-            prior_rollout_steps=args.prior_rollout_steps,
-            probe_hidden_dim=args.probe_hidden_dim,
-            probe_layers=args.probe_layers,
-            contrastive_dim=args.contrastive_dim,
-            contrastive_steps=args.contrastive_steps,
-            recon_beta=args.recon_beta,
-            obs_loss_mode=args.obs_loss_mode,
-        ).to(args.device)
+            **common_kwargs,
+        )
         model_config_extra["tssm"] = {
             "hidden_size": args.hidden_size,
             "layers": args.layers,
@@ -635,10 +635,77 @@ def create_model(
             "probe_layers": args.probe_layers,
             "contrastive_dim": args.contrastive_dim,
             "contrastive_steps": args.contrastive_steps,
-            "recon_beta": args.recon_beta,
             "action_dim": action_dim,
-            "obs_loss_mode": args.obs_loss_mode,
         }
+    return model.to(args.device)
+
+
+def create_model(
+    args,
+    *,
+    input_dim: int,
+    action_dim: int,
+    observation_type: str,
+    observation_space,
+    sensor_bins,
+    loc_x_bins: int,
+    loc_y_bins: int,
+    heading_dim: int,
+    turn_bins: int,
+    step_bins: int,
+    active_attention_window,
+    model_config_extra: Dict,
+    logger=None,
+):
+    if args.sensor_mode != "categorical":
+        raise ValueError("World models currently require --sensor-mode categorical")
+
+    if args.model_type in {"transformer", "rnn"}:
+        observation_encoder, observation_decoder = create_baseline_observation_codec(
+            observation_type,
+            observation_space,
+            args,
+            feature_dim=args.hidden_size,
+            sensor_bins=sensor_bins,
+        )
+        model = create_baseline_model(
+            args,
+            input_dim=input_dim,
+            action_dim=action_dim,
+            observation_encoder=observation_encoder,
+            observation_decoder=observation_decoder,
+            loc_x_bins=loc_x_bins,
+            loc_y_bins=loc_y_bins,
+            heading_dim=heading_dim,
+            turn_bins=turn_bins,
+            step_bins=step_bins,
+            active_attention_window=active_attention_window,
+            model_config_extra=model_config_extra,
+            logger=logger,
+        )
+    elif args.model_type in {"rssm", "tssm"}:
+        observation_codecs = create_discrete_observation_codec(
+            observation_type,
+            observation_space,
+            args,
+            feature_dim=args.hidden_size + args.stoch_size * args.stoch_classes,
+            stochastic_dim=args.stoch_size * args.stoch_classes,
+            hidden_size=args.hidden_size,
+            sensor_bins=sensor_bins,
+        )
+        model = create_rssm_tssm_model(
+            args,
+            action_dim=action_dim,
+            observation_codecs=observation_codecs,
+            loc_x_bins=loc_x_bins,
+            loc_y_bins=loc_y_bins,
+            heading_dim=heading_dim,
+            turn_bins=turn_bins,
+            step_bins=step_bins,
+            active_attention_window=active_attention_window,
+            model_config_extra=model_config_extra,
+            logger=logger,
+        )
     else:
         raise ValueError(f"Unknown model type: {args.model_type}")
 
@@ -880,13 +947,17 @@ def create_double_policy_agent(args, wm_model_args, wm_model, logger, maze_dim, 
     return agent
 
 
-def create_maze_world_model(
+def create_world_model(
     *,
     model_args,
     device: torch.device,
+    observation_type: str,
+    observation_space,
     maze_dim: int,
     turn_bins: int,
     step_bins: int,
+    action_dim: int = 2,
+    heading_dim: int = 4,
     contrastive_temp: float = 0.1,
     contrastive_horizon_discount: float = 0.75,
     contrastive_uncertainty_weight: float = 0.05,
@@ -899,17 +970,26 @@ def create_maze_world_model(
     pos_sigma: float = 1.0,
     heading_smoothing: float = 0.0,
     sensor_max_bin: int = 64,
-    logger=None
-) -> TransformerBaseline:
+    logger=None,
+):
     if int(model_args.contrastive_dim) <= 0:
         raise ValueError("contrastive_dim must be > 0 for AC-CPC intrinsic reward")
-    if sensor_max_bin < 1:
-        raise ValueError("sensor_max_bin must be >= 1")
     if maze_dim < 2:
         raise ValueError("maze_dim must be >= 2")
 
-    sensor_bin_count = int(sensor_max_bin) + 1
-    sensor_bins = numpy.array([sensor_bin_count, sensor_bin_count, sensor_bin_count], dtype=numpy.int64)
+    _observation_space_spec(observation_type, observation_space)
+    if observation_type == "maze":
+        if sensor_max_bin < 1:
+            raise ValueError("sensor_max_bin must be >= 1")
+        sensor_bin_count = int(sensor_max_bin) + 1
+        sensor_bins = numpy.full(3, sensor_bin_count, dtype=numpy.int64)
+        sensor_tables = [make_soft_table(sensor_bin_count, sensor_sigma, device) for _ in range(3)]
+        sensor_min_idx = torch.zeros(3, dtype=torch.long, device=device)
+    else:
+        sensor_bins = None
+        sensor_tables = None
+        sensor_min_idx = None
+
     model_args.device = device
     active_attention_window = (
         model_args.attention_window
@@ -921,31 +1001,26 @@ def create_maze_world_model(
     model = create_model(
         model_args,
         input_dim=input_dim,
-        sensor_dim=3,
+        observation_type=observation_type,
+        observation_space=observation_space,
         sensor_bins=sensor_bins,
         loc_x_bins=int(maze_dim),
         loc_y_bins=int(maze_dim),
-        heading_dim=4,
+        heading_dim=int(heading_dim),
         turn_bins=int(turn_bins),
         step_bins=int(step_bins),
-        obs_dim=3,
-        action_dim=2,
+        action_dim=int(action_dim),
         active_attention_window=active_attention_window,
         model_config_extra=model_config_extra,
         logger=logger,
     )
     loc_min = torch.tensor([0.0, 0.0], dtype=torch.float32, device=device)
-    sensor_min_idx = torch.zeros(3, dtype=torch.long, device=device)
     model.config = LossConfig(
-        sensor_tables=[
-            make_soft_table(sensor_bin_count, sensor_sigma, device),
-            make_soft_table(sensor_bin_count, sensor_sigma, device),
-            make_soft_table(sensor_bin_count, sensor_sigma, device),
-        ],
+        sensor_tables=sensor_tables,
         sensor_min_idx=sensor_min_idx,
         loc_x_table=make_soft_table(int(maze_dim), pos_sigma, device),
         loc_y_table=make_soft_table(int(maze_dim), pos_sigma, device),
-        heading_table=make_label_smoothing_table(4, heading_smoothing, device),
+        heading_table=make_label_smoothing_table(int(heading_dim), heading_smoothing, device),
         sensor_weight=sensor_weight,
         loc_weight=loc_weight,
         head_weight=head_weight,
@@ -958,3 +1033,22 @@ def create_maze_world_model(
         loc_min=loc_min,
     )
     return model
+
+
+def create_maze_world_model(*, model_args, device: torch.device, maze_dim: int,
+                            turn_bins: int, step_bins: int, sensor_max_bin: int = 64,
+                            **kwargs):
+    observation_space = gym.spaces.Dict({
+        "sensor": gym.spaces.Box(low=0, high=sensor_max_bin, shape=(3,), dtype=numpy.float32),
+    })
+    return create_world_model(
+        model_args=model_args,
+        device=device,
+        observation_type="maze",
+        observation_space=observation_space,
+        maze_dim=maze_dim,
+        turn_bins=turn_bins,
+        step_bins=step_bins,
+        sensor_max_bin=sensor_max_bin,
+        **kwargs,
+    )

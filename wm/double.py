@@ -4,7 +4,7 @@ from typing import Dict
 
 from ppo import PPOBase
 from wm_joint_agent import BaseWMOnPolicy, _WMEpisodePool
-from util import EpisodeBatch
+from util import EpisodeBatch, detach as detach_tree, to_device, tree_stack
 
 
 class DoubleAgent(BaseWMOnPolicy):
@@ -326,9 +326,9 @@ class DoubleAgent(BaseWMOnPolicy):
         try:
             self.wm_model.eval()
             with torch.no_grad():
-                sensor = [torch.stack([
-                        torch.as_tensor(episode[current_step][0]["sensor"], dtype=torch.float32)
-                        for current_step in range(step_idx[i] + 1)]).to(self.device)
+                sensor = [tree_stack([
+                        episode[current_step][0]["sensor"]
+                        for current_step in range(step_idx[i] + 1)])
                     for i, episode in enumerate(replay_episodes)]
 
                 action_indices = [torch.stack([
@@ -336,7 +336,7 @@ class DoubleAgent(BaseWMOnPolicy):
                         for current_step in range(step_idx[i] + 1)]).to(self.device)
                     for i, episode in enumerate(replay_episodes)]
 
-                actions = [self.action_idx_to_val(ai).to(sensor[0]) for ai in action_indices]
+                actions = [self.action_idx_to_val(ai).to(self.action_cont_table) for ai in action_indices]
                 prefix_batch = EpisodeBatch({
                     "actions": actions,
                     "sensor": sensor,
@@ -427,11 +427,12 @@ class DoubleAgent(BaseWMOnPolicy):
                     scale = cpc_dist.base_dist.scale[..., 0]
                     prediction_scales.append(scale)
                     pred_sensor_latent = self.wm_model.cpc_sensor_latent_head(pred_cpc)
+                    # Each autoregressive call advances one step; the WM cache carries prior virtual history.
                     next_out = self.wm_model(
                         {
-                            "sensor_latent": pred_sensor_latent,
+                            "sensor_latent": pred_sensor_latent.unsqueeze(1),
                             "actions": None,
-                            "prev_actions": action_values,
+                            "prev_actions": action_values.unsqueeze(1),
                         },
                         episode_start=torch.zeros(
                             num_virtual_episodes,
@@ -699,11 +700,12 @@ class DoubleAgent(BaseWMOnPolicy):
                     action_values = self.action_idx_to_val(actions).to(h)
                     pred_cpc = self.wm_model.predict_next_contrastive_dist(h, action_values).mean
                     pred_sensor_latent = self.wm_model.cpc_sensor_latent_head(pred_cpc)
+                    # Each autoregressive call advances one step; the WM cache carries prior virtual history.
                     next_out = self.wm_model(
                         {
-                            "sensor_latent": pred_sensor_latent,
+                            "sensor_latent": pred_sensor_latent.unsqueeze(1),
                             "actions": None,
-                            "prev_actions": action_values,
+                            "prev_actions": action_values.unsqueeze(1),
                         },
                         episode_start=torch.zeros(
                             branch_indices.numel(),
@@ -1262,7 +1264,7 @@ class DoubleAgent(BaseWMOnPolicy):
         self.agent_high.store_prediction_context(wm_out["state_last"], actions)
 
         wm_states = {
-            "sensor": state["sensor"].detach().to("cpu"),
+            "sensor": to_device(detach_tree(state["sensor"]), torch.device("cpu")),
             "heading_idx": state["heading_idx"].detach().to("cpu"),
             "location": state["location"].detach().to("cpu"),
             "policy_state": low_state.detach().to("cpu"),

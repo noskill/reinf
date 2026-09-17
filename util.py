@@ -364,6 +364,52 @@ def detach(x: Any):
     return tree_map(x, lambda t: t.detach() if isinstance(t, torch.Tensor) else t)
 
 
+def get_first_tensor(x: Any) -> torch.Tensor:
+    if isinstance(x, torch.Tensor):
+        return x
+    if isinstance(x, dict):
+        if not x:
+            raise ValueError("Tensor tree must not be empty")
+        return get_first_tensor(next(iter(x.values())))
+    raise TypeError(f"Expected tensor tree, got {type(x).__name__}")
+
+
+def tree_index(x: Any, index) -> Any:
+    return tree_map(x, lambda tensor: tensor[index])
+
+
+def tree_stack(items: List[Any], dim: int = 0) -> Any:
+    if not items:
+        raise ValueError("tree_stack requires at least one item")
+    first = items[0]
+    if isinstance(first, torch.Tensor):
+        assert all(isinstance(item, torch.Tensor) for item in items)
+        return torch.stack(items, dim=dim)
+    if isinstance(first, dict):
+        keys = tuple(first.keys())
+        assert all(isinstance(item, dict) and tuple(item.keys()) == keys for item in items)
+        return {key: tree_stack([item[key] for item in items], dim=dim) for key in keys}
+    raise TypeError(f"Expected tensor tree, got {type(first).__name__}")
+
+
+def pad_tree_sequence_list(seq_list: List[Any], pad_value: float = 0.0,
+                           batch_first: bool = True) -> Any:
+    if not seq_list:
+        raise ValueError("pad_tree_sequence_list requires at least one sequence")
+    first = seq_list[0]
+    if isinstance(first, torch.Tensor):
+        assert all(isinstance(seq, torch.Tensor) for seq in seq_list)
+        return pad_sequence(seq_list, batch_first=batch_first, padding_value=pad_value)
+    if isinstance(first, dict):
+        keys = tuple(first.keys())
+        assert all(isinstance(seq, dict) and tuple(seq.keys()) == keys for seq in seq_list)
+        return {
+            key: pad_tree_sequence_list([seq[key] for seq in seq_list], pad_value, batch_first)
+            for key in keys
+        }
+    raise TypeError(f"Expected tensor tree, got {type(first).__name__}")
+
+
 def pad_sequence_list(seq_list: List[torch.Tensor], pad_value: float = 0.0, batch_first: bool = True) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Pad a list of 2D/3D tensors with time in dim=0 into [B, T, ...].
@@ -388,16 +434,11 @@ def pad_dict_sequence_list(dict_list: List[Dict[str, torch.Tensor]], pad_value: 
     """
     if len(dict_list) == 0:
         raise ValueError("pad_dict_sequence_list requires at least one sequence")
-    keys = list(dict_list[0].keys())
-    # Compute lengths from any one key
-    lengths = torch.tensor([dict_list[i][keys[0]].shape[0] for i in range(len(dict_list))], dtype=torch.long)
+    lengths = torch.tensor([get_first_tensor(item).shape[0] for item in dict_list], dtype=torch.long)
     max_len = int(lengths.max().item()) if lengths.numel() > 0 else 0
     arange = torch.arange(max_len, device=lengths.device)
     mask = arange.unsqueeze(0) >= lengths.unsqueeze(1)
-    padded: Dict[str, torch.Tensor] = {}
-    for k in keys:
-        seqs = [d[k] for d in dict_list]
-        padded[k] = pad_sequence(seqs, batch_first=batch_first, padding_value=pad_value)
+    padded = pad_tree_sequence_list(dict_list, pad_value, batch_first)
     return padded, mask, lengths
 
 
@@ -521,10 +562,7 @@ class EpisodeBatch:
 
     @staticmethod
     def _length_of_episode_item(x: TensorLike) -> int:
-        if isinstance(x, dict):
-            any_key = next(iter(x))
-            return int(x[any_key].shape[0])
-        return int(x.shape[0])
+        return int(get_first_tensor(x).shape[0])
 
     @property
     def num_episodes(self) -> int:
@@ -578,12 +616,7 @@ class EpisodeBatch:
             if k not in self.data:
                 continue
             lst = self.data[k]
-            if isinstance(lst[0], dict):
-                padded[k], _, _ = pad_dict_sequence_list(lst, pad_value=pad_value, batch_first=True)
-            elif isinstance(lst[0], torch.Tensor):
-                padded[k], _, _ = pad_sequence_list(lst, pad_value=pad_value, batch_first=True)
-            else:
-                raise TypeError(f"Unsupported episode item type for field '{k}'")
+            padded[k] = pad_tree_sequence_list(lst, pad_value=pad_value, batch_first=True)
         return padded, key_padding_mask, lengths
 
     def left_pad(
@@ -611,6 +644,15 @@ class EpisodeBatch:
                 padding_value=pad_value,
             )
             return padded.flip(dims=(1,))
+        def left_pad_tree(seq_list: List[Any]) -> Any:
+            first = seq_list[0]
+            if isinstance(first, torch.Tensor):
+                return left_pad_tensors(seq_list)
+            if isinstance(first, dict):
+                keys = tuple(first.keys())
+                assert all(isinstance(seq, dict) and tuple(seq.keys()) == keys for seq in seq_list)
+                return {key: left_pad_tree([seq[key] for seq in seq_list]) for key in keys}
+            raise TypeError(f"Expected tensor tree, got {type(first).__name__}")
         padded: Dict[str, Any] = {}
         for field in fields:
             if field not in self.data:
@@ -618,18 +660,7 @@ class EpisodeBatch:
             episodes = self.data[field]
             if not episodes:
                 raise ValueError(f"Field '{field}' contains no episodes")
-            first = episodes[0]
-            if isinstance(first, dict):
-                keys = list(first.keys())
-                padded[field] = {}
-                # Fix: Extract sequences per key across all episodes and pad them
-                for key in keys:
-                    seq_list = [episode[key] for episode in episodes]
-                    padded[field][key] = left_pad_tensors(seq_list)
-            elif isinstance(first, torch.Tensor):
-                padded[field] = left_pad_tensors(episodes)
-            else:
-                raise TypeError(f"Unsupported episode item type for field '{field}'")
+            padded[field] = left_pad_tree(episodes)
         return padded, key_padding_mask, lengths
 
     def flatten(self, fields: Optional[Sequence[str]] = None) -> Dict[str, Any]:

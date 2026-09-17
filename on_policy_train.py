@@ -70,7 +70,7 @@ class OnPolicyTrainer:
         self.save_interval = save_interval
         self.checkpoint = checkpoint
         self.seed = seed
-        self.max_episode_steps = getattr(self.env.unwrapped, "max_episode_length", None)
+        self.max_episode_steps = getattr(self.env, "max_episode_length", None)
         self.early_termination_scale = float(getattr(agent, "early_termination_penalty_scale", 0.0))
 
     def compute_terminal_reward(self, terminated, info):

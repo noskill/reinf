@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """RSSM discrete predictor implementation."""
 
-from typing import Optional
-
-import numpy as np
 import torch
 from torch import nn
 
 from base import DiscreteLatentPredictorBase
+from observation import ObservationDecoder, ObservationEncoder
 from transformer import LlamaRMSNorm
 
 
@@ -15,17 +13,17 @@ class RSSMDiscretePredictor(DiscreteLatentPredictorBase):
     def __init__(
         self,
         *,
+        observation_encoder: ObservationEncoder,
+        observation_decoder: ObservationDecoder,
+        z_observation_decoder: ObservationDecoder,
+        h_observation_decoder: ObservationDecoder,
         hidden_size: int,
         sensor_mode: str,
-        sensor_dim: int,
-        sensor_bins: Optional[np.ndarray],
         loc_x_bins: int,
         loc_y_bins: int,
         heading_dim: int,
         turn_bins: int,
         step_bins: int,
-        obs_dim: int,
-        obs_latent_dim: int,
         action_dim: int,
         stoch_size: int,
         stoch_classes: int,
@@ -33,8 +31,6 @@ class RSSMDiscretePredictor(DiscreteLatentPredictorBase):
         kl_dyn_beta: float,
         kl_rep_beta: float,
         kl_free_nats: float,
-        recon_beta: float,
-        obs_loss_mode: str,
         prior_rollout_weight: float,
         bptt_horizon: int,
         z_only_weight: float,
@@ -48,19 +44,20 @@ class RSSMDiscretePredictor(DiscreteLatentPredictorBase):
         transition: str = "gru",
         residual_scale: float = 1.0,
         state_norm: str = "none",
+        logger=None,
     ):
         super().__init__(
+            observation_encoder=observation_encoder,
+            observation_decoder=observation_decoder,
+            z_observation_decoder=z_observation_decoder,
+            h_observation_decoder=h_observation_decoder,
             hidden_size=hidden_size,
             sensor_mode=sensor_mode,
-            sensor_dim=sensor_dim,
-            sensor_bins=sensor_bins,
             loc_x_bins=loc_x_bins,
             loc_y_bins=loc_y_bins,
             heading_dim=heading_dim,
             turn_bins=turn_bins,
             step_bins=step_bins,
-            obs_dim=obs_dim,
-            obs_latent_dim=obs_latent_dim,
             action_dim=action_dim,
             stoch_size=stoch_size,
             stoch_classes=stoch_classes,
@@ -68,8 +65,6 @@ class RSSMDiscretePredictor(DiscreteLatentPredictorBase):
             kl_dyn_beta=kl_dyn_beta,
             kl_rep_beta=kl_rep_beta,
             kl_free_nats=kl_free_nats,
-            recon_beta=recon_beta,
-            obs_loss_mode=obs_loss_mode,
             prior_rollout_weight=prior_rollout_weight,
             bptt_horizon=bptt_horizon,
             z_only_weight=z_only_weight,
@@ -80,6 +75,7 @@ class RSSMDiscretePredictor(DiscreteLatentPredictorBase):
             contrastive_dim=contrastive_dim,
             contrastive_steps=contrastive_steps,
             detach_action_heads=detach_action_heads,
+            logger=logger,
         )
         self.rnn = nn.GRUCell(self.stoch_flat + self.action_dim, self.hidden_size)
         self.transition = str(transition)
@@ -162,7 +158,7 @@ class RSSMDiscretePredictor(DiscreteLatentPredictorBase):
         z_post = torch.stack(z_only_steps, dim=1)             # [B, T, S*C]
         h_post = torch.stack(h_only_steps, dim=1)             # [B, T, H]
 
-        outputs, obs_hat = self._decode_feat(feat)
+        outputs = self._decode_feat(feat)
         prior_sensor_pred = self._decode_sensor_from_feat(feat_prior)
         z_only_pred = self._decode_sensor_from_z(z_post)
         h_only_pred = self._decode_sensor_from_h(h_post)
@@ -190,7 +186,6 @@ class RSSMDiscretePredictor(DiscreteLatentPredictorBase):
                 "prior_logits": prior_logits,
                 "post_logits": post_logits,
                 "feat": feat,
-                "obs_target": obs_features,
                 "sensor_target": obs_features,
                 "loc_target": obs["loc"],
                 "head_target": obs["heading"],
@@ -207,9 +202,6 @@ class RSSMDiscretePredictor(DiscreteLatentPredictorBase):
             aux_inputs["contrastive_pred_emb_steps"] = pred_steps
             aux_inputs["contrastive_pred_scale_steps"] = scale_steps
             aux_inputs["contrastive_tgt_emb"] = self._project_contrastive_target_z(z_post)
-            if obs_hat is not None:
-                aux_inputs["obs_hat"] = obs_hat
-
         state_seq = feat
         last_state = torch.cat([h_prev, z_prev_flat], dim=-1)
         return outputs, aux_inputs, state_seq, last_state

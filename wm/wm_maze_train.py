@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-"""Main entrypoint for joint WM+policy maze training."""
+#!/usr/bin/env python3"""Main entrypoint for joint WM+policy maze training."""
 
 from __future__ import annotations
 
@@ -17,56 +16,20 @@ import gymnasium as gym
 import numpy as np
 import torch
 
-from agent_utils_wm import (MAZE_WM_MODEL_DEFAULTS, add_create_model_args, extract_create_model_args, create_single_policy_agent,
-                            create_double_policy_agent)
+from agent_utils_wm import (MAZE_WM_MODEL_DEFAULTS, add_create_model_args, extract_create_model_args, create_single_policy_agent, create_double_policy_agent)
 from log import Logger
 from sample import DiscreteActionSampler
 from wm_joint_agent import JointWMReinforce, JointWMPPO
 from policy_head import WMActionHeadPolicy, WMValueHeadPolicy
 from util import copy_python_sources
-from agent_utils_wm import create_maze_world_model
-
+from agent_utils_wm import create_world_model
+from env_setup import setup_environment
 
 THIS_DIR = Path(__file__).resolve().parent
 PARENT_DIR = THIS_DIR.parent
 
 
 from on_policy_train import OnPolicyTrainer
-from maze.rl_env import MazeVecEnv
-
-
-class MazeTrainerEnvAdapter:
-    """Adapter for MazeVecEnv to match OnPolicyTrainer expectations."""
-
-    def __init__(self, env: MazeVecEnv):
-        self.env = env
-        self.device = env.device
-        self.num_envs = env.num_envs
-        self.max_episode_length = int(env.max_steps)
-        self.obs_dim = 7
-        self.action_space = gym.spaces.Discrete(env.action_space_n)
-        self.observation_space = gym.spaces.Dict(
-            {
-                "sensor": gym.spaces.Box(low=0, high=np.inf, shape=(3,), dtype=np.float32),
-                "heading_idx": gym.spaces.Box(low=0, high=3, shape=(), dtype=np.int64),
-                "location": gym.spaces.Box(low=0, high=np.inf, shape=(2,), dtype=np.int64),
-                "step_count": gym.spaces.Box(low=0, high=np.inf, shape=(), dtype=np.int64),
-            }
-        )
-
-    @property
-    def unwrapped(self):
-        return self
-
-    def reset(self):
-        return self.env.reset()
-
-    def step(self, actions):
-        obs, reward, done, info = self.env.step(actions)
-        return obs, reward, done, info
-
-    def close(self) -> None:
-        self.env.close()
 
 
 def default_experiment_dir(experiment_name: str | None) -> str:
@@ -215,6 +178,7 @@ def parse_args():
     parser.add_argument("--wm-pos-sigma", type=float, default=1.0)
     parser.add_argument("--wm-heading-smoothing", type=float, default=0.0)
     parser.add_argument("--agent-type", type=str, default="single-policy-ppo")
+    parser.add_argument("--env-type", type=str, default='maze', choices=['maze', 'agimaze'])
     return parser.parse_args()
 
 
@@ -240,22 +204,10 @@ def main():
     if args.render and args.num_envs != 1:
         raise ValueError("--render requires --num-envs 1")
 
-    base_env = MazeVecEnv(
-        num_envs=args.num_envs,
-        maze_path=args.maze_path,
-        random_dim=args.random_dim,
-        random_extra_openings=args.random_extra_openings,
-        randomize_each_reset=args.randomize_each_reset,
-        max_steps=args.max_steps,
-        render=args.render,
-        seed=args.seed,
-        auto_reset=True,
-        return_torch=True,
-        device=args.device,
-    )
-    env = MazeTrainerEnvAdapter(base_env)
+    env = setup_environment(args)
+    base_env = env.env
     action_dim = int(base_env.action_space_n)
-    sensor_dim = 3
+
     target_entropy = args.target_entropy
     if target_entropy is None:
         target_entropy = 0.5 * math.log(action_dim)
@@ -273,15 +225,19 @@ def main():
         raise ValueError("--wm-sensor-max-bin must be >= 1")
 
     wm_model_args = extract_create_model_args(args, arg_prefix="wm", device=args.device)
-    maze_dim = int(base_env._mazes[0].dim)
+    maze_dim = int(env.max_dim)
     turn_bins = len({int(turn) for turn, _ in base_env.action_table})
     step_bins = len({int(step) for _, step in base_env.action_table})
-    wm_model = create_maze_world_model(
+    wm_model = create_world_model(
         model_args=wm_model_args,
         device=torch.device(args.device),
+        observation_type=args.env_type,
+        observation_space=env.observation_space,
         maze_dim=maze_dim,
         turn_bins=turn_bins,
         step_bins=step_bins,
+        action_dim=2,
+        heading_dim=4,
         contrastive_temp=args.wm_contrastive_temp,
         contrastive_horizon_discount=args.wm_contrastive_discount,
         contrastive_uncertainty_weight=args.wm_contrastive_uncertainty_weight,
@@ -311,8 +267,7 @@ def main():
         checkpoint_dir=checkpoint_dir,
         save_interval=args.save_interval,
         checkpoint=args.checkpoint,
-        seed=args.seed,
-    )
+        seed=args.seed)
     trainer.train()
     env.close()
 

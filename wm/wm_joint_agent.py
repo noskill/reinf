@@ -15,9 +15,21 @@ from baselines import TransformerBaseline
 from pool import EpisodesOldPoolMixin
 from reinforce import Reinforce
 from ppo import PPO
-from util import RunningNorm
 from utils import make_label_smoothing_table, make_soft_table
-from util import RunningNorm, EpisodeBatch, to_device, gae, normalize_padded_returns, flatten_padded, unflatten_padded, load_optimizer_state_preserve_lrs
+from util import (
+    EpisodeBatch,
+    RunningNorm,
+    detach as detach_tree,
+    flatten_padded,
+    gae,
+    load_optimizer_state_preserve_lrs,
+    normalize_padded_returns,
+    to_device,
+    get_first_tensor,
+    tree_map,
+    tree_stack,
+    unflatten_padded,
+)
 from clustering import SmartClusteringNovelty
 
 
@@ -155,14 +167,15 @@ class BaseWMOnPolicy:
         if not isinstance(state, dict):
             raise ValueError("JointWMReinforce expects dict observation with 'sensor'")
         sensor = state["sensor"]
-        if sensor.dim() == 2:
-            sensor = sensor.unsqueeze(1)
-        if sensor.dim() != 3:
-            raise ValueError(f"Expected sensor shape [B,3] or [B,T,3], got {tuple(sensor.shape)}")
-        batch_size, seq_len = int(sensor.shape[0]), int(sensor.shape[1])
+        if episode_start is not None:
+            sensor = tree_map(sensor, lambda tensor: tensor.unsqueeze(1))
+        sensor_tensor = get_first_tensor(sensor)
+        if sensor_tensor.ndim < 2:
+            raise ValueError("sensor leaves must have shape [B,T,...]")
+        batch_size, seq_len = sensor_tensor.shape[:2]
         # we are in training mode
         if episode_start is None:
-            prev_actions = sensor.new_zeros((batch_size, seq_len, self.action_dim))
+            prev_actions = self.action_cont_table.new_zeros((batch_size, seq_len, self.action_dim))
             actions = prev_actions
             model_obs = {
                 "sensor": sensor,
@@ -174,8 +187,10 @@ class BaseWMOnPolicy:
             )
         # we are in the episode collection
         else:
+            assert episode_start.shape == (batch_size,), \
+                f"Expected episode_start [B], got {tuple(episode_start.shape)}"
             if self._prev_actions is None:
-                self._prev_actions = torch.zeros((batch_size, self.action_dim), dtype=sensor.dtype, device=sensor.device)
+                self._prev_actions = self.action_cont_table.new_zeros((batch_size, self.action_dim))
             if episode_start.any():
                 self._prev_actions[episode_start, :] = 0.0
             prev_actions = self._prev_actions.unsqueeze(1).expand(batch_size, seq_len, self.action_dim)
@@ -231,7 +246,7 @@ class BaseWMOnPolicy:
 
         self.rl_add_transition_batch(policy_states, actions, log_probs, entropy)
         wm_states = {
-            "sensor": state["sensor"].detach().to("cpu"),
+            "sensor": to_device(detach_tree(state["sensor"]), torch.device("cpu")),
             "heading_idx": state["heading_idx"].detach().to("cpu"),
             "location": state["location"].detach().to("cpu"),
             "policy_state": policy_states.detach().to("cpu"),
@@ -922,24 +937,12 @@ class BaseWMOnPolicy:
         pred_sensor,
         targets: Dict[str, torch.Tensor],
     ) -> torch.Tensor:
-        key_padding_mask = targets["key_padding_mask"]
-        if getattr(wm_model, "sensor_mode", "categorical") == "categorical":
-            cfg = wm_model.config
-            pred_l, pred_f, pred_r = pred_sensor
-            idx = targets["y_sensor_idx"].clamp(min=0)
-            if cfg.sensor_min_idx is not None:
-                idx = (idx - cfg.sensor_min_idx.view(1, 1, -1)).clamp(min=0)
-            idx_l = idx[..., 0].clamp(max=cfg.sensor_tables[0].shape[0] - 1)
-            idx_f = idx[..., 1].clamp(max=cfg.sensor_tables[1].shape[0] - 1)
-            idx_r = idx[..., 2].clamp(max=cfg.sensor_tables[2].shape[0] - 1)
-            error = (
-                -(cfg.sensor_tables[0][idx_l] * F.log_softmax(pred_l, dim=-1)).sum(dim=-1)
-                -(cfg.sensor_tables[1][idx_f] * F.log_softmax(pred_f, dim=-1)).sum(dim=-1)
-                -(cfg.sensor_tables[2][idx_r] * F.log_softmax(pred_r, dim=-1)).sum(dim=-1)
-            )
-        else:
-            error = (pred_sensor - targets["y_sensor"]).pow(2).mean(dim=-1)
-        return error.masked_fill(key_padding_mask, 0.0)
+        return wm_model.observation_decoder.compute_step_error(
+            pred_sensor,
+            targets["y_sensor"],
+            targets["key_padding_mask"],
+            wm_model.config,
+        )
 
     def _evaluate_step_cpc_error_no_grad(self, wm_model, obs: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> torch.Tensor:
         was_training = wm_model.training
@@ -993,54 +996,64 @@ class BaseWMOnPolicy:
         valid_episodes = [ep for ep in episodes if len(ep) >= 2]
         if not valid_episodes:
             raise ValueError("episodes must contain at least two steps each")
-        lengths = [len(ep) - 1 for ep in valid_episodes]
-        batch_size = len(valid_episodes)
-        max_len = max(lengths)
-        obs_sensor = torch.zeros((batch_size, max_len, 3), dtype=torch.float32, device=self.device)
-        obs_actions = torch.zeros((batch_size, max_len, 2), dtype=torch.float32, device=self.device)
-        y_sensor = torch.zeros((batch_size, max_len, 3), dtype=torch.float32, device=self.device)
-        y_sensor_idx = torch.full((batch_size, max_len, 3), -1, dtype=torch.long, device=self.device)
-        y_loc_xy = torch.full((batch_size, max_len, 2), -1, dtype=torch.long, device=self.device)
-        y_head = torch.full((batch_size, max_len), -100, dtype=torch.long, device=self.device)
-        y_turn = torch.full((batch_size, max_len), -100, dtype=torch.long, device=self.device)
-        y_step = torch.full((batch_size, max_len), -100, dtype=torch.long, device=self.device)
-        key_padding_mask = torch.ones((batch_size, max_len), dtype=torch.bool, device=self.device)
+        sensor_episodes = []
+        action_episodes = []
+        next_sensor_episodes = []
+        next_location_episodes = []
+        next_heading_episodes = []
+        turn_episodes = []
+        step_episodes = []
+        for episode in valid_episodes:
+            length = len(episode) - 1
+            action_indices = torch.stack([
+                torch.as_tensor(episode[step][1], dtype=torch.long).view(-1)[0]
+                for step in range(length)
+            ])
+            turns = self._turn_cls[action_indices].to(torch.long)
+            steps = self._step_cls[action_indices].to(torch.long)
+            turns[0] = -100
+            steps[0] = -100
 
-        for i, ep in enumerate(valid_episodes):
-            L = len(ep) - 1
-            key_padding_mask[i, :L] = False
-            for t in range(L):
-                tr_t = ep[t]
-                tr_tp1 = ep[t + 1]
-                state_t = tr_t[0]
-                state_tp1 = tr_tp1[0]
-                action_idx = torch.as_tensor(tr_t[1], dtype=torch.long, device=self.device).view(-1)[0]
-                obs_sensor[i, t] = torch.as_tensor(state_t["sensor"], dtype=torch.float32, device=self.device)
-                obs_actions[i, t] = self.action_idx_to_val(action_idx.view(1))[0].to(torch.float32)
-                y_sensor[i, t] = torch.as_tensor(state_tp1["sensor"], dtype=torch.float32, device=self.device)
-                y_sensor_idx[i, t] = y_sensor[i, t].round().to(torch.long).clamp_(0, self.sensor_max_bin)
-                y_loc_xy[i, t] = torch.as_tensor(state_tp1["location"], dtype=torch.long, device=self.device).clamp_(
-                    0, self.maze_dim - 1
-                )
-                y_head[i, t] = torch.as_tensor(state_tp1["heading_idx"], dtype=torch.long, device=self.device)
-                y_turn[i, t] = self._turn_cls[action_idx].to(torch.long)
-                y_step[i, t] = self._step_cls[action_idx].to(torch.long)
-            # Ignore first-step action CE: t=0 is conditioned on synthetic prev_action (BOS), not a real action history.
-            y_turn[i, 0] = -100
-            y_step[i, 0] = -100
+            sensor_episodes.append(tree_stack([episode[step][0]["sensor"] for step in range(length)]))
+            action_episodes.append(self.action_idx_to_val(action_indices.to(self.device)).to(torch.float32).cpu())
+            next_sensor_episodes.append(tree_stack([
+                episode[step + 1][0]["sensor"] for step in range(length)
+            ]))
+            next_location_episodes.append(torch.stack([
+                torch.as_tensor(episode[step + 1][0]["location"], dtype=torch.long)
+                for step in range(length)
+            ]).clamp_(0, self.maze_dim - 1))
+            next_heading_episodes.append(torch.stack([
+                torch.as_tensor(episode[step + 1][0]["heading_idx"], dtype=torch.long)
+                for step in range(length)
+            ]))
+            turn_episodes.append(turns)
+            step_episodes.append(steps)
+
+        batch = EpisodeBatch({
+            "sensor": sensor_episodes,
+            "actions": action_episodes,
+            "y_sensor": next_sensor_episodes,
+            "y_loc_xy": next_location_episodes,
+            "y_head": next_heading_episodes,
+            "y_turn": turn_episodes,
+            "y_step": step_episodes,
+        }).to(self.device)
+        padded, key_padding_mask, _ = batch.pad()
+        padded["y_turn"][key_padding_mask] = -100
+        padded["y_step"][key_padding_mask] = -100
 
         obs = {
-            "sensor": obs_sensor,
-            "actions": obs_actions,
+            "sensor": padded["sensor"],
+            "actions": padded["actions"],
             "key_padding_mask": key_padding_mask,
         }
         targets = {
-            "y_sensor": y_sensor,
-            "y_sensor_idx": y_sensor_idx,
-            "y_loc_xy": y_loc_xy,
-            "y_head": y_head,
-            "y_turn": y_turn,
-            "y_step": y_step,
+            "y_sensor": padded["y_sensor"],
+            "y_loc_xy": padded["y_loc_xy"],
+            "y_head": padded["y_head"],
+            "y_turn": padded["y_turn"],
+            "y_step": padded["y_step"],
             "key_padding_mask": key_padding_mask,
         }
         meta = {}

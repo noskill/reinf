@@ -17,6 +17,7 @@ from dataclasses import asdict
 from typing import List
 
 import numpy as np
+import gymnasium as gym
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
@@ -38,17 +39,15 @@ from agent_utils_wm import add_create_model_args, create_model, extract_create_m
 def configure_recon_head_only_training(model: nn.Module) -> List[str]:
     """Freeze model and enable training only of reconstruction heads ([z,h], z, h)."""
     if not isinstance(model, DiscreteLatentPredictorBase):
-        raise ValueError("--train-recon-heads-only requires model-type rssm-discrete or tssm")
+        raise ValueError("--train-recon-heads-only requires model-type rssm or tssm")
     if model.sensor_mode != "categorical":
         raise ValueError("--train-recon-heads-only currently supports --sensor-mode categorical only")
-    if model.obs_loss_mode != "soft":
-        raise ValueError("--train-recon-heads-only requires --obs-loss-mode soft")
 
     for p in model.parameters():
         p.requires_grad = False
 
     enabled: List[str] = []
-    for module_name in ("obs_head", "z_obs_head", "h_obs_head"):
+    for module_name in ("observation_decoder", "z_observation_decoder", "h_observation_decoder"):
         module = getattr(model, module_name, None)
         if module is None:
             continue
@@ -64,7 +63,7 @@ def configure_recon_head_only_training(model: nn.Module) -> List[str]:
 def configure_state_probe_only_training(model: nn.Module) -> List[str]:
     """Freeze model and enable only location/heading probe heads."""
     if not isinstance(model, (DiscreteLatentPredictorBase, TransformerBaseline)):
-        raise ValueError("--train-state-probes-only requires model-type transformer/rnn/rssm-discrete/tssm")
+        raise ValueError("--train-state-probes-only requires model-type transformer/rnn/rssm/tssm")
 
     for p in model.parameters():
         p.requires_grad = False
@@ -255,8 +254,6 @@ def main():
     input_obs_dim = sequences[0].obs_cont.shape[-1]
     input_dim = sensor_latent_dim + action_latent_dim
     action_dim = sequences[0].action_cont.shape[-1]
-    obs_dim = input_obs_dim
-    sensor_dim = 3
     sensor_min_idx = torch.tensor(stats.sensor_min, dtype=torch.long, device=args.device)
     loc_min = torch.tensor(stats.loc_min, dtype=torch.float32, device=args.device)
     loc_max = torch.tensor(stats.loc_max, dtype=torch.float32, device=args.device)
@@ -272,17 +269,25 @@ def main():
         else None
     )
     model_config_extra = {}
+    observation_space = gym.spaces.Dict({
+        "sensor": gym.spaces.Box(
+            low=stats.sensor_min,
+            high=stats.sensor_max,
+            shape=(input_obs_dim,),
+            dtype=np.float32,
+        ),
+    })
     model = create_model(
         model_args,
         input_dim=input_dim,
-        sensor_dim=sensor_dim,
+        observation_type="maze",
+        observation_space=observation_space,
         sensor_bins=sensor_bins,
         loc_x_bins=loc_x_bins,
         loc_y_bins=loc_y_bins,
         heading_dim=heading_dim,
         turn_bins=turn_bins,
         step_bins=step_bins,
-        obs_dim=obs_dim,
         action_dim=action_dim,
         active_attention_window=active_attention_window,
         model_config_extra=model_config_extra,
