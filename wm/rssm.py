@@ -111,12 +111,13 @@ class RSSMDiscretePredictor(DiscreteLatentPredictorBase):
         need_aux: bool = False,
     ):
         del attention_window
-        obs_embed, obs_features, actions, a_prev, key_padding_mask, B, T = self._encode_obs(
+        obs_features, obs_embed, actions, a_prev, key_padding_mask, _ = self._validate_obs_contract(
             obs,
             episode_start=episode_start,
         )
-        h_prev = actions.new_zeros((B, self.hidden_size))
-        z_prev_flat = actions.new_zeros((B, self.stoch_flat))
+        batch_size, sequence_length = obs_embed.shape[:2]
+        h_prev = obs_embed.new_zeros((batch_size, self.hidden_size))
+        z_prev_flat = obs_embed.new_zeros((batch_size, self.stoch_flat))
         h_init = h_prev
         z_init_flat = z_prev_flat
 
@@ -126,20 +127,20 @@ class RSSMDiscretePredictor(DiscreteLatentPredictorBase):
         feat_prior_steps = []
         z_only_steps = []
         h_only_steps = []
-        for t in range(T):
+        for t in range(sequence_length):
             if self.bptt_horizon > 0 and t > 0 and (t % self.bptt_horizon) == 0:
                 h_prev = h_prev.detach()
                 z_prev_flat = z_prev_flat.detach()
             h_t = self._rssm_step(torch.cat([z_prev_flat, a_prev[:, t, :]], dim=-1), h_prev)
-            prior_logits_t = self.prior_head(h_t).view(B, self.stoch_size, self.stoch_classes)
+            prior_logits_t = self.prior_head(h_t).view(batch_size, self.stoch_size, self.stoch_classes)
             z_prior_t = self._sample_stoch(prior_logits_t.unsqueeze(1), self.training).squeeze(1)
-            z_prior_flat = z_prior_t.reshape(B, self.stoch_flat)
+            z_prior_flat = z_prior_t.reshape(batch_size, self.stoch_flat)
             # Detach h_t so posterior gradients don't flow into the deterministic state.
             post_logits_t = self.post_head(torch.cat([h_t.detach(), obs_embed[:, t, :]], dim=-1)).view(
-                B, self.stoch_size, self.stoch_classes
+                batch_size, self.stoch_size, self.stoch_classes
             )
             z_t = self._sample_stoch(post_logits_t.unsqueeze(1), self.training).squeeze(1)
-            z_t_flat = z_t.reshape(B, self.stoch_flat)
+            z_t_flat = z_t.reshape(batch_size, self.stoch_flat)
 
             feat_steps.append(torch.cat([h_t, z_t_flat], dim=-1))
             feat_prior_steps.append(torch.cat([h_t, z_prior_flat], dim=-1))
@@ -167,15 +168,15 @@ class RSSMDiscretePredictor(DiscreteLatentPredictorBase):
             h_roll = h_init
             z_roll_flat = z_init_flat
             feat_roll_steps = []
-            roll_T = T if self.prior_rollout_steps <= 0 else min(T, self.prior_rollout_steps)
+            roll_T = sequence_length if self.prior_rollout_steps <= 0 else min(sequence_length, self.prior_rollout_steps)
             for t in range(roll_T):
                 if self.bptt_horizon > 0 and t > 0 and (t % self.bptt_horizon) == 0:
                     h_roll = h_roll.detach()
                     z_roll_flat = z_roll_flat.detach()
                 h_roll = self._rssm_step(torch.cat([z_roll_flat, a_prev[:, t, :]], dim=-1), h_roll)
-                prior_logits_roll_t = self.prior_head(h_roll).view(B, self.stoch_size, self.stoch_classes)
+                prior_logits_roll_t = self.prior_head(h_roll).view(batch_size, self.stoch_size, self.stoch_classes)
                 z_roll_t = self._sample_stoch(prior_logits_roll_t.unsqueeze(1), self.training).squeeze(1)
-                z_roll_flat = z_roll_t.reshape(B, self.stoch_flat)
+                z_roll_flat = z_roll_t.reshape(batch_size, self.stoch_flat)
                 feat_roll_steps.append(torch.cat([h_roll, z_roll_flat], dim=-1))
             if feat_roll_steps:
                 feat_roll = torch.stack(feat_roll_steps, dim=1)

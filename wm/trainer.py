@@ -33,6 +33,7 @@ def run_epoch_joint(
         "z_only": 0.0,
         "h_only": 0.0,
         "recon": 0.0,
+        "sensor_cpc_probe": 0.0,
         "contrastive": 0.0,
         "contrastive_nll": 0.0,
         "contrastive_acc": 0.0,
@@ -132,6 +133,7 @@ def run_epoch_joint(
             ("z_only_sensor", "z_only"),
             ("h_only_sensor", "h_only"),
             ("recon", "recon"),
+            ("sensor_cpc_probe", "sensor_cpc_probe"),
             ("contrastive", "contrastive"),
             ("contrastive_nll", "contrastive_nll"),
         ):

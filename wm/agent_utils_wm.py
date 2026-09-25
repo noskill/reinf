@@ -424,8 +424,7 @@ def _observation_space_spec(observation_type, observation_space):
     return movement_result_space.n, inventory_space.shape[0]
 
 
-def create_baseline_observation_codec(observation_type, observation_space, args, *,
-                                      feature_dim: int, sensor_bins=None):
+def create_baseline_observation_codec(observation_type, observation_space, args, *, sensor_bins=None):
     first_dim, second_dim = _observation_space_spec(observation_type, observation_space)
     if observation_type == "maze":
         if sensor_bins is None:
@@ -433,7 +432,7 @@ def create_baseline_observation_codec(observation_type, observation_space, args,
         return create_maze_baseline_observation_codec(
             sensor_dim=first_dim,
             sensor_latent_dim=args.sensor_latent_dim,
-            feature_dim=feature_dim,
+            feature_dim=args.hidden_size,
             sensor_bins=sensor_bins,
             hidden_dim=args.probe_hidden_dim,
         )
@@ -441,7 +440,7 @@ def create_baseline_observation_codec(observation_type, observation_space, args,
         movement_result_classes=first_dim,
         inventory_size=second_dim,
         observation_latent_dim=args.sensor_latent_dim,
-        feature_dim=feature_dim,
+        feature_dim=args.hidden_size,
         hidden_dim=args.probe_hidden_dim,
     )
 
@@ -473,7 +472,7 @@ def create_discrete_observation_codec(observation_type, observation_space, args,
 
 
 def create_baseline_model(args, *, input_dim: int, action_dim: int,
-                          observation_encoder, observation_decoder,
+                          observation_encoder, observation_decoder, cpc_sensor_probe_decoder,
                           loc_x_bins: int, loc_y_bins: int, heading_dim: int,
                           turn_bins: int, step_bins: int, active_attention_window,
                           model_config_extra: Dict, logger=None):
@@ -496,6 +495,7 @@ def create_baseline_model(args, *, input_dim: int, action_dim: int,
     common_kwargs = {
         "observation_encoder": observation_encoder,
         "observation_decoder": observation_decoder,
+        "cpc_sensor_probe_decoder": cpc_sensor_probe_decoder,
         "sensor_mode": args.sensor_mode,
         "action_dim": action_dim,
         "loc_x_bins": loc_x_bins,
@@ -661,11 +661,10 @@ def create_model(
         raise ValueError("World models currently require --sensor-mode categorical")
 
     if args.model_type in {"transformer", "rnn"}:
-        observation_encoder, observation_decoder = create_baseline_observation_codec(
+        observation_encoder, observation_decoder, cpc_sensor_probe_decoder = create_baseline_observation_codec(
             observation_type,
             observation_space,
             args,
-            feature_dim=args.hidden_size,
             sensor_bins=sensor_bins,
         )
         model = create_baseline_model(
@@ -674,6 +673,7 @@ def create_model(
             action_dim=action_dim,
             observation_encoder=observation_encoder,
             observation_decoder=observation_decoder,
+            cpc_sensor_probe_decoder=cpc_sensor_probe_decoder,
             loc_x_bins=loc_x_bins,
             loc_y_bins=loc_y_bins,
             heading_dim=heading_dim,
@@ -762,19 +762,24 @@ def create_single_policy_agent(args, wm_model_args, wm_model, logger, maze_dim, 
     )
 
 
-    agent = JointWMPPO(
+    ppo_agent = PPO(
         policy=policy_module,
         value=value,
         sampler=DiscreteActionSampler(),
+        joint=True,
         policy_lr=args.policy_lr,
         num_envs=args.num_envs,
         discount=args.discount,
         logger=logger,
-        wm_model=wm_model,
-        action_table=action_table,
         device=torch.device(args.device),
         entropy_coef=args.entropy_coef,
         target_entropy=args.target_entropy,
+    )
+    agent = JointWMPPO(
+        agent=ppo_agent,
+        logger=logger,
+        wm_model=wm_model,
+        action_table=action_table,
         intrinsic_reward_scale=args.intrinsic_reward_scale,
         env_reward_scale=args.env_reward_scale,
         wm_updates_per_policy=args.wm_updates_per_policy,
@@ -783,9 +788,6 @@ def create_single_policy_agent(args, wm_model_args, wm_model, logger, maze_dim, 
         wm_sensor_lp_reward_coef=args.wm_sensor_lp_reward_coef,
         wm_divergence_novelty_coef=args.wm_divergence_novelty_coef,
         wm_fixed=args.wm_fixed,
-        high_warmup_goal_coef=getattr(args, "high_warmup_goal_coef", 0.005),
-        high_warmup_goal_epochs=getattr(args, "high_warmup_goal_epochs", 1),
-        reset_high_agent_on_load=getattr(args, "reset_high_agent", False),
         sensor_max_bin=args.wm_sensor_max_bin,
         maze_dim=maze_dim,
         wm_weight_decay=args.wm_weight_decay,

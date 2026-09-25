@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """TSSM discrete predictor implementation."""
 
+from contextlib import nullcontext
 from typing import Optional
 
 import torch
 
 from base import DiscreteLatentPredictorBase
 from observation import ObservationDecoder, ObservationEncoder
-from transformer import LlamaConfig, LlamaModel
-from tr_cache import PositionBasedDynamicCache, WindowedPositionBasedDynamicCache
+from transformer import LlamaConfig
+from transformer_cached import CachedTransformer
 
 
 class TSSMDiscretePredictor(DiscreteLatentPredictorBase):
@@ -103,7 +104,40 @@ class TSSMDiscretePredictor(DiscreteLatentPredictorBase):
             attention_window=attention_window,
             use_rope=True,
         )
-        self.transition = LlamaModel(trans_cfg)
+        self.backbone = CachedTransformer(trans_cfg)
+        self._state = None
+
+    def clear_cache(self):
+        self.backbone.clear_cache()
+        self._state = None
+
+    def reset_cache(self, reset_mask):
+        assert reset_mask.dtype == torch.bool and reset_mask.ndim == 1
+        if self._state is not None:
+            assert reset_mask.shape == self._state.shape[:1]
+            self._state = self._state.masked_fill(reset_mask[:, None], 0)
+        self.backbone.reset_cache(reset_mask)
+
+    def get_cache_state(self):
+        if self._state is None:
+            assert self.backbone.get_cache_state() is None
+            return None
+        return {"state": self._state.detach().clone(), "backbone": self.backbone.get_cache_state()}
+
+    def set_cache_state(self, state):
+        if state is None:
+            self.clear_cache()
+            return
+        self._state = state["state"].detach().clone()
+        self.backbone.set_cache_state(state["backbone"])
+
+    def index_cache_state(self, state, batch_indices):
+        if state is None:
+            return None
+        return {
+            "state": state["state"][batch_indices].detach().clone(),
+            "backbone": self.backbone.index_cache_state(state["backbone"], batch_indices),
+        }
 
     def _forward_core(
         self,
@@ -113,29 +147,32 @@ class TSSMDiscretePredictor(DiscreteLatentPredictorBase):
         episode_start=None,
         need_aux: bool = False,
     ):
-        obs_embed, obs_features, actions, a_prev, key_padding_mask, B, T = self._encode_obs(
+        obs_features, obs_embed, actions, a_prev, key_padding_mask, _ = self._validate_obs_contract(
             obs,
             episode_start=episode_start,
         )
-        device = actions.device
-
-        h_prev = actions.new_zeros((B, self.hidden_size))
-        z_prev_flat = actions.new_zeros((B, self.stoch_flat))
+        batch_size, sequence_length = obs_embed.shape[:2]
+        h_prev = obs_embed.new_zeros((batch_size, self.hidden_size))
+        z_prev_flat = obs_embed.new_zeros((batch_size, self.stoch_flat))
+        if episode_start is not None:
+            self.reset_cache(episode_start)
+            if self._state is not None:
+                assert self._state.shape == (batch_size, self.feat_dim)
+                h_prev, z_prev_flat = self._state.split([self.hidden_size, self.stoch_flat], dim=-1)
         h_init = h_prev
         z_init_flat = z_prev_flat
 
         if attention_window is None:
             attention_window = self.attention_window
-        detach_on_pop = bool(self.training and self.bptt_horizon > 0)
-        if attention_window is not None and attention_window > 0:
-            cache = WindowedPositionBasedDynamicCache(
-                int(attention_window),
-                detach_on_pop=detach_on_pop,
-            ).to(device=device)
+        detach_every = self.bptt_horizon if self.training else 0
+        reset_mask = torch.zeros(batch_size, dtype=torch.bool, device=obs_embed.device)
+        if episode_start is None:
+            cache_context = self.backbone.temporary_cache(
+                batch_size, attention_window=attention_window, detach_every=detach_every)
         else:
-            cache = PositionBasedDynamicCache(detach_on_pop=detach_on_pop).to(device=device)
-
-        pos = torch.arange(T, device=device, dtype=torch.long).unsqueeze(0).expand(B, T)
+            assert attention_window == self.backbone.attention_window, \
+                "Online attention_window must match the configured cache window"
+            cache_context = nullcontext()
 
         prior_logits_steps = []
         post_logits_steps = []
@@ -143,35 +180,31 @@ class TSSMDiscretePredictor(DiscreteLatentPredictorBase):
         feat_prior_steps = []
         z_only_steps = []
         h_only_steps = []
-        for t in range(T):
-            if self.bptt_horizon > 0 and t > 0 and (t % self.bptt_horizon) == 0:
-                z_prev_flat = z_prev_flat.detach()
-            trans_in_t = torch.cat([z_prev_flat, a_prev[:, t, :]], dim=-1).unsqueeze(1)
-            h_step = self.transition(
-                trans_in_t,
-                past_key_values=cache,
-                cache_position=pos[:, t : t + 1],
-                attention_window=attention_window,
-            )
-            h_t = h_step[:, -1, :]
-            prior_logits_t = self.prior_head(h_t).view(B, self.stoch_size, self.stoch_classes)
-            z_prior_t = self._sample_stoch(prior_logits_t.unsqueeze(1), self.training).squeeze(1)
-            z_prior_flat = z_prior_t.reshape(B, self.stoch_flat)
-            post_logits_t = self.post_head(torch.cat([h_t.detach(), obs_embed[:, t, :]], dim=-1)).view(
-                B, self.stoch_size, self.stoch_classes
-            )
-            z_t = self._sample_stoch(post_logits_t.unsqueeze(1), self.training).squeeze(1)
-            z_t_flat = z_t.reshape(B, self.stoch_flat)
+        with cache_context:
+            for t in range(sequence_length):
+                if self.bptt_horizon > 0 and t > 0 and (t % self.bptt_horizon) == 0:
+                    z_prev_flat = z_prev_flat.detach()
+                trans_in_t = torch.cat([z_prev_flat, a_prev[:, t, :]], dim=-1).unsqueeze(1)
+                h_step = self.backbone(trans_in_t, key_padding_mask=None, reset_mask=reset_mask)
+                h_t = h_step[:, -1, :]
+                prior_logits_t = self.prior_head(h_t).view(batch_size, self.stoch_size, self.stoch_classes)
+                z_prior_t = self._sample_stoch(prior_logits_t.unsqueeze(1), self.training).squeeze(1)
+                z_prior_flat = z_prior_t.reshape(batch_size, self.stoch_flat)
+                post_logits_t = self.post_head(torch.cat([h_t.detach(), obs_embed[:, t, :]], dim=-1)).view(
+                    batch_size, self.stoch_size, self.stoch_classes
+                )
+                z_t = self._sample_stoch(post_logits_t.unsqueeze(1), self.training).squeeze(1)
+                z_t_flat = z_t.reshape(batch_size, self.stoch_flat)
 
-            feat_steps.append(torch.cat([h_t, z_t_flat], dim=-1))
-            feat_prior_steps.append(torch.cat([h_t, z_prior_flat], dim=-1))
-            z_only_steps.append(z_t_flat)
-            h_only_steps.append(h_t)
-            prior_logits_steps.append(prior_logits_t)
-            post_logits_steps.append(post_logits_t)
+                feat_steps.append(torch.cat([h_t, z_t_flat], dim=-1))
+                feat_prior_steps.append(torch.cat([h_t, z_prior_flat], dim=-1))
+                z_only_steps.append(z_t_flat)
+                h_only_steps.append(h_t)
+                prior_logits_steps.append(prior_logits_t)
+                post_logits_steps.append(post_logits_t)
 
-            h_prev = h_t
-            z_prev_flat = z_t_flat
+                h_prev = h_t
+                z_prev_flat = z_t_flat
 
         feat = torch.stack(feat_steps, dim=1)                 # [B, T, H + S*C]
         feat_prior = torch.stack(feat_prior_steps, dim=1)     # [B, T, H + S*C]
@@ -185,33 +218,23 @@ class TSSMDiscretePredictor(DiscreteLatentPredictorBase):
         z_only_pred = self._decode_sensor_from_z(z_post)
         h_only_pred = self._decode_sensor_from_h(h_post)
         prior_roll_sensor_pred = None
-        if self.prior_rollout_weight > 0:
-            if attention_window is not None and attention_window > 0:
-                cache_roll = WindowedPositionBasedDynamicCache(
-                    int(attention_window),
-                    detach_on_pop=detach_on_pop,
-                ).to(device=device)
-            else:
-                cache_roll = PositionBasedDynamicCache(detach_on_pop=detach_on_pop).to(device=device)
+        if need_aux and self.prior_rollout_weight > 0:
             h_roll = h_init
             z_roll_flat = z_init_flat
             feat_roll_steps = []
-            roll_T = T if self.prior_rollout_steps <= 0 else min(T, self.prior_rollout_steps)
-            for t in range(roll_T):
-                if self.bptt_horizon > 0 and t > 0 and (t % self.bptt_horizon) == 0:
-                    z_roll_flat = z_roll_flat.detach()
-                trans_in_roll_t = torch.cat([z_roll_flat, a_prev[:, t, :]], dim=-1).unsqueeze(1)
-                h_step_roll = self.transition(
-                    trans_in_roll_t,
-                    past_key_values=cache_roll,
-                    cache_position=pos[:, t : t + 1],
-                    attention_window=attention_window,
-                )
-                h_roll = h_step_roll[:, -1, :]
-                prior_logits_roll_t = self.prior_head(h_roll).view(B, self.stoch_size, self.stoch_classes)
-                z_roll_t = self._sample_stoch(prior_logits_roll_t.unsqueeze(1), self.training).squeeze(1)
-                z_roll_flat = z_roll_t.reshape(B, self.stoch_flat)
-                feat_roll_steps.append(torch.cat([h_roll, z_roll_flat], dim=-1))
+            roll_T = sequence_length if self.prior_rollout_steps <= 0 else min(sequence_length, self.prior_rollout_steps)
+            with self.backbone.temporary_cache(
+                    batch_size, attention_window=attention_window, detach_every=detach_every):
+                for t in range(roll_T):
+                    if self.bptt_horizon > 0 and t > 0 and (t % self.bptt_horizon) == 0:
+                        z_roll_flat = z_roll_flat.detach()
+                    trans_in_roll_t = torch.cat([z_roll_flat, a_prev[:, t, :]], dim=-1).unsqueeze(1)
+                    h_step_roll = self.backbone(trans_in_roll_t, key_padding_mask=None, reset_mask=reset_mask)
+                    h_roll = h_step_roll[:, -1, :]
+                    prior_logits_roll_t = self.prior_head(h_roll).view(batch_size, self.stoch_size, self.stoch_classes)
+                    z_roll_t = self._sample_stoch(prior_logits_roll_t.unsqueeze(1), self.training).squeeze(1)
+                    z_roll_flat = z_roll_t.reshape(batch_size, self.stoch_flat)
+                    feat_roll_steps.append(torch.cat([h_roll, z_roll_flat], dim=-1))
             if feat_roll_steps:
                 feat_roll = torch.stack(feat_roll_steps, dim=1)
                 prior_roll_sensor_pred = self._decode_sensor_from_feat(feat_roll)
@@ -240,6 +263,8 @@ class TSSMDiscretePredictor(DiscreteLatentPredictorBase):
             aux_inputs["contrastive_tgt_emb"] = self._project_contrastive_target_z(z_post)
         state_seq = feat
         last_state = torch.cat([h_prev, z_prev_flat], dim=-1)
+        if episode_start is not None:
+            self._state = last_state.detach()
         return outputs, aux_inputs, state_seq, last_state
 
     def forward(

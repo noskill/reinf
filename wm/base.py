@@ -134,14 +134,7 @@ class PredictionLossMixin:
                 raise ValueError("prev_actions are required when actions are not provided")
             prev_actions = self._shift_prev_actions(actions)
 
-        return (
-            sensor,
-            sensor_latent.to(torch.float32),
-            None if actions is None else actions.to(torch.float32),
-            prev_actions.to(torch.float32),
-            key_padding_mask,
-            rollout,
-        )
+        return sensor, sensor_latent, None if actions is None else actions, prev_actions, key_padding_mask, rollout
 
     def compute_soft_target_loss(
         self,
@@ -264,8 +257,7 @@ class PredictionLossMixin:
             target_emb=tgt_emb,
             key_padding_mask=key_padding_mask,
             temperature=temperature,
-            horizon_discount=horizon_discount,
-        )
+            horizon_discount=horizon_discount)
 
     @staticmethod
     def compute_contrastive_uncertainty_loss(
@@ -940,18 +932,6 @@ class DiscreteLatentPredictorBase(PredictionLossMixin, nn.Module):
         )
         return {**base_losses, **aux_losses}
 
-    def _encode_obs(self, obs, *, episode_start=None):
-        sensor, sensor_latent, actions, prev_actions, key_padding_mask, _ = self._validate_obs_contract(
-            obs,
-            episode_start=episode_start,
-        )
-        if sensor is None:
-            raise ValueError("Discrete latent models require raw sensor observations")
-        if actions is None:
-            raise ValueError("Discrete latent models require current actions")
-        B, T, _ = actions.shape
-        return sensor_latent, sensor, actions, prev_actions, key_padding_mask, B, T
-
     def _decode_sensor_from_feat(self, feat: torch.Tensor):
         """Decode sensors from full feature [h, z] (main prediction path)."""
         return self.observation_decoder.decode(feat)
@@ -997,13 +977,13 @@ class DiscreteLatentPredictorBase(PredictionLossMixin, nn.Module):
     def _project_contrastive_pred_steps(
         self,
         prior_feat: torch.Tensor,
-        actions: torch.Tensor,
+        actions: Optional[torch.Tensor],
     ):
         """Project action-conditioned prior features for horizons 1..K.
 
         Horizon h uses input [prior_feat_t, a_t, ..., a_{t+h-1}] and predicts target at t+h.
         """
-        if self.contrastive_dim <= 0:
+        if self.contrastive_dim <= 0 or actions is None:
             return [], []
         if self.contrastive_action_heads is None or len(self.contrastive_action_heads) == 0:
             pred, scale = self._project_contrastive_pred(prior_feat)

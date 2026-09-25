@@ -304,7 +304,8 @@ class AgiMazeObservationDecoder(ObservationDecoder):
 
 
 def create_maze_baseline_observation_codec(*, sensor_dim: int, sensor_latent_dim: int,
-                                           feature_dim: int, sensor_bins: Sequence[int],
+                                           feature_dim: int,
+                                           sensor_bins: Sequence[int],
                                            hidden_dim: int):
     sensor_encoder = make_probe_head(sensor_dim, sensor_latent_dim, hidden_dim, 2)
     sensor_heads = tuple(nn.Linear(feature_dim, int(size)) for size in sensor_bins)
@@ -313,7 +314,11 @@ def create_maze_baseline_observation_codec(*, sensor_dim: int, sensor_latent_dim
         sensor_bins=sensor_bins,
         categorical_heads=sensor_heads,
     )
-    return encoder, decoder
+    probe_decoder = MazeObservationDecoder(
+        sensor_bins=sensor_bins,
+        categorical_heads=tuple(nn.Linear(sensor_latent_dim, int(size)) for size in sensor_bins),
+    )
+    return encoder, decoder, probe_decoder
 
 
 def create_maze_discrete_observation_codec(*, sensor_dim: int, sensor_latent_dim: int,
@@ -344,7 +349,8 @@ def create_maze_discrete_observation_codec(*, sensor_dim: int, sensor_latent_dim
 
 def create_agimaze_baseline_observation_codec(*, movement_result_classes: int,
                                               inventory_size: int, observation_latent_dim: int,
-                                              feature_dim: int, hidden_dim: int):
+                                              feature_dim: int,
+                                              hidden_dim: int):
     observation_dim = movement_result_classes + inventory_size
     encoder = AgiMazeObservationEncoder(
         make_probe_head(observation_dim, observation_latent_dim, hidden_dim, 2),
@@ -358,7 +364,13 @@ def create_agimaze_baseline_observation_codec(*, movement_result_classes: int,
         movement_result_classes,
         inventory_size,
     )
-    return encoder, decoder
+    probe_decoder = AgiMazeObservationDecoder(
+        nn.Linear(observation_latent_dim, movement_result_classes),
+        nn.Linear(observation_latent_dim, inventory_size),
+        movement_result_classes,
+        inventory_size,
+    )
+    return encoder, decoder, probe_decoder
 
 
 def create_agimaze_discrete_observation_codec(*, movement_result_classes: int,

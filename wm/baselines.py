@@ -24,6 +24,7 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         *,
         observation_encoder: ObservationEncoder,
         observation_decoder: ObservationDecoder,
+        cpc_sensor_probe_decoder: ObservationDecoder,
         sensor_mode: str,
         action_dim: int,
         loc_x_bins: int,
@@ -58,12 +59,13 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         self._validate_params()
         self.observation_encoder = observation_encoder
         self.observation_decoder = observation_decoder
+        self.cpc_sensor_probe_decoder = cpc_sensor_probe_decoder
+        self.obs_fuse = nn.Linear(config.hidden_size + self.action_latent_dim, config.hidden_size)
         self.loc_x_head = make_probe_head(config.hidden_size, loc_x_bins, self.probe_hidden_dim, self.probe_layers)
         self.loc_y_head = make_probe_head(config.hidden_size, loc_y_bins, self.probe_hidden_dim, self.probe_layers)
         self.heading_head = make_probe_head(config.hidden_size, heading_dim, self.probe_hidden_dim, self.probe_layers)
         self.action_encoder = make_probe_head(self.action_dim, self.action_latent_dim, self.probe_hidden_dim, 2)
         self.contrastive_context = nn.Linear(config.hidden_size, cpc_context_dim)
-        self.obs_fuse = nn.Linear(config.hidden_size + self.action_latent_dim, config.hidden_size)
         self.turn_head = nn.Linear(config.hidden_size, turn_bins)
         self.step_head = nn.Linear(config.hidden_size, step_bins)
         self.cpc_sensor_latent_head = make_probe_head(
@@ -99,8 +101,8 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
             raise ValueError("probe_hidden_dim must be >= 0")
         if self.probe_layers < 1:
             raise ValueError("probe_layers must be >= 1")
-        if self.contrastive_dim < 0:
-            raise ValueError("contrastive_dim must be >= 0")
+        if self.contrastive_dim <= 0:
+            raise ValueError("contrastive_dim must be > 0")
         if self.contrastive_steps < 1:
             raise ValueError("contrastive_steps must be >= 1")
 
@@ -180,8 +182,7 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         return self.contrastive_target_head(h)
 
     def _project_contrastive_pred_steps(self, h: torch.Tensor, actions: torch.Tensor):
-        if self.contrastive_dim <= 0 or self.contrastive_action_heads is None:
-            return [], []
+        """Predict horizons with available future CPC targets."""
         B, T, _ = h.shape
         mean_steps: List[torch.Tensor] = []
         scale_steps: List[torch.Tensor] = []
@@ -240,20 +241,19 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
             key_padding_mask=key_padding_mask,
             reset_mask=episode_start)
         preds, aux_inputs = self.forward_preds(h, actions, sensor_latent, episode_start)
+        aux_inputs["sensor_target"] = sensor
         return preds, aux_inputs, h, h[:, -1, :]
 
     def forward_preds(self, h, actions, sensor_latent, episode_start):
         """
         Compute cpc/sfa and other features based on {st, at}
         """
-        if actions is None:
-            action_latent = None
-            pred_sensor = None
-        else:
-            action_latent = self.action_encoder(actions)
+        action_latent = None if actions is None else self.action_encoder(actions)
+        aux_inputs = self.compute_aux(h, action_latent, episode_start, sensor_latent)
+        pred_sensor = None
+        if action_latent is not None:
             obs_feat = torch.tanh(self.obs_fuse(torch.cat([h, action_latent], dim=-1)))
             pred_sensor = self.observation_decoder.decode(obs_feat)
-        aux_inputs = self.compute_aux(h, action_latent, episode_start, sensor_latent)
         # State probes (current-step location/heading) read detached state.
         h_probe = h.detach()
         # Action heads use detached or live state based on constructor setting.
@@ -296,6 +296,7 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         aux_inputs["contrastive_pred_scale_steps"] = scale_steps
         aux_inputs["sensor_latent"] = sensor_latent
         aux_inputs["cpc_sensor_latent_pred"] = self.cpc_sensor_latent_head(aux_inputs["contrastive_tgt_emb"])
+        aux_inputs["cpc_sensor_latent_future_pred"] = self.cpc_sensor_latent_head(pred_steps[0].detach()) if pred_steps else None
 
         sfa = self.cpc_sfa(scale_upstream_grad(aux_inputs["contrastive_tgt_emb"], scale=self.sfa_cpc_grad_scale),
                             reset_mask)
@@ -306,6 +307,40 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         aux_inputs['sfa'] = sfa
         return aux_inputs
 
+    def compute_losses(self, *, preds, targets, aux_inputs=None):
+        losses = super().compute_losses(preds=preds, targets=targets, aux_inputs=aux_inputs)
+        assert aux_inputs["sensor_target"] is not None, "CPC sensor probe requires raw observations"
+        anchor_latent = self.cpc_sensor_latent_head(aux_inputs["contrastive_tgt_emb"].detach())
+        reconstruction = self.cpc_sensor_probe_decoder.decode(anchor_latent)
+        reconstruction_loss = self.cpc_sensor_probe_decoder.compute_loss(
+            reconstruction, aux_inputs["sensor_target"], targets["key_padding_mask"], self.config)
+        future_latent = aux_inputs["cpc_sensor_latent_future_pred"]
+        if future_latent is not None:
+            padding = targets["key_padding_mask"]
+            future_reconstruction = self.cpc_sensor_probe_decoder.decode(future_latent)
+            future_loss = self.cpc_sensor_probe_decoder.compute_loss(
+                future_reconstruction, tree_index(targets["y_sensor"], (slice(None), slice(None, -1))),
+                padding[:, :-1] | padding[:, 1:], self.config)
+            reconstruction_loss = 0.5 * (reconstruction_loss + future_loss)
+        losses["sensor_cpc_probe"] = reconstruction_loss
+        losses["aux_total"] = losses["aux_total"] + self.config.sensor_weight * reconstruction_loss
+        return losses
+
+    @torch.no_grad()
+    def compute_metrics(self, *, preds, targets, aux_inputs=None):
+        metrics = super().compute_metrics(preds=preds, targets=targets, aux_inputs=aux_inputs)
+        predicted_latent = aux_inputs["cpc_sensor_latent_future_pred"]
+        if predicted_latent is None:
+            return metrics
+        predicted_sensor = self.cpc_sensor_probe_decoder.decode(predicted_latent)
+        padding = targets["key_padding_mask"]
+        next_sensor_metrics = self.cpc_sensor_probe_decoder.compute_metrics(
+            predicted_sensor, tree_index(targets["y_sensor"], (slice(None), slice(None, -1))),
+            padding[:, :-1] | padding[:, 1:], self.config)
+        if "lr_acc" in next_sensor_metrics:
+            metrics["cpc_next_lr_acc"] = next_sensor_metrics["lr_acc"]
+        return metrics
+
 
 class RNNPredictor(TransformerBaseline):
     def __init__(
@@ -314,6 +349,7 @@ class RNNPredictor(TransformerBaseline):
         *,
         observation_encoder: ObservationEncoder,
         observation_decoder: ObservationDecoder,
+        cpc_sensor_probe_decoder: ObservationDecoder,
         sensor_mode: str,
         loc_x_bins: int,
         loc_y_bins: int,
@@ -333,6 +369,7 @@ class RNNPredictor(TransformerBaseline):
             config,
             observation_encoder=observation_encoder,
             observation_decoder=observation_decoder,
+            cpc_sensor_probe_decoder=cpc_sensor_probe_decoder,
             sensor_mode=sensor_mode,
             loc_x_bins=loc_x_bins,
             loc_y_bins=loc_y_bins,
