@@ -239,6 +239,7 @@ def build_model_from_checkpoint(ckpt: dict, sensor_mode: str, device: str):
             observation_decoder=observation_codecs[1],
             z_observation_decoder=observation_codecs[2],
             h_observation_decoder=observation_codecs[3],
+            cpc_sensor_probe_decoder=observation_codecs[4],
             hidden_size=int(mcfg["hidden_size"]),
             layers=int(mcfg["layers"]),
             heads=int(mcfg["heads"]),
@@ -273,15 +274,13 @@ def build_model_from_checkpoint(ckpt: dict, sensor_mode: str, device: str):
         probe_layers = resolve_probe_layers(mcfg, probe_hidden_dim)
         contrastive_dim = int(mcfg.get("contrastive_dim", contrastive_dim_cfg))
         contrastive_steps = int(mcfg.get("contrastive_steps", contrastive_steps_cfg))
-        transition = str(mcfg.get("transition", cfg.get("rssm_transition", "gru")))
-        residual_scale = float(mcfg.get("residual_scale", cfg.get("rssm_residual_scale", 1.0)))
-        state_norm = str(mcfg.get("state_norm", cfg.get("rssm_state_norm", "none")))
         observation_codecs = create_discrete_codecs(mcfg)
         model = RSSMDiscretePredictor(
             observation_encoder=observation_codecs[0],
             observation_decoder=observation_codecs[1],
             z_observation_decoder=observation_codecs[2],
             h_observation_decoder=observation_codecs[3],
+            cpc_sensor_probe_decoder=observation_codecs[4],
             hidden_size=int(mcfg["hidden_size"]),
             sensor_mode=sensor_mode,
             loc_x_bins=loc_x_bins,
@@ -304,9 +303,6 @@ def build_model_from_checkpoint(ckpt: dict, sensor_mode: str, device: str):
             probe_layers=probe_layers,
             contrastive_dim=contrastive_dim,
             contrastive_steps=contrastive_steps,
-            transition=transition,
-            residual_scale=residual_scale,
-            state_norm=state_norm,
         ).to(device)
     elif model_type == "transformer":
         llama_cfg = LlamaConfig(**model_cfg["llama"])
@@ -315,7 +311,7 @@ def build_model_from_checkpoint(ckpt: dict, sensor_mode: str, device: str):
         contrastive_dim = int(model_cfg.get("contrastive_dim", contrastive_dim_cfg))
         contrastive_steps = int(model_cfg.get("contrastive_steps", contrastive_steps_cfg))
         sensor_latent_dim = int(model_cfg["sensor_latent_dim"])
-        observation_encoder, observation_decoder = create_maze_baseline_observation_codec(
+        observation_encoder, observation_decoder, cpc_sensor_probe_decoder = create_maze_baseline_observation_codec(
             sensor_dim=sensor_dim,
             sensor_latent_dim=sensor_latent_dim,
             feature_dim=llama_cfg.hidden_size,
@@ -326,6 +322,7 @@ def build_model_from_checkpoint(ckpt: dict, sensor_mode: str, device: str):
             llama_cfg,
             observation_encoder=observation_encoder,
             observation_decoder=observation_decoder,
+            cpc_sensor_probe_decoder=cpc_sensor_probe_decoder,
             sensor_mode=sensor_mode,
             action_dim=2,
             loc_x_bins=loc_x_bins,
@@ -352,7 +349,7 @@ def build_model_from_checkpoint(ckpt: dict, sensor_mode: str, device: str):
             num_hidden_layers=int(rcfg.get("layers", 2)),
         )
         sensor_latent_dim = int(rcfg["sensor_latent_dim"])
-        observation_encoder, observation_decoder = create_maze_baseline_observation_codec(
+        observation_encoder, observation_decoder, cpc_sensor_probe_decoder = create_maze_baseline_observation_codec(
             sensor_dim=sensor_dim,
             sensor_latent_dim=sensor_latent_dim,
             feature_dim=rnn_cfg.hidden_size,
@@ -363,6 +360,7 @@ def build_model_from_checkpoint(ckpt: dict, sensor_mode: str, device: str):
             rnn_cfg,
             observation_encoder=observation_encoder,
             observation_decoder=observation_decoder,
+            cpc_sensor_probe_decoder=cpc_sensor_probe_decoder,
             sensor_mode=sensor_mode,
             action_dim=2,
             loc_x_bins=loc_x_bins,
@@ -556,15 +554,15 @@ def main():
             roll_head = heading
 
             if isinstance(model, TSSMDiscretePredictor):
-                detach_on_pop = bool(getattr(model, "bptt_horizon", 0) > 0)
+                detach_every = model.bptt_horizon if model.training else 0
                 if model.attention_window is not None and model.attention_window > 0:
                     cache = WindowedPositionBasedDynamicCache(
                         int(model.attention_window),
-                        detach_on_pop=detach_on_pop,
+                        detach_every=detach_every,
                     ).to(device=args.device)
                 else:
                     cache = PositionBasedDynamicCache(
-                        detach_on_pop=detach_on_pop
+                        detach_every=detach_every
                     ).to(device=args.device)
                 pos_idx = 0
 

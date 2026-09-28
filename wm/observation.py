@@ -344,7 +344,9 @@ def create_maze_discrete_observation_codec(*, sensor_dim: int, sensor_latent_dim
         sensor_bins=sensor_bins,
         decoder=nn.Linear(hidden_size, sensor_out_dim),
     )
-    return encoder, decoder, z_decoder, h_decoder
+    probe_decoder = MazeObservationDecoder(
+        sensor_bins=sensor_bins, decoder=nn.Linear(sensor_latent_dim, sensor_out_dim))
+    return encoder, decoder, z_decoder, h_decoder, probe_decoder
 
 
 def create_agimaze_baseline_observation_codec(*, movement_result_classes: int,
@@ -398,4 +400,5 @@ def create_agimaze_discrete_observation_codec(*, movement_result_classes: int,
         create_decoder(feature_dim),
         create_decoder(stochastic_dim),
         create_decoder(hidden_size),
+        create_decoder(observation_latent_dim),
     )

@@ -43,9 +43,6 @@ _MODEL_ARG_DEFAULTS = {
     "attention_window": None,
     "attention_dropout": 0.0,
     "rnn_state_norm": "none",
-    "rssm_transition": "gru",
-    "rssm_residual_scale": 1.0,
-    "rssm_state_norm": "none",
     "stoch_size": 32,
     "stoch_classes": 32,
     "stoch_temp": 1.0,
@@ -96,9 +93,6 @@ _MODEL_ARG_FIELDS = (
     "attention_window",
     "attention_dropout",
     "rnn_state_norm",
-    "rssm_transition",
-    "rssm_residual_scale",
-    "rssm_state_norm",
     "stoch_size",
     "stoch_classes",
     "stoch_temp",
@@ -203,29 +197,6 @@ def add_create_model_args(
         choices=["none", "layernorm", "rmsnorm"],
         default=resolved_defaults["rnn_state_norm"],
         help="Normalization on RNN hidden sequence before prediction heads.",
-    )
-    parser.add_argument(
-        _arg_option(arg_prefix, "rssm_transition"),
-        dest=_arg_dest(arg_prefix, "rssm_transition"),
-        type=str,
-        choices=["gru", "residual"],
-        default=resolved_defaults["rssm_transition"],
-        help="RSSM deterministic transition: GRUCell or residual update h_t=h_{t-1}+g_t.",
-    )
-    parser.add_argument(
-        _arg_option(arg_prefix, "rssm_residual_scale"),
-        dest=_arg_dest(arg_prefix, "rssm_residual_scale"),
-        type=float,
-        default=resolved_defaults["rssm_residual_scale"],
-        help="Scale for RSSM residual update when --rssm-transition=residual.",
-    )
-    parser.add_argument(
-        _arg_option(arg_prefix, "rssm_state_norm"),
-        dest=_arg_dest(arg_prefix, "rssm_state_norm"),
-        type=str,
-        choices=["none", "layernorm", "rmsnorm"],
-        default=resolved_defaults["rssm_state_norm"],
-        help="Pre-normalization on RSSM h_{t-1} before transition step.",
     )
     parser.add_argument(
         _arg_option(arg_prefix, "stoch_size"),
@@ -544,12 +515,13 @@ def create_rssm_tssm_model(args, *, action_dim: int, observation_codecs,
                            model_config_extra: Dict, logger=None):
     if args.model_type not in {"rssm", "tssm"}:
         raise ValueError(f"Expected discrete model type, got {args.model_type}")
-    observation_encoder, observation_decoder, z_observation_decoder, h_observation_decoder = observation_codecs
+    observation_encoder, observation_decoder, z_observation_decoder, h_observation_decoder, cpc_sensor_probe_decoder = observation_codecs
     common_kwargs = {
         "observation_encoder": observation_encoder,
         "observation_decoder": observation_decoder,
         "z_observation_decoder": z_observation_decoder,
         "h_observation_decoder": h_observation_decoder,
+        "cpc_sensor_probe_decoder": cpc_sensor_probe_decoder,
         "hidden_size": args.hidden_size,
         "sensor_mode": args.sensor_mode,
         "loc_x_bins": loc_x_bins,
@@ -576,12 +548,7 @@ def create_rssm_tssm_model(args, *, action_dim: int, observation_codecs,
         "logger": logger,
     }
     if args.model_type == "rssm":
-        model = RSSMDiscretePredictor(
-            transition=args.rssm_transition,
-            residual_scale=args.rssm_residual_scale,
-            state_norm=args.rssm_state_norm,
-            **common_kwargs,
-        )
+        model = RSSMDiscretePredictor(**common_kwargs)
         model_config_extra["rssm"] = {
             "hidden_size": args.hidden_size,
             "stoch_size": args.stoch_size,
@@ -599,9 +566,6 @@ def create_rssm_tssm_model(args, *, action_dim: int, observation_codecs,
             "probe_layers": args.probe_layers,
             "contrastive_dim": args.contrastive_dim,
             "contrastive_steps": args.contrastive_steps,
-            "transition": args.rssm_transition,
-            "residual_scale": args.rssm_residual_scale,
-            "state_norm": args.rssm_state_norm,
             "action_dim": action_dim,
         }
     else:
@@ -749,7 +713,7 @@ def create_model(
 
 
 def create_single_policy_agent(args, wm_model_args, wm_model, logger, maze_dim, num_actions, action_table):
-    policy_input_dim = int(wm_model_args.hidden_size)
+    policy_input_dim = wm_model.get_feature_size()
     policy_module = WMActionHeadPolicy(
         num_actions=num_actions,
         device=torch.device(args.device),

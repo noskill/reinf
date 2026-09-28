@@ -47,6 +47,7 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         self.turn_bins = turn_bins
         self.step_bins = step_bins
         self.input_size = config.input_size
+        self.hidden_size = config.hidden_size
         self.action_latent_dim = action_latent_dim
         self.sensor_latent_dim = observation_encoder.latent_dim
         self.action_dim = action_dim
@@ -95,6 +96,13 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         self.attention_window = config.attention_window
         self.logger = logger
         self.sfa_cpc_grad_scale = 0.05
+
+    def get_feature_size(self):
+        return self.hidden_size
+
+    def predict_next_sensor(self, obs, next_sensor):
+        assert not self.training
+        return self(obs)["preds"][0]
 
     def _validate_params(self):
         if self.probe_hidden_dim < 0:
@@ -309,19 +317,7 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
 
     def compute_losses(self, *, preds, targets, aux_inputs=None):
         losses = super().compute_losses(preds=preds, targets=targets, aux_inputs=aux_inputs)
-        assert aux_inputs["sensor_target"] is not None, "CPC sensor probe requires raw observations"
-        anchor_latent = self.cpc_sensor_latent_head(aux_inputs["contrastive_tgt_emb"].detach())
-        reconstruction = self.cpc_sensor_probe_decoder.decode(anchor_latent)
-        reconstruction_loss = self.cpc_sensor_probe_decoder.compute_loss(
-            reconstruction, aux_inputs["sensor_target"], targets["key_padding_mask"], self.config)
-        future_latent = aux_inputs["cpc_sensor_latent_future_pred"]
-        if future_latent is not None:
-            padding = targets["key_padding_mask"]
-            future_reconstruction = self.cpc_sensor_probe_decoder.decode(future_latent)
-            future_loss = self.cpc_sensor_probe_decoder.compute_loss(
-                future_reconstruction, tree_index(targets["y_sensor"], (slice(None), slice(None, -1))),
-                padding[:, :-1] | padding[:, 1:], self.config)
-            reconstruction_loss = 0.5 * (reconstruction_loss + future_loss)
+        reconstruction_loss = self.compute_cpc_probe_loss(aux_inputs, targets)
         losses["sensor_cpc_probe"] = reconstruction_loss
         losses["aux_total"] = losses["aux_total"] + self.config.sensor_weight * reconstruction_loss
         return losses
@@ -329,16 +325,7 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
     @torch.no_grad()
     def compute_metrics(self, *, preds, targets, aux_inputs=None):
         metrics = super().compute_metrics(preds=preds, targets=targets, aux_inputs=aux_inputs)
-        predicted_latent = aux_inputs["cpc_sensor_latent_future_pred"]
-        if predicted_latent is None:
-            return metrics
-        predicted_sensor = self.cpc_sensor_probe_decoder.decode(predicted_latent)
-        padding = targets["key_padding_mask"]
-        next_sensor_metrics = self.cpc_sensor_probe_decoder.compute_metrics(
-            predicted_sensor, tree_index(targets["y_sensor"], (slice(None), slice(None, -1))),
-            padding[:, :-1] | padding[:, 1:], self.config)
-        if "lr_acc" in next_sensor_metrics:
-            metrics["cpc_next_lr_acc"] = next_sensor_metrics["lr_acc"]
+        metrics.update(self.compute_cpc_probe_metrics(aux_inputs, targets))
         return metrics
 
 

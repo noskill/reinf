@@ -27,6 +27,7 @@ class TSSMDiscretePredictor(DiscreteLatentPredictorBase):
         observation_decoder: ObservationDecoder,
         z_observation_decoder: ObservationDecoder,
         h_observation_decoder: ObservationDecoder,
+        cpc_sensor_probe_decoder: ObservationDecoder,
         hidden_size: int,
         layers: int,
         heads: int,
@@ -65,6 +66,7 @@ class TSSMDiscretePredictor(DiscreteLatentPredictorBase):
             observation_decoder=observation_decoder,
             z_observation_decoder=z_observation_decoder,
             h_observation_decoder=h_observation_decoder,
+            cpc_sensor_probe_decoder=cpc_sensor_probe_decoder,
             hidden_size=hidden_size,
             sensor_mode=sensor_mode,
             loc_x_bins=loc_x_bins,
@@ -105,38 +107,43 @@ class TSSMDiscretePredictor(DiscreteLatentPredictorBase):
             use_rope=True,
         )
         self.backbone = CachedTransformer(trans_cfg)
-        self._state = None
+        self._z = None
 
     def clear_cache(self):
         self.backbone.clear_cache()
-        self._state = None
+        self._z = None
+        self.cpc_sfa.clear_cache()
 
     def reset_cache(self, reset_mask):
         assert reset_mask.dtype == torch.bool and reset_mask.ndim == 1
-        if self._state is not None:
-            assert reset_mask.shape == self._state.shape[:1]
-            self._state = self._state.masked_fill(reset_mask[:, None], 0)
+        if self._z is not None:
+            assert reset_mask.shape == self._z.shape[:1]
+            self._z = self._z.masked_fill(reset_mask[:, None], 0)
         self.backbone.reset_cache(reset_mask)
+        self.cpc_sfa.reset_cache(reset_mask)
 
     def get_cache_state(self):
-        if self._state is None:
+        if self._z is None:
             assert self.backbone.get_cache_state() is None
             return None
-        return {"state": self._state.detach().clone(), "backbone": self.backbone.get_cache_state()}
+        return {"z": self._z.detach().clone(), "backbone": self.backbone.get_cache_state(),
+                "sfa": self.cpc_sfa.get_cache_state()}
 
     def set_cache_state(self, state):
         if state is None:
             self.clear_cache()
             return
-        self._state = state["state"].detach().clone()
+        self._z = state["z"].detach().clone()
         self.backbone.set_cache_state(state["backbone"])
+        self.cpc_sfa.set_cache_state(state["sfa"])
 
     def index_cache_state(self, state, batch_indices):
         if state is None:
             return None
         return {
-            "state": state["state"][batch_indices].detach().clone(),
+            "z": state["z"][batch_indices].detach().clone(),
             "backbone": self.backbone.index_cache_state(state["backbone"], batch_indices),
+            "sfa": self.cpc_sfa.index_cache_state(state["sfa"], batch_indices),
         }
 
     def _forward_core(
@@ -152,14 +159,12 @@ class TSSMDiscretePredictor(DiscreteLatentPredictorBase):
             episode_start=episode_start,
         )
         batch_size, sequence_length = obs_embed.shape[:2]
-        h_prev = obs_embed.new_zeros((batch_size, self.hidden_size))
         z_prev_flat = obs_embed.new_zeros((batch_size, self.stoch_flat))
         if episode_start is not None:
             self.reset_cache(episode_start)
-            if self._state is not None:
-                assert self._state.shape == (batch_size, self.feat_dim)
-                h_prev, z_prev_flat = self._state.split([self.hidden_size, self.stoch_flat], dim=-1)
-        h_init = h_prev
+            if self._z is not None:
+                assert self._z.shape == (batch_size, self.stoch_flat)
+                z_prev_flat = self._z
         z_init_flat = z_prev_flat
 
         if attention_window is None:
@@ -203,7 +208,6 @@ class TSSMDiscretePredictor(DiscreteLatentPredictorBase):
                 prior_logits_steps.append(prior_logits_t)
                 post_logits_steps.append(post_logits_t)
 
-                h_prev = h_t
                 z_prev_flat = z_t_flat
 
         feat = torch.stack(feat_steps, dim=1)                 # [B, T, H + S*C]
@@ -219,7 +223,6 @@ class TSSMDiscretePredictor(DiscreteLatentPredictorBase):
         h_only_pred = self._decode_sensor_from_h(h_post)
         prior_roll_sensor_pred = None
         if need_aux and self.prior_rollout_weight > 0:
-            h_roll = h_init
             z_roll_flat = z_init_flat
             feat_roll_steps = []
             roll_T = sequence_length if self.prior_rollout_steps <= 0 else min(sequence_length, self.prior_rollout_steps)
@@ -239,32 +242,22 @@ class TSSMDiscretePredictor(DiscreteLatentPredictorBase):
                 feat_roll = torch.stack(feat_roll_steps, dim=1)
                 prior_roll_sensor_pred = self._decode_sensor_from_feat(feat_roll)
 
-        aux_inputs = None
+        aux_inputs = self.compute_cpc_aux(feat_prior, z_post, actions, obs_embed, episode_start)
+        aux_inputs["prior_sensor_pred"] = prior_sensor_pred
         if need_aux:
-            aux_inputs = {
+            aux_inputs.update({
                 "prior_logits": prior_logits,
                 "post_logits": post_logits,
                 "feat": feat,
                 "sensor_target": obs_features,
-                "loc_target": obs["loc"],
-                "head_target": obs["heading"],
-                "prior_sensor_pred": prior_sensor_pred,
                 "prior_roll_sensor_pred": prior_roll_sensor_pred,
                 "z_only_pred": z_only_pred,
                 "h_only_pred": h_only_pred,
-            }
-            # Twister-style action-conditioned contrastive predictors for horizons 1..K.
-            pred_steps, scale_steps = self._project_contrastive_pred_steps(
-                feat_prior,
-                actions,
-            )
-            aux_inputs["contrastive_pred_emb_steps"] = pred_steps
-            aux_inputs["contrastive_pred_scale_steps"] = scale_steps
-            aux_inputs["contrastive_tgt_emb"] = self._project_contrastive_target_z(z_post)
+            })
         state_seq = feat
-        last_state = torch.cat([h_prev, z_prev_flat], dim=-1)
+        last_state = feat[:, -1, :]
         if episode_start is not None:
-            self._state = last_state.detach()
+            self._z = z_prev_flat.detach()
         return outputs, aux_inputs, state_seq, last_state
 
     def forward(
@@ -282,7 +275,7 @@ class TSSMDiscretePredictor(DiscreteLatentPredictorBase):
         )
         return {
             "preds": outputs,
-            "aux": aux_inputs if need_aux else None,
+            "aux": aux_inputs,
             "state": last_state,
             "state_last": last_state,
             "state_seq": state_seq,

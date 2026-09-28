@@ -11,7 +11,8 @@ import torch.nn.functional as F
 from torch import nn
 import neural_sfa
 from observation import ObservationDecoder, ObservationEncoder
-from util import tree_map
+from util import tree_map, tree_index
+from recurrent_mlp import RecurrentMLP
 
 from utils import (
     batch_row_k_step_contrastive_pair_stats,
@@ -20,6 +21,7 @@ from utils import (
     masked_coord_rmse,
     make_probe_head,
     isotropic_normal_from_params,
+    scale_upstream_grad,
     sg,
     soft_cross_entropy,
 )
@@ -445,6 +447,34 @@ class PredictionLossMixin:
         losses["sensor_cpc"] = loss_sensor_cpc
         return losses
 
+    def compute_cpc_probe_loss(self, aux_inputs, targets):
+        assert aux_inputs["sensor_target"] is not None, "CPC sensor probe requires raw observations"
+        anchor_latent = self.cpc_sensor_latent_head(aux_inputs["contrastive_tgt_emb"].detach())
+        reconstruction = self.cpc_sensor_probe_decoder.decode(anchor_latent)
+        padding = targets["key_padding_mask"]
+        loss = self.cpc_sensor_probe_decoder.compute_loss(
+            reconstruction, aux_inputs["sensor_target"], padding, self.config)
+        future_latent = aux_inputs["cpc_sensor_latent_future_pred"]
+        if future_latent is not None:
+            prediction = self.cpc_sensor_probe_decoder.decode(future_latent)
+            future_loss = self.cpc_sensor_probe_decoder.compute_loss(
+                prediction, tree_index(targets["y_sensor"], (slice(None), slice(None, -1))),
+                padding[:, :-1] | padding[:, 1:], self.config)
+            loss = 0.5 * (loss + future_loss)
+        return loss
+
+    @torch.no_grad()
+    def compute_cpc_probe_metrics(self, aux_inputs, targets):
+        latent = aux_inputs["cpc_sensor_latent_future_pred"]
+        if latent is None:
+            return {}
+        prediction = self.cpc_sensor_probe_decoder.decode(latent)
+        padding = targets["key_padding_mask"]
+        metrics = self.cpc_sensor_probe_decoder.compute_metrics(
+            prediction, tree_index(targets["y_sensor"], (slice(None), slice(None, -1))),
+            padding[:, :-1] | padding[:, 1:], self.config)
+        return {"cpc_next_lr_acc": metrics["lr_acc"]} if "lr_acc" in metrics else {}
+
     def compute_metrics(
         self,
         *,
@@ -590,6 +620,7 @@ class DiscreteLatentPredictorBase(PredictionLossMixin, nn.Module):
         observation_decoder: ObservationDecoder,
         z_observation_decoder: ObservationDecoder,
         h_observation_decoder: ObservationDecoder,
+        cpc_sensor_probe_decoder: ObservationDecoder,
         hidden_size: int,
         sensor_mode: str,
         loc_x_bins: int,
@@ -647,8 +678,8 @@ class DiscreteLatentPredictorBase(PredictionLossMixin, nn.Module):
             raise ValueError("probe_hidden_dim must be >= 0")
         if self.probe_layers < 1:
             raise ValueError("probe_layers must be >= 1")
-        if self.contrastive_dim < 0:
-            raise ValueError("contrastive_dim must be >= 0")
+        if self.contrastive_dim <= 0:
+            raise ValueError("contrastive_dim must be > 0 for CPC and SFA")
         if self.contrastive_steps < 1:
             raise ValueError("contrastive_steps must be >= 1")
         self.loc_x_bins = int(loc_x_bins)
@@ -658,6 +689,11 @@ class DiscreteLatentPredictorBase(PredictionLossMixin, nn.Module):
         self.observation_decoder = observation_decoder
         self.z_observation_decoder = z_observation_decoder
         self.h_observation_decoder = h_observation_decoder
+        self.cpc_sensor_probe_decoder = cpc_sensor_probe_decoder
+        self.cpc_sensor_latent_head = make_probe_head(
+            self.contrastive_dim, observation_encoder.latent_dim, self.probe_hidden_dim, 3)
+        self.cpc_sfa = RecurrentMLP(make_probe_head(self.contrastive_dim * 2, self.contrastive_dim, 256, 3))
+        self.sfa_cpc_grad_scale = 0.05
         self.prior_head = nn.Linear(self.hidden_size, self.stoch_flat)
         self.post_head = nn.Linear(self.hidden_size + observation_encoder.latent_dim, self.stoch_flat)
 
@@ -696,6 +732,58 @@ class DiscreteLatentPredictorBase(PredictionLossMixin, nn.Module):
                 nn.ReLU(),
                 nn.Linear(self.hidden_size, self.contrastive_dim),
             )
+
+    def get_feature_size(self):
+        return self.feat_dim
+
+    def predict_next_sensor(self, obs, next_sensor):
+        """Decode prior at t+1 after transition with a_t, before observing o_t+1.
+
+        Teacher forcing uses [o_0, ..., o_T]; slicing prior predictions from
+        index 1 preserves every transition, including the final one. Eval uses
+        categorical modes for reproducible before/after learning progress.
+        """
+        assert not self.training
+        sensor_latent = torch.cat([
+            self.observation_encoder.encode(tree_index(obs["sensor"], (slice(None), slice(0, 1)))),
+            self.observation_encoder.encode(next_sensor),
+        ], dim=1)
+        actions = obs["actions"]
+        padding = obs["key_padding_mask"]
+        prior_obs = {
+            "sensor_latent": sensor_latent,
+            "actions": None,
+            "prev_actions": torch.cat([torch.zeros_like(actions[:, :1]), actions], dim=1),
+            "key_padding_mask": torch.cat([padding[:, :1], padding], dim=1),
+        }
+        _, aux, _, _ = self._forward_core(prior_obs, need_aux=False)
+        return tree_index(aux["prior_sensor_pred"], (slice(None), slice(1, None)))
+
+    def compute_cpc_aux(self, prior_feat, z_post, actions, sensor_latent, reset_mask):
+        anchor = self._project_contrastive_target_z(z_post)
+        pred_steps, scale_steps = self._project_contrastive_pred_steps(prior_feat, actions)
+        return {
+            "contrastive_tgt_emb": anchor,
+            "contrastive_pred_emb_steps": pred_steps,
+            "contrastive_pred_scale_steps": scale_steps,
+            "sensor_latent": sensor_latent,
+            "cpc_sensor_latent_pred": self.cpc_sensor_latent_head(anchor.detach()),
+            "cpc_sensor_latent_future_pred": self.cpc_sensor_latent_head(pred_steps[0].detach()) if pred_steps else None,
+            "sfa": self.cpc_sfa(scale_upstream_grad(anchor, self.sfa_cpc_grad_scale), reset_mask),
+        }
+
+    def compute_losses(self, *, preds, targets, aux_inputs=None):
+        losses = super().compute_losses(preds=preds, targets=targets, aux_inputs=aux_inputs)
+        probe_loss = self.compute_cpc_probe_loss(aux_inputs, targets)
+        losses["sensor_cpc_probe"] = probe_loss
+        losses["aux_total"] = losses["aux_total"] + self.config.sensor_weight * probe_loss
+        return losses
+
+    @torch.no_grad()
+    def compute_metrics(self, *, preds, targets, aux_inputs=None):
+        metrics = super().compute_metrics(preds=preds, targets=targets, aux_inputs=aux_inputs)
+        metrics.update(self.compute_cpc_probe_metrics(aux_inputs, targets))
+        return metrics
 
     def _sample_stoch(self, logits: torch.Tensor, training: bool) -> torch.Tensor:
         # logits: [B, T, S, C]
@@ -761,13 +849,13 @@ class DiscreteLatentPredictorBase(PredictionLossMixin, nn.Module):
         key_padding_mask: torch.Tensor,
         aux_inputs: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Dict[str, torch.Tensor]:
-        del y_sensor, y_sensor_idx, y_loc_xy, y_head
+        del y_sensor, y_sensor_idx
         cfg = self.config
-        if aux_inputs is None or "sensor_target" not in aux_inputs or "loc_target" not in aux_inputs or "head_target" not in aux_inputs:
+        if aux_inputs is None or "sensor_target" not in aux_inputs:
             raise ValueError("aux_inputs targets are required for observation loss")
         sensor_target = aux_inputs["sensor_target"]
-        loc_target = aux_inputs["loc_target"]
-        head_target = aux_inputs["head_target"]
+        loc_target = y_loc_xy
+        head_target = y_head
 
         loc_idx = loc_target.round().to(torch.long).clamp(min=0)
         loss_loc_x = soft_cross_entropy(pred_loc_x, cfg.loc_x_table[loc_idx[..., 0]], key_padding_mask)
@@ -807,12 +895,12 @@ class DiscreteLatentPredictorBase(PredictionLossMixin, nn.Module):
         loc_min: Optional[torch.Tensor],
         aux_inputs: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Dict[str, torch.Tensor]:
-        del y_sensor, y_sensor_idx, y_loc_xy, sensor_min_idx
-        if aux_inputs is None or "sensor_target" not in aux_inputs or "loc_target" not in aux_inputs or "head_target" not in aux_inputs:
+        del y_sensor, y_sensor_idx, sensor_min_idx
+        if aux_inputs is None or "sensor_target" not in aux_inputs:
             raise ValueError("aux_inputs targets are required for metrics")
 
         sensor_target = aux_inputs["sensor_target"]
-        loc_target = aux_inputs["loc_target"]
+        loc_target = y_loc_xy
 
         sensor_metrics = self.observation_decoder.compute_metrics(
             pred_sensor,

@@ -34,6 +34,8 @@ def run_epoch_joint(
         "h_only": 0.0,
         "recon": 0.0,
         "sensor_cpc_probe": 0.0,
+        "sensor_cpc": 0.0,
+        "sfa": 0.0,
         "contrastive": 0.0,
         "contrastive_nll": 0.0,
         "contrastive_acc": 0.0,
@@ -101,6 +103,7 @@ def run_epoch_joint(
         )
         if cfg.contrastive_weight > 0:
             loss = loss + cfg.contrastive_weight * loss_dict.get("contrastive", torch.tensor(0.0, device=device))
+        loss = loss + loss_dict["sfa"] + 0.1 * loss_dict["sensor_cpc"]
 
         if is_train:
             optimizer.zero_grad(set_to_none=True)
@@ -108,6 +111,8 @@ def run_epoch_joint(
             optimizer.step()
 
         totals["loss"] += float(loss.detach().cpu())
+        if "cpc_next_lr_acc" in metrics:
+            totals["cpc_next_lr_acc"] = totals.get("cpc_next_lr_acc", 0.0) + float(metrics["cpc_next_lr_acc"].detach().cpu())
         for key in (
             "mse",
             "rmse",
@@ -134,6 +139,8 @@ def run_epoch_joint(
             ("h_only_sensor", "h_only"),
             ("recon", "recon"),
             ("sensor_cpc_probe", "sensor_cpc_probe"),
+            ("sensor_cpc", "sensor_cpc"),
+            ("sfa", "sfa"),
             ("contrastive", "contrastive"),
             ("contrastive_nll", "contrastive_nll"),
         ):

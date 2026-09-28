@@ -6,7 +6,6 @@ from torch import nn
 
 from base import DiscreteLatentPredictorBase
 from observation import ObservationDecoder, ObservationEncoder
-from transformer import LlamaRMSNorm
 
 
 class RSSMDiscretePredictor(DiscreteLatentPredictorBase):
@@ -17,6 +16,7 @@ class RSSMDiscretePredictor(DiscreteLatentPredictorBase):
         observation_decoder: ObservationDecoder,
         z_observation_decoder: ObservationDecoder,
         h_observation_decoder: ObservationDecoder,
+        cpc_sensor_probe_decoder: ObservationDecoder,
         hidden_size: int,
         sensor_mode: str,
         loc_x_bins: int,
@@ -41,9 +41,6 @@ class RSSMDiscretePredictor(DiscreteLatentPredictorBase):
         contrastive_dim: int = 0,
         contrastive_steps: int = 1,
         detach_action_heads: bool = True,
-        transition: str = "gru",
-        residual_scale: float = 1.0,
-        state_norm: str = "none",
         logger=None,
     ):
         super().__init__(
@@ -51,6 +48,7 @@ class RSSMDiscretePredictor(DiscreteLatentPredictorBase):
             observation_decoder=observation_decoder,
             z_observation_decoder=z_observation_decoder,
             h_observation_decoder=h_observation_decoder,
+            cpc_sensor_probe_decoder=cpc_sensor_probe_decoder,
             hidden_size=hidden_size,
             sensor_mode=sensor_mode,
             loc_x_bins=loc_x_bins,
@@ -78,29 +76,40 @@ class RSSMDiscretePredictor(DiscreteLatentPredictorBase):
             logger=logger,
         )
         self.rnn = nn.GRUCell(self.stoch_flat + self.action_dim, self.hidden_size)
-        self.transition = str(transition)
-        self.residual_scale = float(residual_scale)
-        if self.transition not in {"gru", "residual"}:
-            raise ValueError("RSSM transition must be one of {'gru', 'residual'}")
-        self.state_norm = str(state_norm)
-        if self.state_norm not in {"none", "layernorm", "rmsnorm"}:
-            raise ValueError("RSSM state_norm must be one of {'none', 'layernorm', 'rmsnorm'}")
-        if self.state_norm == "layernorm":
-            self.state_pre_norm = nn.LayerNorm(self.hidden_size)
-        elif self.state_norm == "rmsnorm":
-            self.state_pre_norm = LlamaRMSNorm(self.hidden_size)
-        else:
-            self.state_pre_norm = nn.Identity()
+        self._state = None
+
+    def clear_cache(self):
+        self._state = None
+        self.cpc_sfa.clear_cache()
+
+    def reset_cache(self, reset_mask):
+        assert reset_mask.dtype == torch.bool and reset_mask.ndim == 1
+        if self._state is not None:
+            assert reset_mask.shape == self._state.shape[:1]
+            self._state = self._state.masked_fill(reset_mask[:, None], 0)
+        self.cpc_sfa.reset_cache(reset_mask)
+
+    def get_cache_state(self):
+        if self._state is None:
+            return None
+        return {"state": self._state.detach().clone(), "sfa": self.cpc_sfa.get_cache_state()}
+
+    def set_cache_state(self, state):
+        if state is None:
+            self.clear_cache()
+            return
+        assert state["state"].ndim == 2 and state["state"].shape[1] == self.feat_dim
+        self._state = state["state"].detach().clone()
+        self.cpc_sfa.set_cache_state(state["sfa"])
+
+    def index_cache_state(self, state, batch_indices):
+        if state is None:
+            return None
+        return {"state": state["state"][batch_indices].detach().clone(),
+                "sfa": self.cpc_sfa.index_cache_state(state["sfa"], batch_indices)}
 
     def _rssm_step(self, x_t: torch.Tensor, h_prev: torch.Tensor) -> torch.Tensor:
-        # Pre-norm transition (LLaMA-style): normalize previous state before sublayer.
-        h_in = self.state_pre_norm(h_prev)
-        h_raw = self.rnn(x_t, h_in)
-        if self.transition == "residual":
-            h_t = h_prev + self.residual_scale * h_raw
-        else:
-            h_t = h_raw
-        return h_t
+        return self.rnn(x_t, h_prev)
 
     def _forward_core(
         self,
@@ -118,6 +127,11 @@ class RSSMDiscretePredictor(DiscreteLatentPredictorBase):
         batch_size, sequence_length = obs_embed.shape[:2]
         h_prev = obs_embed.new_zeros((batch_size, self.hidden_size))
         z_prev_flat = obs_embed.new_zeros((batch_size, self.stoch_flat))
+        if episode_start is not None:
+            self.reset_cache(episode_start)
+            if self._state is not None:
+                assert self._state.shape == (batch_size, self.feat_dim)
+                h_prev, z_prev_flat = self._state.split([self.hidden_size, self.stoch_flat], dim=-1)
         h_init = h_prev
         z_init_flat = z_prev_flat
 
@@ -181,30 +195,22 @@ class RSSMDiscretePredictor(DiscreteLatentPredictorBase):
             if feat_roll_steps:
                 feat_roll = torch.stack(feat_roll_steps, dim=1)
                 prior_roll_sensor_pred = self._decode_sensor_from_feat(feat_roll)
-        aux_inputs = None
+        aux_inputs = self.compute_cpc_aux(feat_prior, z_post, actions, obs_embed, episode_start)
+        aux_inputs["prior_sensor_pred"] = prior_sensor_pred
         if need_aux:
-            aux_inputs = {
+            aux_inputs.update({
                 "prior_logits": prior_logits,
                 "post_logits": post_logits,
                 "feat": feat,
                 "sensor_target": obs_features,
-                "loc_target": obs["loc"],
-                "head_target": obs["heading"],
-                "prior_sensor_pred": prior_sensor_pred,
                 "prior_roll_sensor_pred": prior_roll_sensor_pred,
                 "z_only_pred": z_only_pred,
                 "h_only_pred": h_only_pred,
-            }
-            # Twister-style action-conditioned contrastive predictors for horizons 1..K.
-            pred_steps, scale_steps = self._project_contrastive_pred_steps(
-                feat_prior,
-                actions,
-            )
-            aux_inputs["contrastive_pred_emb_steps"] = pred_steps
-            aux_inputs["contrastive_pred_scale_steps"] = scale_steps
-            aux_inputs["contrastive_tgt_emb"] = self._project_contrastive_target_z(z_post)
+            })
         state_seq = feat
         last_state = torch.cat([h_prev, z_prev_flat], dim=-1)
+        if episode_start is not None:
+            self._state = last_state.detach()
         return outputs, aux_inputs, state_seq, last_state
 
     def forward(
@@ -222,7 +228,7 @@ class RSSMDiscretePredictor(DiscreteLatentPredictorBase):
         )
         return {
             "preds": outputs,
-            "aux": aux_inputs if need_aux else None,
+            "aux": aux_inputs,
             "state": last_state,
             "state_last": last_state,
             "state_seq": state_seq,

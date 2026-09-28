@@ -230,8 +230,6 @@ def main():
         f"batch_size={args.batch_size} epochs={args.epochs} attention_window={args.attention_window} "
         f"context_len={args.context_len} probe_hidden_dim={args.probe_hidden_dim} probe_layers={args.probe_layers} "
         f"rnn_state_norm={args.rnn_state_norm} "
-        f"rssm_transition={args.rssm_transition} rssm_residual_scale={args.rssm_residual_scale} "
-        f"rssm_state_norm={args.rssm_state_norm} "
         f"contrastive_w={args.contrastive_weight} contrastive_dim={args.contrastive_dim} "
         f"contrastive_temp={args.contrastive_temp} contrastive_steps={args.contrastive_steps} "
         f"contrastive_discount={args.contrastive_horizon_discount} "
@@ -397,9 +395,6 @@ def main():
                 "probe_hidden_dim": args.probe_hidden_dim,
                 "probe_layers": args.probe_layers,
                 "rnn_state_norm": args.rnn_state_norm,
-                "rssm_transition": args.rssm_transition,
-                "rssm_residual_scale": args.rssm_residual_scale,
-                "rssm_state_norm": args.rssm_state_norm,
                 "contrastive_weight": args.contrastive_weight,
                 "contrastive_uncertainty_weight": args.contrastive_uncertainty_weight,
                 "contrastive_dim": args.contrastive_dim,

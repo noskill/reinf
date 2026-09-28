@@ -919,8 +919,7 @@ class BaseWMOnPolicy:
         was_training = wm_model.training
         wm_model.eval()
         with torch.no_grad():
-            forward_out = wm_model(obs)
-            pred_sensor = forward_out["preds"][0]
+            pred_sensor = wm_model.predict_next_sensor(obs, targets["y_sensor"])
             sensor_error = self._compute_step_sensor_error_from_preds(
                 wm_model,
                 pred_sensor=pred_sensor,
@@ -999,8 +998,8 @@ class BaseWMOnPolicy:
         sensor_episodes = []
         action_episodes = []
         next_sensor_episodes = []
-        next_location_episodes = []
-        next_heading_episodes = []
+        location_episodes = []
+        heading_episodes = []
         turn_episodes = []
         step_episodes = []
         for episode in valid_episodes:
@@ -1019,12 +1018,12 @@ class BaseWMOnPolicy:
             next_sensor_episodes.append(tree_stack([
                 episode[step + 1][0]["sensor"] for step in range(length)
             ]))
-            next_location_episodes.append(torch.stack([
-                torch.as_tensor(episode[step + 1][0]["location"], dtype=torch.long)
+            location_episodes.append(torch.stack([
+                torch.as_tensor(episode[step][0]["location"], dtype=torch.long)
                 for step in range(length)
             ]).clamp_(0, self.maze_dim - 1))
-            next_heading_episodes.append(torch.stack([
-                torch.as_tensor(episode[step + 1][0]["heading_idx"], dtype=torch.long)
+            heading_episodes.append(torch.stack([
+                torch.as_tensor(episode[step][0]["heading_idx"], dtype=torch.long)
                 for step in range(length)
             ]))
             turn_episodes.append(turns)
@@ -1034,8 +1033,8 @@ class BaseWMOnPolicy:
             "sensor": sensor_episodes,
             "actions": action_episodes,
             "y_sensor": next_sensor_episodes,
-            "y_loc_xy": next_location_episodes,
-            "y_head": next_heading_episodes,
+            "y_loc_xy": location_episodes,
+            "y_head": heading_episodes,
             "y_turn": turn_episodes,
             "y_step": step_episodes,
         }).to(self.device)
@@ -1193,23 +1192,10 @@ class JointWMReinforce(BaseWMOnPolicy, Reinforce):
 
 class JointWMPPO(BaseWMOnPolicy):
     """PPO agent with joint AC-CPC world-model updates."""
-    def __init__(self, policy,
-                 value,
-                 sampler,
-                 policy_lr=0.0001,
-                 value_lr=0.001, num_envs=8,
-                 discount=0.999,
-                 device=torch.device('cpu'),
-                 logger=None,
-                 num_learning_epochs=4,
-                 entropy_coef=0.005,
-                 clip_param=None,
-                 exp_adv=None,
-                 target_entropy=2,
-                 **kwargs):
-
-        BaseWMOnPolicy.__init__(self, device=device, logger=logger, **kwargs)
+    def __init__(self, agent: PPO, logger=None, **kwargs):
+        self.agent = agent
         self.agents = [self.agent]
+        BaseWMOnPolicy.__init__(self, device=agent.device, logger=logger, **kwargs)
 
     @property
     def device(self):

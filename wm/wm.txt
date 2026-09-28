@@ -1,83 +1,223 @@
 WORLD MODELS
 World models are models that infer world state from observations and predict how this state evolves given actions. This allows to train policy in virtual episodes.
-Here we describe to prominent models Dreamer v3 and TWISTER and their components.
+Here we describe two prominent models, DreamerV3 and TWISTER, and their components.
 
-https://arxiv.org/pdf/1807.03748
+https://arxiv.org/pdf/2301.04104
 https://arxiv.org/pdf/2503.04416
 
 Key components of DREAMER/TWISTER
 
-ht =Fϕ(ht-1, zt-1, at−1)  - context encoder e.g. RNN or transformer.
-zt ∼ qϕ(zt | ot)  - observation encoder, models distribution of z_t given only current observation ot e.g. VAE encoder in dreamer v3 its zt ∼ qϕ(* | ot, ht) .
-zt ∼ dϕ(zt | ht) - dynamics predictor: models distribution of world state given context. Virtually this predicts how world changes given previous state and action at-1which encoded in ht
-st = {ht, zt} - concatenation of context and world state.
-ot ∼ pϕ(ot | zt)  - observation decoder, models distribution for observations e.g. VAE decoder, in dreamer it’s ot ∼ pϕ(ot | st).
-         et= u (zt)- model that projects world states to embedding space.
+ht = Fϕ(ht-1, zt-1, at−1) - context encoder, e.g. RNN or transformer.
+zt ∼ qϕ(zt | ot) - TWISTER observation encoder, models the posterior distribution of zt from the current observation. In DreamerV3 it is zt ∼ qϕ(zt | ot, ht).
+For AC-CPC, TWISTER additionally computes z't ∼ qϕ(zt | augment(ot)) from an augmented view of the observation.
+hat zt ∼ dϕ(zt | ht) - dynamics prior: predicts the distribution of the stochastic world state from the context, which already encodes previous states and actions.
+st = {ht, zt} - posterior model state used by the policy, reward and continuation heads. The TWISTER CPC implementation instead uses the prior feature {ht, hat zt} as its predictor input.
+ot ∼ pϕ(ot | zt) - TWISTER observation decoder. In DreamerV3 the decoder is ot ∼ pϕ(ot | st).
+         ekt = uk(z't) - projection of the augmented posterior state into the embedding space by the CPC head for horizon k.
 
-et:t+k = wϕ (st, at:t+k) - predicted embeddings given state and actions
-         rt ∼ rϕ(rt | st) - predicted reward for current transition
+hat ekt = wk({ht, hat zt}, at:t+k-1) - predicted future embedding from the prior feature and the action sequence; for k=0 there are no explicitly concatenated future actions.
+         rt ∼ rϕ(rt | st) - predicted reward for the current transition
 ct ∼ cϕ(ct | st) - predicted episode continuation/termination
 
 losses:
-zt~dϕ is learnt with KL divergence with zt produced by observation encoder.
-qϕ and pϕ are trained with whatever encoder-decoder loss is suitable e.g. ELBO loss.
-wϕ is trained with constructive loss with projection u(zt) of observed zt to predicted  et:t+k
+The prior hat zt ∼ dϕ and posterior zt ∼ qϕ are aligned with KL divergence. DreamerV3 and TWISTER use balanced prior/posterior KL terms with stop-gradient on the opposite branch.
+qϕ and pϕ are trained with observation reconstruction negative log-likelihood together with the KL terms.
+wk and uk are trained with contrastive InfoNCE loss between predicted embeddings hat ekt and projected augmented targets ek(t+k) = uk(z't+k).
 
 It is also possible to learn other useful signals such as rewards and episode termination.
 
 Action Conditioned (AC-CPC)
-This is TWISTER component that is responsible for et= u (zt)training.
+This is a TWISTER component that jointly trains the predictor wk, target projection uk, augmented observation encoder and TSSM/prior representation.
 This is an architecture that allows compressing high-dimensional observations into useful representations.
 
 
 RSSM stands for Recurrent State-Space Model. This is a part of dreamer that constitutes the world model. In TWISTER it is TSSM - transformer instead of recurrent model.
 There are two key differences:
-Dreamer updates distribution zt ∼ dϕ(* | ht) to match different encoder: zt ∼ qϕ(* | ot, ht).
-This is very similar to recursive Bayesian estimation or Bayesian filtering, very similar to the inference in the hidden-markov model. Unlike TWISTER which uses zt ∼ qϕ(* | ot)
-AC-CPC/TWISTER contrastive loss for embeddings additionally to reconstructive loss in Dreamer.
+DreamerV3 aligns the prior hat zt ∼ dϕ(zt | ht) with the posterior zt ∼ qϕ(zt | ot, ht), while TWISTER uses an observation-only posterior zt ∼ qϕ(zt | ot).
+This is similar to recursive Bayesian estimation or Bayesian filtering and to inference in a hidden Markov model.
+TWISTER adds the AC-CPC contrastive objective to its reconstruction, KL, reward and continuation losses.
 
-Another minor difference decoder in dreamer is ot ∼ pϕ(ot | st)
+Another minor difference is that the decoder in DreamerV3 is ot ∼ pϕ(ot | st).
 
-Having said that it helps to concatenate many observations ot or use dreamer style encoder  qϕ(zt | ot, ht) for AC-CPC.
-Both methods are reported to work best with discrete distribution of world states  zt.  though can be used with different distributions.
+As an alternative design, one can concatenate multiple observations or use a Dreamer-style posterior qϕ(zt | ot, ht) for AC-CPC, but this is not how the released TWISTER implementation works.
+Both implementations use discrete categorical stochastic states zt, although related world models can use other latent distributions.
+
+##############################
+##
+## Dreamer-style world model state update
+##
+##############################
 
 
-
-
-
-// world models
 h0=0, posterior z0 = qϕ(h0, o0)
 s0 = [ h0, z0] -> a0
 h1=Fϕ(z0, h0, a0), prior hat z1 = dϕ(h1)
 posterior z1 = qϕ(h1, O1)
-s1 = [h1, z1] -> a0
+s1 = [h1, z1] -> a1
 h2=Fϕ(z1, h1, a1)
 
-conceptually:
-z0 = q(h0, o0) -> h1 = F(h0, z0, a0)  -> predict a1 from o0, a0, o1
+conceptually information flow:
+z0 = q(h0, o0) -> h1 = F(h0, z0, a0) -> z1 = q(h1, o1) -> predict a1 from s1
 s0 -> a0,
 s1 -> a1
-and for ac-cpc starting from h1:
-e10 = wϕ(h1, hat z1) - conditioned by a0 via h1
-e12 = wϕ(h1, hat z1, a1)
-e13 = wϕ(h1, hat z1, a1, a2)
-with positives e10 <-> z1, e12 <-> z2, e13 <-> z3… with projection z -> e
-in twister cpc target z is computed from augmented series of observations ot-k..ok
+and for the released TWISTER AC-CPC implementation starting from the prior state at t=1:
+hat e10 = w0(h1, hat z1) - conditioned by a0 through h1 and hat z1
+hat e12 = w1(h1, hat z1, a1)
+hat e13 = w2(h1, hat z1, a1, a2)
+with positives hat e10 <-> u0(z'1), hat e12 <-> u1(z'2), hat e13 <-> u2(z'3), where z'k is encoded from an augmented observation o'k
+in TWISTER the CPC target sequence z't:t+K is computed from augmented observations o't:t+K; each z'k = qϕ(z | augment(ok)) is encoded independently, not from the whole observation window
+
+##############################
+## simplified baselines:
+##############################
 
 
-baselines:
-h0 = Fϕ(h-1,a-1, o0)
-h0 -> a0
-h0, a0 -> predict o1
-h1 = Fϕ(h0, a0, o1)
+olat_t = enc(ot)
+h0 = Fϕ(h-1, a-1, olat_t)  # backbone, rnn or transformer
+h0 -> a0  # policy
+h0, a0 -> hat o1 # distribution
+h1 = Fϕ(h0, a0, enc(o1))
 
-e10 = wϕ(h1) - conditioned by a0 via h1
-e12 = wϕ(h1, a1)
-e13 = wϕ(h1, a1, a2)
-with positives e13 <-> e30, e12 <-> e20... with backprop enabled in both branches
+sensor prediction is trained with cross-entropy
+sensor_CE = CE(hat ot+1, ot+1)
+
+
+cpc:
+e10 = wϕ(h1) - conditioned by a0 via h1         # deterministic
+e12 = predict wϕ(h1, a1)                        # distribution
+e13 = predict wϕ(h1, a1, a2)                    # distribution
+trained with InfoNCE and NLL.
+InfoNCE with positives e13 <-> e30, e12 <-> e20... with backprop enabled in both branches
+cpc_nll = NLL(detach(eij), predicted e_ij)  - negative log-likelihood of deterministic cpc vs predicted
+ decoder_cpc_loss =  0.5 * CE(dec(sensor_latent_head(detach(e_t0))), o_t)           - decode observation from cpc, both anchor and prediction
+                   + 0.5 * CE(dec(sensor_latent_head(detach(mu_t,t+1))), o_t+1)
+
+
 additionally:
-e_k0 -> ok - sensor embedding reconstruction
-sfa(e_k, e_k+1) - with downscaled backprop
+computed from deterministic cpc
+hat olat_k = sensor_latent_head(e_k0) #  sensor embedding reconstruction, deterministic, computed from anchor cpc only
+Trained with 
+sensor_cpc_loss = MSE(hat olat_k, detach(sensor_latent_k)) # backprop enabled through sensor_latent_head, cpc to ht
+
+sfa_t = SFA_network(scale_upstream_grad(e_t0, 0.05), sfa_t-1) # recurrent encoder
+SFA_loss = sfa(sfa_t, sfa_t-1) - with downscaled backprop to cpc features.
+state_stability_loss = stability(detach(h_t), h_new_t) - distance minimised between old and ofter optimiser step
 
 
+WM loss =  
+    + sensor_weight * sensor_CE
+    + contrastive_weight * (InfoNCE + uncertainty_weight * cpc_nll)
+    + SFA_loss
+    + 0.1 * sensor_cpc_loss                                         
+    + wm_stability_coef * state_stability_loss
+    + sensor_weight * decoder_cpc_loss
+    + probes
+
+    
 policy(h) -> a trained with sensor surprise + learning progress + embedding divergence from nearest embedding in other episodes
+
+reward =
+    sensor_lp_coef * max(error_before - error_after, 0)
+    + divergence_coef * nearest_other_episode_embedding_distance
+    + 0.02 * error_before
+
+error is sensor prediction cross-entropy
+
+##############################
+##
+## TWISTER losses:
+##
+##############################
+
+observation reconstruction:
+hat ot = decoder(zt)
+observation_loss = -log pϕ(ot | zt)
+# MSEDist: equivalent to pixel reconstruction MSE with fixed variance
+# gradients: decoder -> posterior zt -> observation encoder
+
+prior/posterior alignment:
+prior = dϕ(hat zt | ht)
+posterior = qϕ(zt | ot)
+
+kl_prior = max(
+    free_nats,
+    KL(detach(posterior) || prior)) # trains dynamics prior/TSSM to predict the posterior
+
+kl_post = max(
+    free_nats,
+    KL(posterior || detach(prior))) # trains observation encoder toward the dynamics prior
+
+free_nats = 1.0
+AC-CPC:
+for horizon k = 0..K-1:
+    x_tk = wk([ht, hat zt, at:t+k-1])
+    y_tk = uk(z't+k)
+    z't+k = qϕ(z | augment(ot+k))
+
+    cpc_k = InfoNCE(x_tk, y_tk)
+    
+    
+hat olat_k = sensor_latent_head(e_k0) #  sensor embedding reconstruction, deterministic, computed from anchor cpc only
+MSE(G(detach(anchor_CPC_t)), detach(enc(o_t)))
+
+
+TWISTER world-model loss =
+    1.0 * observation_loss
+    + 1.0 * reward_loss
+    + 1.0 * continue_loss
+    + 0.5 * kl_prior
+    + 0.1 * kl_post
+    + 1.0 * sum_k(cpc_weight_k * cpc_k)
+
+
+
+ 
+##############################
+##
+## new losses:
+##
+##############################
+
+olat_t = enc(o_t)
+
+ht=Fϕ(zt-1, ht-1, at-1)
+
+prior:
+p_t = p(hat z_t | h_t)
+
+posterior:
+q_t = q(z_t | detach(h_t), o_t)
+
+CPC target:                                                                                                                 
+y_t = u(detach(z_t))   
+
+CPC prediction:                                                                                                             
+mu_tk, sigma_tk = w_k([h_t, hat_z_t, a_t, ..., a_t+k-1])   
+
+cpc_loss = InfoNCE(x_tk, y_t+k)
+NLL = -log Normal(detach(y_t+k); mu_tk, sigma_tk² I)
+
+observation_loss = CE(decoder([h_t, z_t]), o_t) # posterior reconstruction with decoder
+sensor_cpc_loss = MSE(sensor_latent_head(detach(y_t)), detach(olat_t))  # recover sensor embedding from anchor ac-cpc embedding
+
+
+sfa_t = SFA_network(scale_upstream_grad(e_t0, 0.05), sfa_t-1) # recurrent encoder
+SFA_loss = sfa(sfa_t, sfa_t-1) - with downscaled backprop to cpc features.
+
+state_t = [h_t, z_t]
+stability_loss = MSE(state_new_t, detach(state_old_t)) - state distance minimise between old and ofter optimiser step
+
+
+# trained as probe
+decoder_cpc_loss = 0.5 * CE(cpc_sensor_probe_decoder(sensor_latent_head(detach(y_t))), o_t)
+  + 0.5 * CE(cpc_sensor_probe_decoder(sensor_latent_head(detach(mu_t1))), o_t+1)           
+
+WM loss =
+    + KL(detach(q_t) || p_t) # with free nats
+    + KL(q_t || detach(p_t)) # with free nats
+    + cpc_loss + NLL
+    + observation_loss
+    + sensor_cpc_loss
+    + SFA_loss
+    + stability_loss
+    + probes
