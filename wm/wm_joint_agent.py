@@ -300,9 +300,7 @@ class BaseWMOnPolicy:
             state_seq=embs,
             key_padding_mask=obs_new["key_padding_mask"],
         )
-        novelty_signal = 0.5 * (divergence_novelty + episode_novelty)
-        self._log_novelty_vs_distance_from_start(
-            novelty_signal=novelty_signal,
+        self._log_distance_from_start(
             wm_episodes=wm_new_episodes,
             key_padding_mask=obs_new["key_padding_mask"],
         )
@@ -397,18 +395,12 @@ class BaseWMOnPolicy:
         episode_batch = self._prepare_episode_batch(policy_episodes)
         self.train_policy_batch_joint(episode_batch)
 
-        advantages, _, _ = episode_batch.pad(fields=['advantages_gae', 'advantages_mc'])
+        advantages, _, _ = episode_batch.pad(fields=['advantages_gae'])
         advantages_gae = advantages['advantages_gae']
         self._log_intrinsic_vs_episode_coverage(
             intrinsic_rewards=advantages_gae,
             wm_episodes=wm_new_episodes,
             log_name='advantages_gae'
-        )
-        advantages_mc = advantages['advantages_mc']
-        self._log_intrinsic_vs_episode_coverage(
-            intrinsic_rewards=advantages_mc,
-            wm_episodes=wm_new_episodes,
-            log_name='advantages_mc'
         )
 
         self.print_episode_stats(self.get_completed_episodes())
@@ -509,16 +501,9 @@ class BaseWMOnPolicy:
         # reward = reward_progress
         intrinsic_rewards = self.intrinsic_reward_scale * reward
 
-        self.logger.log_scalar("reward/lp_mean", lp_rewards_new.detach().mean().cpu().item())
-        self.logger.log_scalar("reward/surprise_mean", cpc_error_before.detach().mean().cpu().item() * 0.001)
         self.logger.log_scalar("reward/sensor_lp_mean", self._masked_mean(sensor_lp_rewards_new, valid))
         self.logger.log_scalar("reward/sensor_lp_pos_mean", self._masked_mean(sensor_lp_rewards_pos, valid))
         self.logger.log_scalar("reward/sensor_surprise_mean", self._masked_mean(sensor_error_before, valid))
-        self.logger.log_scalar("reward/novelty_signal_mean", self._masked_mean(novelty_signal, valid))
-        self._log_first_last_window_means(
-            values=intrinsic_rewards,
-            valid_mask=valid,
-            metric_prefix="reward/intrinsic")
         return intrinsic_rewards
 
     def _apply_intrinsic_rewards_to_episodes(
@@ -614,21 +599,19 @@ class BaseWMOnPolicy:
                 corr = torch.tensor(0.0, dtype=torch.float32, device=self.device)
         else:
             corr = torch.tensor(0.0, dtype=torch.float32, device=self.device)
-        self.logger.log_scalar(f"reward/{log_name}_episode_sum_mean", rewards_t.mean().item())
         self.logger.log_scalar("episode/location_coverage_mean", coverage_t.mean().item())
         self.logger.log_scalar(f"reward/{log_name}_vs_episode_coverage_corr", corr.item())
 
-    def _log_novelty_vs_distance_from_start(
+    def _log_distance_from_start(
         self,
         *,
-        novelty_signal: torch.Tensor,
         wm_episodes,
         key_padding_mask: torch.Tensor,
     ) -> None:
-        max_rows = min(len(wm_episodes), int(novelty_signal.shape[0]))
+        max_rows = min(len(wm_episodes), int(key_padding_mask.shape[0]))
         if max_rows <= 0:
             return
-        max_len = int(novelty_signal.shape[1])
+        max_len = int(key_padding_mask.shape[1])
         distance = torch.zeros((max_rows, max_len), dtype=torch.float32, device=self.device)
         valid = torch.zeros((max_rows, max_len), dtype=torch.bool, device=self.device)
         for ep_idx in range(max_rows):
@@ -660,47 +643,13 @@ class BaseWMOnPolicy:
         if not valid.any():
             return
 
-        novelty_valid = novelty_signal[:max_rows, :max_len][valid].to(torch.float32)
         distance_valid = distance[valid].to(torch.float32)
-        if novelty_valid.numel() >= 2:
-            novelty_centered = novelty_valid - novelty_valid.mean()
-            distance_centered = distance_valid - distance_valid.mean()
-            denom_step = novelty_centered.norm() * distance_centered.norm()
-            if denom_step > 0:
-                step_corr = (novelty_centered * distance_centered).sum() / denom_step
-            else:
-                step_corr = torch.tensor(0.0, dtype=torch.float32, device=self.device)
-        else:
-            step_corr = torch.tensor(0.0, dtype=torch.float32, device=self.device)
-        self.logger.log_scalar("reward/novelty_vs_distance_from_start_step_corr", step_corr.item())
         self.logger.log_scalar("episode/distance_from_start_mean", distance_valid.mean().item())
         self._log_first_last_window_means(
             values=distance,
             valid_mask=valid,
             metric_prefix="episode/distance_from_start",
         )
-
-        novelty_episode_means = []
-        distance_episode_means = []
-        for ep_idx in range(max_rows):
-            episode_valid = valid[ep_idx]
-            if not episode_valid.any():
-                continue
-            novelty_episode_means.append(novelty_signal[ep_idx][episode_valid].mean())
-            distance_episode_means.append(distance[ep_idx][episode_valid].mean())
-        if len(novelty_episode_means) >= 2:
-            novelty_episode = torch.stack(novelty_episode_means).to(torch.float32)
-            distance_episode = torch.stack(distance_episode_means).to(torch.float32)
-            novelty_episode = novelty_episode - novelty_episode.mean()
-            distance_episode = distance_episode - distance_episode.mean()
-            denom_episode = novelty_episode.norm() * distance_episode.norm()
-            if denom_episode > 0:
-                episode_corr = (novelty_episode * distance_episode).sum() / denom_episode
-            else:
-                episode_corr = torch.tensor(0.0, dtype=torch.float32, device=self.device)
-        else:
-            episode_corr = torch.tensor(0.0, dtype=torch.float32, device=self.device)
-        self.logger.log_scalar("reward/novelty_vs_distance_from_start_episode_corr", episode_corr.item())
 
     def _log_update_stats(
         self,
@@ -714,12 +663,19 @@ class BaseWMOnPolicy:
     ) -> None:
         for key, value in scalar_sums.items():
             self.logger.log_scalar(key, value / updates)
-        for key in sorted(wm_loss_sums.keys()):
-            self.logger.log_scalar(f"wm/loss/{key}", wm_loss_sums[key] / updates)
-        for key in sorted(wm_metric_sums.keys()):
-            self.logger.log_scalar(f"wm/metric/{key}", wm_metric_sums[key] / updates)
+        losses = ("sensor", "kl_dyn", "kl_rep", "contrastive", "contrastive_nll",
+                  "sensor_cpc", "sensor_cpc_probe")
+        metrics = ("lr_acc", "cpc_next_lr_acc", "contrastive_acc", "contrastive_scale",
+                   "contrastive_uncertainty_error_corr", "cpc_delta_mean", "state_drift")
+        for key in losses:
+            if key in wm_loss_sums:
+                self.logger.log_scalar(f"wm/loss/{key}", wm_loss_sums[key] / updates)
+        for key in metrics:
+            if key in wm_metric_sums:
+                self.logger.log_scalar(f"wm/metric/{key}", wm_metric_sums[key] / updates)
         for key, value in extra_scalars.items():
-            self.logger.log_scalar(key, value)
+            if not key.startswith("wm/"):
+                self.logger.log_scalar(key, value)
         if info is not None:
             per_env = info.get("per_env", None)
             if per_env:
@@ -808,26 +764,9 @@ class BaseWMOnPolicy:
             # novelty_valid = self._divergence_running_norm(novelty_raw[valid].reshape(-1, 1)).reshape(-1)
             novelty_valid = novelty_raw[valid]
             novelty[valid] = novelty_valid.to(novelty.dtype)
-            divergence_raw_valid = novelty_raw[valid].to(torch.float32)
-            self.logger.log_scalar("reward/divergence_raw_batch_std", divergence_raw_valid.std(unbiased=False).item())
-            self.logger.log_scalar("reward/divergence_raw_batch_p50", torch.quantile(divergence_raw_valid, 0.50).item())
-            self.logger.log_scalar("reward/divergence_raw_batch_p90", torch.quantile(divergence_raw_valid, 0.90).item())
-            self.logger.log_scalar("reward/divergence_raw_batch_p99", torch.quantile(divergence_raw_valid, 0.99).item())
 
         if self.logger is not None:
-            divergence_raw_mean = self._masked_mean(novelty_raw, valid)
-            self._log_first_last_window_means(
-                values=novelty_raw,
-                valid_mask=valid,
-                metric_prefix="reward/divergence_raw",
-            )
-            self.logger.log_scalar("reward/divergence_raw_mean", divergence_raw_mean)
             divergence_mean = self._masked_mean(novelty, valid)
-            self._log_first_last_window_means(
-                values=novelty,
-                valid_mask=valid,
-                metric_prefix="reward/divergence",
-            )
             self.logger.log_scalar("reward/divergence_mean", divergence_mean)
 
         return novelty
@@ -873,20 +812,6 @@ class BaseWMOnPolicy:
             novelty_valid = novelty_raw[valid_novelty]
             novelty[valid_novelty] = novelty_valid.to(novelty.dtype)
 
-        episode_novelty_raw_mean = self._masked_mean(novelty_raw, valid_novelty)
-        self._log_first_last_window_means(
-            values=novelty_raw,
-            valid_mask=valid_novelty,
-            metric_prefix="reward/episode_novelty_raw",
-        )
-        self.logger.log_scalar("reward/episode_novelty_raw_mean", episode_novelty_raw_mean)
-        episode_novelty_mean = self._masked_mean(novelty, valid_novelty)
-        self._log_first_last_window_means(
-            values=novelty,
-            valid_mask=valid_novelty,
-            metric_prefix="reward/episode_novelty",
-        )
-        self.logger.log_scalar("reward/episode_novelty_mean", episode_novelty_mean)
 
         return novelty
 
