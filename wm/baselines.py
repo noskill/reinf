@@ -275,22 +275,13 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         preds = (pred_sensor, loc_x, loc_y, heading, turn, step)
         return preds, aux_inputs
 
-    def forward(
-        self,
-        obs,
-        episode_start=None,
-    ):
-        preds, aux_inputs, state_seq, last_state = self._forward_core(
-            obs,
-            episode_start=episode_start,
-        )
-        return {
-            "preds": preds,
+    def forward(self, obs, episode_start=None):
+        preds, aux_inputs, state_seq, last_state = self._forward_core(obs, episode_start=episode_start)
+        return {"preds": preds,
             "aux": aux_inputs,
             "state": last_state,
             "state_last": last_state,
-            "state_seq": state_seq,
-        }
+            "state_seq": state_seq}
 
     def compute_aux(self, h, action_latent, reset_mask, sensor_latent):
         aux_inputs = {}
@@ -307,7 +298,7 @@ class TransformerBaseline(PredictionLossMixin, nn.Module):
         aux_inputs["cpc_sensor_latent_future_pred"] = self.cpc_sensor_latent_head(pred_steps[0].detach()) if pred_steps else None
 
         sfa = self.cpc_sfa(scale_upstream_grad(aux_inputs["contrastive_tgt_emb"], scale=self.sfa_cpc_grad_scale),
-                            reset_mask)
+                           reset_mask)
 
         if reset_mask is not None:
             assert reset_mask.numel() == sfa.shape[0]
