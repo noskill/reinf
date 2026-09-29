@@ -515,6 +515,13 @@ class PredictionLossMixin:
         metrics["contrastive_scale"] = uncertainty_stats["scale"]
         metrics["contrastive_entropy"] = uncertainty_stats["entropy"]
         metrics["contrastive_uncertainty_error_corr"] = uncertainty_stats["error_corr"]
+        embeddings = aux_inputs["contrastive_tgt_emb"].detach()
+        padding = targets["key_padding_mask"]
+        valid_pairs = ~padding[:, :-1] & ~padding[:, 1:]
+        if valid_pairs.any():
+            deltas = torch.linalg.vector_norm(embeddings[:, 1:] - embeddings[:, :-1], dim=-1)[valid_pairs]
+            metrics["cpc_delta_mean"] = deltas.mean()
+            metrics["cpc_delta_std"] = deltas.std(unbiased=False)
         return metrics
 
     def compute_predictions_metrics(
