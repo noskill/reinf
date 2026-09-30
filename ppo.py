@@ -100,6 +100,8 @@ class PPOBase(VPGBase):
 
     def train_policy_batch_joint(self, episode_batch: EpisodeBatch, num_minibatches: int = 4):
         """joint updates of value and policy"""
+        assert self.optimizer_policy is self.optimizer_value, \
+            "train_policy_batch_joint requires a shared policy/value optimizer; construct PPO with joint=True"
         padded, padding_mask, _ = episode_batch.pad(fields=self.pad_fields)
         padding_mask = padding_mask.to(self.device)
         states_padded = to_device(padded['states'], self.device)

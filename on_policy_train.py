@@ -143,7 +143,7 @@ class OnPolicyTrainer:
             info = None
             while True:
                 action = self.agent.get_action(obs, episode_start)
-                if action.ndim == 1:
+                if isinstance(action, torch.Tensor) and action.ndim == 1:
                     action = action.unsqueeze(1)
                 next_obs, reward, terminated, info = self.env.step(action)
                 if torch.isnan(reward).any():

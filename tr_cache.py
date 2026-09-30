@@ -1,14 +1,15 @@
 """
-Resettable, position-aware cache for transformer decoding in vectorized RL.
+Resettable, append-only cache for transformer decoding in vectorized RL.
 
 This module provides a drop-in replacement for Hugging Face style caches that:
 - Subclass the HF base types (Cache and CacheLayerMixin) for compatibility.
-- Support per-row cache_position indexing so each batch element can reset or
-  continue independently (common in multi-env RL).
+- Support explicit per-row resets so each batch element can reset or continue
+  independently (common in multi-env RL).
 
 It is designed to be used with attention modules that call:
     past_key_value.update(key_states, value_states, layer_idx, cache_kwargs)
-where cache_kwargs may contain {"cache_position": LongTensor[B] or [B, 1]}.
+cache_kwargs is accepted for API compatibility but does not control KV writes.
+Absolute positions are handled by the attention module, not by this cache.
 
 Notes
 - We keep per-layer, per-row histories internally and materialize a padded
@@ -34,13 +35,6 @@ except Exception:  # pragma: no cover - fallback typing if transformers is unava
         pass
 
 
-def _to_scalar_long(x: torch.Tensor) -> int:
-    """Convert a 0D/1D tensor to a Python int safely."""
-    if x.numel() == 0:
-        return 0
-    return int(x.reshape(-1)[0].item())
-
-
 def _right_pad_time(t: torch.Tensor, target_len: int) -> torch.Tensor:
     """Pad a per-row KV tensor [H, T, D] with zeros on the time dim to target_len."""
     H, T, D = t.shape
@@ -53,18 +47,20 @@ def _right_pad_time(t: torch.Tensor, target_len: int) -> torch.Tensor:
 
 
 class LayerCache(CacheLayerMixin):
-    """Per-layer cache that supports per-row positions and selective resets.
+    """Per-layer append-only cache with selective resets.
 
     Internally stores a list of row tensors for keys/values with shape [H, T, D].
-    On update, the provided cache_position[b] indicates where the new tokens
-    should be written; rows can be truncated (reset) or appended independently.
+    Updates append new tokens; reset_rows explicitly clears selected histories.
+    A sliding window only removes the oldest tokens.
     """
 
-    def __init__(self, detach_on_pop: bool = False) -> None:
+    def __init__(self, detach_every: int = 0) -> None:
         super().__init__()
+        assert detach_every >= 0
         self._k_rows: List[Optional[torch.Tensor]] = []
         self._v_rows: List[Optional[torch.Tensor]] = []
-        self.detach_on_pop = bool(detach_on_pop)
+        self.detach_every = detach_every
+        self._steps_since_detach: List[int] = []
 
     def __len__(self) -> int:
         return max(len(self._k_rows), len(self._v_rows))
@@ -78,9 +74,10 @@ class LayerCache(CacheLayerMixin):
         return row.detach()
 
     def clone(self):
-        result = LayerCache(detach_on_pop=self.detach_on_pop)
+        result = LayerCache(detach_every=self.detach_every)
         result._k_rows = [self._share_row(row) for row in self._k_rows]
         result._v_rows = [self._share_row(row) for row in self._v_rows]
+        result._steps_since_detach = self._steps_since_detach.copy()
         return result
 
     def index_batch(self, batch_indices: torch.Tensor):
@@ -95,9 +92,10 @@ class LayerCache(CacheLayerMixin):
         if indices and (min(indices) < 0 or max(indices) >= len(self._k_rows)):
             raise IndexError(f"batch index outside cache size {len(self._k_rows)}")
 
-        result = LayerCache(detach_on_pop=self.detach_on_pop)
+        result = LayerCache(detach_every=self.detach_every)
         result._k_rows = [self._share_row(self._k_rows[index]) for index in indices]
         result._v_rows = [self._share_row(self._v_rows[index]) for index in indices]
+        result._steps_since_detach = [self._steps_since_detach[index] for index in indices]
         return result
 
     def _ensure_rows(self, batch: int) -> None:
@@ -105,6 +103,8 @@ class LayerCache(CacheLayerMixin):
             self._k_rows.extend([None] * (batch - len(self._k_rows)))
         if len(self._v_rows) < batch:
             self._v_rows.extend([None] * (batch - len(self._v_rows)))
+        if len(self._steps_since_detach) < batch:
+            self._steps_since_detach.extend([0] * (batch - len(self._steps_since_detach)))
 
     def reset_rows(self, reset_mask: torch.Tensor) -> None:
         """Reset selected rows (set to None so next write starts fresh).
@@ -120,6 +120,7 @@ class LayerCache(CacheLayerMixin):
             if flag:
                 self._k_rows[i] = None
                 self._v_rows[i] = None
+                self._steps_since_detach[i] = 0
 
     def to(self, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None):
         for i in range(len(self)):
@@ -133,60 +134,41 @@ class LayerCache(CacheLayerMixin):
         self,
         key_states: torch.Tensor,   # [B, H, T_new, D]
         value_states: torch.Tensor, # [B, H, T_new, D]
-        cache_position: Optional[torch.Tensor] = None,
         window_size: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Update per-row cache using provided positions and return padded batch K,V.
+        """Append new K/V to each row, then keep the newest window_size tokens.
 
-        For each batch row b, new tokens are placed starting at cache_position[b]. If
-        that position is 0 or the row is empty, the row is replaced. If it is smaller
-        than the current row length, the row is truncated first, then the new tokens
-        are appended. If it is larger, the row is right-padded with zeros up to that
-        position before appending.
+        Histories are cleared only by reset_rows. Returned rows are padded to
+        a common batch length, with padding identified by the attention mask.
         """
         assert key_states.dim() == 4 and value_states.dim() == 4, "Expected [B, H, T, D] tensors"
         B, H, T_new, D = key_states.shape
+        assert self.detach_every == 0 or T_new == 1, "Periodic KV detach requires one-step cache updates"
         self._ensure_rows(B)
-
-        # Normalize cache_position to [B]
-        if cache_position is None:
-            # Default to append at current length
-            positions = torch.zeros(B, dtype=torch.long, device=key_states.device)
-            for b in range(B):
-                cur = self._k_rows[b]
-                positions[b] = 0 if cur is None else cur.shape[1]
-        else:
-            pos = cache_position
-            if pos.dim() > 1:
-                pos = pos.view(pos.shape[0])
-            positions = pos.to(torch.long)
 
         # Update rows independently
         max_len = 0
         for b in range(B):
-            p = _to_scalar_long(positions[b])
             k_new = key_states[b]
             v_new = value_states[b]
 
             k_prev = self._k_rows[b]
             v_prev = self._v_rows[b]
 
-            if k_prev is None or p <= 0:
+            if k_prev is None:
                 k_row = k_new
                 v_row = v_new
+                self._steps_since_detach[b] = 0
             else:
-                prev_len = k_prev.shape[1]
                 k_row = k_prev
                 v_row = v_prev
-                # Truncate or pad to position p
-                if p < prev_len:
-                    k_row = k_row[:, :p, :]
-                    v_row = v_row[:, :p, :]
-                elif p > prev_len:
-                    pad_k = k_prev.new_zeros((H, p - prev_len, D))
-                    pad_v = v_prev.new_zeros((H, p - prev_len, D))
-                    k_row = torch.cat([k_row, pad_k], dim=1)
-                    v_row = torch.cat([v_row, pad_v], dim=1)
+                if self.detach_every > 0 and self._steps_since_detach[b] == self.detach_every:
+                    # Cut history before the next block, leaving new K/V differentiable.
+                    # This limits BPTT, not total activation memory when all losses
+                    # are retained for one backward at the end of the sequence.
+                    k_row = k_row.detach()
+                    v_row = v_row.detach()
+                    self._steps_since_detach[b] = 0
                 # Append new tokens
                 k_row = torch.cat([k_row, k_new], dim=1)
                 v_row = torch.cat([v_row, v_new], dim=1)
@@ -194,12 +176,9 @@ class LayerCache(CacheLayerMixin):
             if window_size is not None and window_size > 0 and k_row.shape[1] > window_size:
                 k_row = k_row[:, -window_size:, :]
                 v_row = v_row[:, -window_size:, :]
-                if self.detach_on_pop:
-                    # Optional truncated-BPTT behavior at window pop boundary.
-                    k_row = k_row.detach()
-                    v_row = v_row.detach()
             self._k_rows[b] = k_row
             self._v_rows[b] = v_row
+            self._steps_since_detach[b] += T_new
             max_len = max(max_len, k_row.shape[1])
 
         # Build padded batch tensors [B, H, T_max, D]
@@ -259,26 +238,27 @@ class LayerCache(CacheLayerMixin):
 
 
 class PositionBasedDynamicCache(Cache):
-    """A Cache that routes updates to per-layer LayerCache using cache_position.
+    """A Cache that appends updates to per-layer LayerCache instances.
 
     Exposes the HF-compatible `update(key, value, layer_idx, cache_kwargs)` API.
     Also provides `reset(mask)` to clear selected rows across all layers.
     """
 
-    def __init__(self, detach_on_pop: bool = False) -> None:
+    def __init__(self, detach_every: int = 0) -> None:
         super().__init__(layer_class_to_replicate=LayerCache)
+        assert detach_every >= 0
         self._layers: Dict[int, LayerCache] = {}
-        self.detach_on_pop = bool(detach_on_pop)
+        self.detach_every = detach_every
 
     def _get_layer(self, layer_idx: int) -> LayerCache:
         if layer_idx not in self._layers:
-            self._layers[layer_idx] = LayerCache(detach_on_pop=self.detach_on_pop)
+            self._layers[layer_idx] = LayerCache(detach_every=self.detach_every)
         return self._layers[layer_idx]
 
     def _new_empty_like(self):
         if hasattr(self, "window_size"):
-            return self.__class__(self.window_size, detach_on_pop=self.detach_on_pop)
-        return self.__class__(detach_on_pop=self.detach_on_pop)
+            return self.__class__(self.window_size, detach_every=self.detach_every)
+        return self.__class__(detach_every=self.detach_every)
 
     def clone(self):
         result = self._new_empty_like()
@@ -312,18 +292,15 @@ class PositionBasedDynamicCache(Cache):
         layer_idx: int,
         cache_kwargs: Optional[Dict] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        cache_position = None
-        if cache_kwargs is not None:
-            cache_position = cache_kwargs.get("cache_position", None)
         layer = self._get_layer(layer_idx)
-        return layer.update(key_states, value_states, cache_position=cache_position)
+        return layer.update(key_states, value_states)
 
 
 class WindowedPositionBasedDynamicCache(PositionBasedDynamicCache):
-    """Position-based cache with a fixed-size sliding window."""
+    """Append-only cache with a fixed-size sliding window."""
 
-    def __init__(self, window_size: int, detach_on_pop: bool = False) -> None:
-        super().__init__(detach_on_pop=detach_on_pop)
+    def __init__(self, window_size: int, detach_every: int = 0) -> None:
+        super().__init__(detach_every=detach_every)
         if window_size is None or window_size <= 0:
             raise ValueError("window_size must be a positive integer")
         self.window_size = int(window_size)
@@ -335,14 +312,10 @@ class WindowedPositionBasedDynamicCache(PositionBasedDynamicCache):
         layer_idx: int,
         cache_kwargs: Optional[Dict] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        cache_position = None
-        if cache_kwargs is not None:
-            cache_position = cache_kwargs.get("cache_position", None)
         layer = self._get_layer(layer_idx)
         return layer.update(
             key_states,
             value_states,
-            cache_position=cache_position,
             window_size=self.window_size,
         )
 

@@ -52,7 +52,7 @@ class RecurrentMLP(nn.Module, CacheModuleMixin):
         return torch.stack(outputs, dim=1)  # Shape: (batch_size, seq_len, output_dim)
 
     def reset_cache(self, reset_mask: torch.Tensor):
-        if reset_mask is None:
+        if reset_mask is None or self._prev is None:
             return
         self._prev[reset_mask] = 0.0
 

@@ -1,3 +1,6 @@
+from contextlib import contextmanager
+from typing import Optional
+
 import torch
 from transformer import LlamaConfig, LlamaModel, LlamaRMSNorm
 from recurrent_cache import CacheModuleMixin
@@ -56,11 +59,23 @@ class CachedTransformer(torch.nn.Module, CacheModuleMixin):
     def device(self):
         return next(next(self.backbone.modules()).parameters()).device
 
-    def init_cache(self, num_entries):
+    @contextmanager
+    def temporary_cache(self, num_entries, *, attention_window=None, detach_every=0):
+        """Use fresh KV history with optional periodic detach; restore live cache on exit."""
+        cache, position, window = self._cache, self._cache_position, self.attention_window
+        try:
+            if attention_window is not None:
+                self.attention_window = attention_window
+            self.init_cache(num_entries, detach_every=detach_every)
+            yield
+        finally:
+            self._cache, self._cache_position, self.attention_window = cache, position, window
+
+    def init_cache(self, num_entries, *, detach_every=0):
         if self.attention_window is not None and self.attention_window > 0:
-            self._cache = WindowedPositionBasedDynamicCache(self.attention_window)
+            self._cache = WindowedPositionBasedDynamicCache(self.attention_window, detach_every=detach_every)
         else:
-            self._cache = PositionBasedDynamicCache()
+            self._cache = PositionBasedDynamicCache(detach_every=detach_every)
         self._cache_position = torch.zeros(num_entries, dtype=torch.long, device=self.device)
 
     def forward(self, x, key_padding_mask, reset_mask):
@@ -86,4 +101,3 @@ class CachedTransformer(torch.nn.Module, CacheModuleMixin):
         
         
         
-
