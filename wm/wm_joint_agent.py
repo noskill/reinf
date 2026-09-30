@@ -15,7 +15,7 @@ from baselines import TransformerBaseline
 from pool import EpisodesOldPoolMixin
 from reinforce import Reinforce
 from ppo import PPO
-from utils import make_label_smoothing_table, make_soft_table
+from utils import make_label_smoothing_table
 from util import (
     EpisodeBatch,
     RunningNorm,
@@ -489,9 +489,10 @@ class BaseWMOnPolicy:
         # lp + divergence
         reward = (
             self.wm_sensor_lp_reward_coef * sensor_lp_rewards_pos
-            + self.wm_divergence_novelty_coef * divergence_novelty
             + 0.02 * sensor_error_before
         )
+        if self.wm_divergence_novelty_coef != 0:
+            reward = reward + self.wm_divergence_novelty_coef * divergence_novelty
 
         reward_next = reward[:, 1:]
         reward_curr = reward[:, :-1]
@@ -513,7 +514,7 @@ class BaseWMOnPolicy:
         intrinsic_rewards: torch.Tensor,
     ) -> None:
         for ep_idx, episode in enumerate(policy_episodes[: intrinsic_rewards.shape[0]]):
-            max_t = min(len(episode) - 1, intrinsic_rewards.shape[1])
+            max_t = min(len(episode), intrinsic_rewards.shape[1])
             for t in range(max_t):
                 transition = episode[t]
                 updated_reward = torch.as_tensor(transition[4], dtype=torch.float32, device=self.device) + intrinsic_rewards[ep_idx, t]
@@ -665,7 +666,7 @@ class BaseWMOnPolicy:
             self.logger.log_scalar(key, value / updates)
         losses = ("sensor", "kl_dyn", "kl_rep", "contrastive", "contrastive_nll",
                   "sensor_cpc", "sensor_cpc_probe")
-        metrics = ("lr_acc", "cpc_next_lr_acc", "contrastive_acc", "contrastive_scale",
+        metrics = ("mse", "rmse", "lr_acc", "cpc_next_lr_acc", "contrastive_acc", "contrastive_scale",
                    "contrastive_uncertainty_error_corr", "cpc_delta_mean", "state_drift")
         for key in losses:
             if key in wm_loss_sums:
@@ -676,24 +677,23 @@ class BaseWMOnPolicy:
         for key, value in extra_scalars.items():
             if not key.startswith("wm/"):
                 self.logger.log_scalar(key, value)
-        if info is not None:
-            per_env = info.get("per_env", None)
-            if per_env:
-                coverage_vals = [float(item["coverage"]) for item in per_env if "coverage" in item]
-                effective_vals = [float(item["effective_coverage"]) for item in per_env if "effective_coverage" in item]
-                wall_vals = [float(item["wall_coverage"]) for item in per_env if "wall_coverage" in item]
-                walls_explored_vals = [float(item["walls_explored"]) for item in per_env if "walls_explored" in item]
-                walls_total_vals = [float(item["walls_total"]) for item in per_env if "walls_total" in item]
-                if coverage_vals:
-                    self.logger.log_scalar("coverage", sum(coverage_vals) / len(coverage_vals))
-                if effective_vals:
-                    self.logger.log_scalar("effective_coverage", sum(effective_vals) / len(effective_vals))
-                if wall_vals:
-                    self.logger.log_scalar("wall_coverage", sum(wall_vals) / len(wall_vals))
-                if walls_explored_vals:
-                    self.logger.log_scalar("walls_explored", sum(walls_explored_vals) / len(walls_explored_vals))
-                if walls_total_vals:
-                    self.logger.log_scalar("walls_total", sum(walls_total_vals) / len(walls_total_vals))
+        if info is not None and "per_env" in info:
+            per_env = info["per_env"]
+            coverage_vals = [float(item["coverage"]) for item in per_env if "coverage" in item]
+            effective_vals = [float(item["effective_coverage"]) for item in per_env if "effective_coverage" in item]
+            wall_vals = [float(item["wall_coverage"]) for item in per_env if "wall_coverage" in item]
+            walls_explored_vals = [float(item["walls_explored"]) for item in per_env if "walls_explored" in item]
+            walls_total_vals = [float(item["walls_total"]) for item in per_env if "walls_total" in item]
+            if coverage_vals:
+                self.logger.log_scalar("coverage", sum(coverage_vals) / len(coverage_vals))
+            if effective_vals:
+                self.logger.log_scalar("effective_coverage", sum(effective_vals) / len(effective_vals))
+            if wall_vals:
+                self.logger.log_scalar("wall_coverage", sum(wall_vals) / len(wall_vals))
+            if walls_explored_vals:
+                self.logger.log_scalar("walls_explored", sum(walls_explored_vals) / len(walls_explored_vals))
+            if walls_total_vals:
+                self.logger.log_scalar("walls_total", sum(walls_total_vals) / len(walls_total_vals))
 
     def action_idx_to_val(self, actions_idx: torch.Tensor) -> torch.Tensor:
         idx = actions_idx.to(self.device).long().view(-1)

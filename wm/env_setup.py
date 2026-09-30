@@ -48,6 +48,9 @@ class MazeTrainerEnvAdapter:
 
 def setup_environment(args):
     env_type = args.env_type
+    shared_body = args.agent_type == "shared-body-ppo"
+    if shared_body and env_type != "maze":
+        raise ValueError("Shared-body experiments currently require --env-type maze")
     if env_type == 'maze':
         base_env = MazeVecEnv(
             num_envs=args.num_envs,
@@ -62,6 +65,20 @@ def setup_environment(args):
             return_torch=True,
             device=args.device)
         env = MazeTrainerEnvAdapter(base_env)
+        if shared_body:
+            from shared_body_env import SharedBodyMazeEnv
+
+            if args.communication == "learned":
+                if args.message_symbols < 2:
+                    raise ValueError("Learned messages require --message-symbols >= 2")
+                message_dim = args.message_symbols
+            elif args.communication == "state":
+                message_dim = args.wm_hidden_size
+                if args.wm_model_type in {"rssm", "tssm"}:
+                    message_dim += args.wm_stoch_size * args.wm_stoch_classes
+            else:
+                message_dim = 0
+            env = SharedBodyMazeEnv(base_env, args.body_agents, message_dim)
     elif env_type == 'agimaze':
         base = AgiMazeVecEnv(
                 num_envs=args.num_envs,

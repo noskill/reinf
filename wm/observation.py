@@ -83,10 +83,10 @@ class MazeObservationDecoder(ObservationDecoder):
     def __init__(self, *, sensor_bins: Sequence[int], decoder: Optional[nn.Module] = None,
                  categorical_heads: Optional[Sequence[nn.Module]] = None):
         super().__init__()
-        assert len(sensor_bins) == 3
+        assert len(sensor_bins) >= 1
         assert (decoder is None) != (categorical_heads is None)
         if categorical_heads is not None:
-            assert len(categorical_heads) == 3
+            assert len(categorical_heads) == len(sensor_bins)
 
         self.sensor_bins = tuple(int(size) for size in sensor_bins)
         self.decoder = decoder
@@ -98,16 +98,15 @@ class MazeObservationDecoder(ObservationDecoder):
 
         logits = self.decoder(features)
         assert logits.shape[-1] == sum(self.sensor_bins)
-        first, second, third = self.sensor_bins
-        return (
-            logits[..., :first],
-            logits[..., first:first + second],
-            logits[..., first + second:first + second + third],
-        )
+        return logits.split(self.sensor_bins, dim=-1)
+
+    def physical_target(self, target):
+        return target
 
     def _target_indices(self, target: torch.Tensor, config) -> torch.Tensor:
-        assert target.ndim == 3 and target.shape[-1] == 3, \
-            f"Expected maze sensor target [B,T,3], got {tuple(target.shape)}"
+        target = self.physical_target(target)
+        assert target.ndim == 3 and target.shape[-1] == len(self.sensor_bins), \
+            f"Expected maze sensor target [B,T,{len(self.sensor_bins)}], got {tuple(target.shape)}"
         target_idx = target.round().to(torch.long).clamp(min=0)
         if config.sensor_min_idx is not None:
             target_idx = (target_idx - config.sensor_min_idx.view(1, 1, -1)).clamp(min=0)
@@ -115,7 +114,7 @@ class MazeObservationDecoder(ObservationDecoder):
 
     def compute_loss(self, prediction, target: torch.Tensor,
                      key_padding_mask: torch.Tensor, config) -> torch.Tensor:
-        assert isinstance(prediction, tuple) and len(prediction) == 3
+        assert isinstance(prediction, tuple) and len(prediction) == len(self.sensor_bins)
         if config.sensor_tables is None:
             raise ValueError("categorical sensor loss requires config.sensor_tables")
         target_idx = self._target_indices(target, config)
@@ -124,17 +123,14 @@ class MazeObservationDecoder(ObservationDecoder):
             for sensor_idx, (pred, table) in enumerate(zip(prediction, config.sensor_tables))
         )
 
-    def compute_metrics(self, prediction, target: torch.Tensor, key_padding_mask: torch.Tensor,
-                        config, auxiliary_prediction=None) -> Mapping[str, torch.Tensor]:
-        assert isinstance(prediction, tuple) and len(prediction) == 3
-        if auxiliary_prediction is None:
-            auxiliary_prediction = prediction
-        assert isinstance(auxiliary_prediction, tuple) and len(auxiliary_prediction) == 3
+    def _distance_metrics(self, prediction, target, key_padding_mask, config):
+        assert isinstance(prediction, tuple) and len(prediction) == len(self.sensor_bins)
 
+        target = self.physical_target(target)
         target_abs = target.round().to(torch.long).clamp(min=0)
         sensor_min = config.sensor_min_idx
         if sensor_min is None:
-            sensor_min = torch.zeros(3, device=prediction[0].device, dtype=torch.float32)
+            sensor_min = torch.zeros(len(self.sensor_bins), device=prediction[0].device, dtype=torch.float32)
         else:
             sensor_min = sensor_min.to(device=prediction[0].device, dtype=torch.float32)
 
@@ -143,20 +139,30 @@ class MazeObservationDecoder(ObservationDecoder):
             for index, logits in enumerate(prediction)
         ], dim=-1)
         target_continuous = target_abs.to(expected.dtype)
-        lr_rmse, lr_acc = masked_lr_metrics_logits(
-            auxiliary_prediction[0], auxiliary_prediction[2], target_abs,
-            key_padding_mask, sensor_min,
-        )
         return {
             "mse": masked_mse(expected, target_continuous, key_padding_mask),
             "rmse": masked_rmse(expected, target_continuous, key_padding_mask),
-            "lr_rmse": lr_rmse,
-            "lr_acc": lr_acc,
         }
+
+    def compute_metrics(self, prediction, target, key_padding_mask, config, auxiliary_prediction=None):
+        assert len(self.sensor_bins) == 3, "Maze metrics require left/front/right sensors"
+        metrics = self._distance_metrics(prediction, target, key_padding_mask, config)
+        if auxiliary_prediction is None:
+            auxiliary_prediction = prediction
+        assert isinstance(auxiliary_prediction, tuple) and len(auxiliary_prediction) == 3
+        target_abs = target.round().to(torch.long).clamp(min=0)
+        sensor_min = config.sensor_min_idx
+        lr_rmse, lr_acc = masked_lr_metrics_logits(
+            pred_left=auxiliary_prediction[0], pred_right=auxiliary_prediction[2],
+            target_left=target_abs[..., 0], target_right=target_abs[..., 2],
+            mask=key_padding_mask, min_left=0.0 if sensor_min is None else float(sensor_min[0]),
+            min_right=0.0 if sensor_min is None else float(sensor_min[2]))
+        metrics.update(lr_rmse=lr_rmse, lr_acc=lr_acc)
+        return metrics
 
     def compute_step_error(self, prediction, target: torch.Tensor,
                            key_padding_mask: torch.Tensor, config) -> torch.Tensor:
-        assert isinstance(prediction, tuple) and len(prediction) == 3
+        assert isinstance(prediction, tuple) and len(prediction) == len(self.sensor_bins)
         if config.sensor_tables is None:
             raise ValueError("categorical sensor error requires config.sensor_tables")
         target_idx = self._target_indices(target, config)
@@ -168,10 +174,67 @@ class MazeObservationDecoder(ObservationDecoder):
         return step_error.masked_fill(key_padding_mask, 0.0)
 
     def sequence_length(self, prediction) -> int:
-        assert isinstance(prediction, tuple) and len(prediction) == 3
+        assert isinstance(prediction, tuple) and len(prediction) == len(self.sensor_bins)
         sequence_length = prediction[0].shape[1]
         assert all(pred.ndim == 3 and pred.shape[1] == sequence_length for pred in prediction)
         return sequence_length
+
+
+class CommunicatingMazeEncoder(MazeObservationEncoder):
+    """Encode local sensors and separately masked, detached peer messages."""
+
+    def __init__(self, encoder, *, local_sensor_dim, latent_dim, message_dim, peer_count):
+        input_dim = local_sensor_dim + peer_count * message_dim + peer_count
+        super().__init__(encoder, input_dim, latent_dim)
+        self.local_sensor_dim = local_sensor_dim
+        self.message_dim = message_dim
+        self.peer_count = peer_count
+
+    def encode(self, observation):
+        local_sensors = observation["local"]
+        incoming_messages = observation["message"]
+        message_valid = observation["message_valid"]
+        assert local_sensors.ndim == 3 and local_sensors.shape[-1] == self.local_sensor_dim, \
+            f"Expected local sensors [B,T,{self.local_sensor_dim}], got {tuple(local_sensors.shape)}"
+        batch_size, sequence_length, _ = local_sensors.shape
+        expected_messages = (batch_size, sequence_length, self.peer_count, self.message_dim)
+        assert incoming_messages.shape == expected_messages, \
+            f"Expected messages {expected_messages}, got {tuple(incoming_messages.shape)}"
+        assert message_valid.shape == (batch_size, sequence_length, self.peer_count), \
+            "Expected message_valid [B,T,peer_count]"
+        assert message_valid.dtype == torch.bool, "message_valid must be Boolean"
+        masked_messages = incoming_messages.detach().clone()
+        masked_messages[~message_valid] = 0
+        encoder_input = torch.cat([local_sensors.float(), masked_messages.flatten(start_dim=2),
+                                   message_valid.float()], dim=-1)
+        return super().encode(encoder_input)
+
+
+class CommunicatingMazeDecoder(MazeObservationDecoder):
+    """Decode one agent's sensor pair, not the full shared body's observations."""
+
+    def __init__(self, *, sensor_bins, decoder=None, categorical_heads=None):
+        assert len(sensor_bins) == 2, "Shared maze decoder requires two local sensors"
+        super().__init__(sensor_bins=sensor_bins, decoder=decoder, categorical_heads=categorical_heads)
+
+    def physical_target(self, target):
+        return target["local"]
+
+    def compute_metrics(self, prediction, target, key_padding_mask, config, auxiliary_prediction=None):
+        # Body-level LR metrics need left from agent 1 and right from agent 2.
+        return self._distance_metrics(prediction, target, key_padding_mask, config)
+
+
+def add_maze_communication(codecs, *, local_sensor_dim, message_dim, peer_count):
+    base_encoder, *base_decoders = codecs
+    encoder = CommunicatingMazeEncoder(
+        base_encoder.encoder, local_sensor_dim=local_sensor_dim, latent_dim=base_encoder.latent_dim,
+        message_dim=message_dim, peer_count=peer_count)
+    assert encoder.sensor_dim == base_encoder.sensor_dim, "Communication dimensions must match the encoder input"
+    decoders = tuple(CommunicatingMazeDecoder(sensor_bins=decoder.sensor_bins, decoder=decoder.decoder,
+                                              categorical_heads=decoder.categorical_heads)
+                     for decoder in base_decoders)
+    return (encoder, *decoders)
 
 
 class AgiMazeObservationEncoder(ObservationEncoder):

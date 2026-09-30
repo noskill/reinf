@@ -223,6 +223,8 @@ def main():
         observation_decoder=observation_codecs[1],
         z_observation_decoder=observation_codecs[2],
         h_observation_decoder=observation_codecs[3],
+        cpc_sensor_probe_decoder=observation_codecs[4],
+        contrastive_dim=64,
         hidden_size=args.hidden_size,
         sensor_mode="categorical",
         loc_x_bins=loc_x_bins,
@@ -244,9 +246,6 @@ def main():
         prior_rollout_steps=0,
         probe_hidden_dim=256,
         probe_layers=2,
-        transition="gru",
-        residual_scale=1.0,
-        state_norm="none",
     ).to(device)
 
     observation_codecs = create_observation_codecs()
@@ -255,6 +254,8 @@ def main():
         observation_decoder=observation_codecs[1],
         z_observation_decoder=observation_codecs[2],
         h_observation_decoder=observation_codecs[3],
+        cpc_sensor_probe_decoder=observation_codecs[4],
+        contrastive_dim=64,
         hidden_size=args.hidden_size,
         layers=args.layers,
         heads=args.heads,

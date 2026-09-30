@@ -5,9 +5,10 @@ from typing import Dict
 from ppo import PPOBase
 from wm_joint_agent import BaseWMOnPolicy, _WMEpisodePool
 from util import EpisodeBatch, detach as detach_tree, to_device, tree_stack
+from agent_group import AgentGroup
 
 
-class DoubleAgent(BaseWMOnPolicy):
+class DoubleAgent(AgentGroup, BaseWMOnPolicy):
     """PPO two-policy agent with joint AC-CPC world-model updates."""
     def __init__(self, agent_high: PPOBase,
                  agent_low: PPOBase,
@@ -150,8 +151,7 @@ class DoubleAgent(BaseWMOnPolicy):
         return self.agent_low.num_envs
 
     def episode_start(self):
-        for agent in self.agents:
-            agent.episode_start()
+        self.start_agents()
         self._prev_actions = None
         self._high_goal_enabled = None
         if hasattr(self.wm_model, "clear_cache"):
@@ -171,10 +171,6 @@ class DoubleAgent(BaseWMOnPolicy):
         self.agent_low.add_reward(env_idx, reward)
         self.agent_high.add_reward(env_idx, reward)
 
-    def process_dones(self, dones):
-        self.agent_low.process_dones(dones)
-        self.agent_high.process_dones(dones)
-
     def train(self):
         self.agent_high.policy.train()
         self.agent_high.value.train()
@@ -186,10 +182,6 @@ class DoubleAgent(BaseWMOnPolicy):
             self.agent_low.policy.train()
             self.agent_low.value.train()
             self.agent_low.achievability_head.train()
-
-    def clear_completed(self):
-        self.agent_low.clear_completed()
-        self.agent_high.clear_completed()
 
     def rl_get_state_dict(self):
         return {

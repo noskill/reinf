@@ -110,29 +110,33 @@ def expected_from_logits(logits: torch.Tensor, min_val: float) -> torch.Tensor:
 def masked_lr_metrics_logits(
     pred_left: torch.Tensor,
     pred_right: torch.Tensor,
-    target_sensor_idx: torch.Tensor,
+    target_left: torch.Tensor,
+    target_right: torch.Tensor,
     mask: torch.Tensor,
-    sensor_min: torch.Tensor,
+    *,
+    min_left: float,
+    min_right: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    assert mask.dtype == torch.bool and mask.ndim == 2, "Expected Boolean padding mask [B,T]"
+    assert pred_left.ndim == 3 and pred_left.shape[:2] == mask.shape, "Expected left logits [B,T,C_left]"
+    assert pred_right.ndim == 3 and pred_right.shape[:2] == mask.shape, "Expected right logits [B,T,C_right]"
+    assert target_left.shape == mask.shape, "Expected left targets [B,T]"
+    assert target_right.shape == mask.shape, "Expected right targets [B,T]"
     valid = ~mask
     if valid.sum() == 0:
         zero = torch.tensor(0.0, device=pred_left.device)
         return zero, zero
-    min_l = float(sensor_min[0].item())
-    min_r = float(sensor_min[2].item())
-    pred_l = expected_from_logits(pred_left, min_l)
-    pred_r = expected_from_logits(pred_right, min_r)
-    tgt_l = target_sensor_idx[..., 0].to(pred_l.dtype)
-    tgt_r = target_sensor_idx[..., 2].to(pred_r.dtype)
-    diff = torch.stack([pred_l - tgt_l, pred_r - tgt_r], dim=-1)[valid]
+    expected_left = expected_from_logits(pred_left, min_left)
+    expected_right = expected_from_logits(pred_right, min_right)
+    diff = torch.stack([expected_left - target_left.to(expected_left.dtype),
+                        expected_right - target_right.to(expected_right.dtype)], dim=-1)[valid]
     lr_rmse = torch.sqrt((diff * diff).mean())
 
     # Report exact classification accuracy from categorical winners.
-    pred_l_idx = torch.argmax(pred_left, dim=-1).to(torch.long) + int(min_l)
-    pred_r_idx = torch.argmax(pred_right, dim=-1).to(torch.long) + int(min_r)
-    tgt_l_idx = torch.round(target_sensor_idx[..., 0]).to(torch.long)
-    tgt_r_idx = torch.round(target_sensor_idx[..., 2]).to(torch.long)
-    both_correct = (pred_l_idx == tgt_l_idx) & (pred_r_idx == tgt_r_idx)
+    predicted_left = torch.argmax(pred_left, dim=-1).to(torch.long) + int(min_left)
+    predicted_right = torch.argmax(pred_right, dim=-1).to(torch.long) + int(min_right)
+    both_correct = ((predicted_left == target_left.round().long())
+                    & (predicted_right == target_right.round().long()))
     lr_acc = both_correct[valid].float().mean()
     return lr_rmse, lr_acc
 

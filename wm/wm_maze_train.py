@@ -177,7 +177,12 @@ def parse_args():
     parser.add_argument("--wm-sensor-sigma", type=float, default=1.0)
     parser.add_argument("--wm-pos-sigma", type=float, default=1.0)
     parser.add_argument("--wm-heading-smoothing", type=float, default=0.0)
-    parser.add_argument("--agent-type", type=str, default="single-policy-ppo")
+    parser.add_argument("--agent-type", type=str, default="single-policy-ppo",
+                        choices=["single-policy-ppo", "double-policy-ppo", "shared-body-ppo"])
+    parser.add_argument("--body-agents", type=int, choices=[2, 3], default=2)
+    parser.add_argument("--communication", choices=["learned", "none", "state"], default="learned")
+    parser.add_argument("--message-symbols", type=int, default=8)
+    parser.add_argument("--shared-weights", action="store_true")
     parser.add_argument("--env-type", type=str, default='maze', choices=['maze', 'agimaze'])
     return parser.parse_args()
 
@@ -228,37 +233,40 @@ def main():
     maze_dim = int(env.max_dim)
     turn_bins = len({int(turn) for turn, _ in base_env.action_table})
     step_bins = len({int(step) for _, step in base_env.action_table})
-    wm_model = create_world_model(
-        model_args=wm_model_args,
-        device=torch.device(args.device),
-        observation_type=args.env_type,
-        observation_space=env.observation_space,
-        maze_dim=maze_dim,
-        turn_bins=turn_bins,
-        step_bins=step_bins,
-        action_dim=2,
-        heading_dim=4,
-        contrastive_temp=args.wm_contrastive_temp,
-        contrastive_horizon_discount=args.wm_contrastive_discount,
-        contrastive_uncertainty_weight=args.wm_contrastive_uncertainty_weight,
-        sensor_weight=args.wm_sensor_weight,
-        loc_weight=args.wm_loc_weight,
-        head_weight=args.wm_head_weight,
-        turn_weight=args.wm_turn_weight,
-        step_weight=args.wm_step_weight,
-        sensor_sigma=args.wm_sensor_sigma,
-        pos_sigma=args.wm_pos_sigma,
-        heading_smoothing=args.wm_heading_smoothing,
-        sensor_max_bin=args.wm_sensor_max_bin,
-        logger=logger
-    )
+    if args.agent_type == "shared-body-ppo":
+        from shared_body_agent import create_shared_body_agents
 
-    if args.agent_type == "single-policy-ppo":
-        agent = create_single_policy_agent(args, wm_model_args, wm_model, logger,
-                                           maze_dim, len(base_env.action_table), base_env.action_table)
-    elif args.agent_type == "double-policy-ppo":
-        agent = create_double_policy_agent(args, wm_model_args, wm_model, logger,
-                                           maze_dim, len(base_env.action_table), base_env.action_table)
+        agent = create_shared_body_agents(args, env, wm_model_args, logger)
+    else:
+        wm_model = create_world_model(
+            model_args=wm_model_args,
+            device=torch.device(args.device),
+            observation_type=args.env_type,
+            observation_space=env.observation_space,
+            maze_dim=maze_dim,
+            turn_bins=turn_bins,
+            step_bins=step_bins,
+            action_dim=2,
+            heading_dim=4,
+            contrastive_temp=args.wm_contrastive_temp,
+            contrastive_horizon_discount=args.wm_contrastive_discount,
+            contrastive_uncertainty_weight=args.wm_contrastive_uncertainty_weight,
+            sensor_weight=args.wm_sensor_weight,
+            loc_weight=args.wm_loc_weight,
+            head_weight=args.wm_head_weight,
+            turn_weight=args.wm_turn_weight,
+            step_weight=args.wm_step_weight,
+            sensor_sigma=args.wm_sensor_sigma,
+            pos_sigma=args.wm_pos_sigma,
+            heading_smoothing=args.wm_heading_smoothing,
+            sensor_max_bin=args.wm_sensor_max_bin,
+            logger=logger)
+        if args.agent_type == "single-policy-ppo":
+            agent = create_single_policy_agent(args, wm_model_args, wm_model, logger,
+                                               maze_dim, len(base_env.action_table), base_env.action_table)
+        else:
+            agent = create_double_policy_agent(args, wm_model_args, wm_model, logger,
+                                               maze_dim, len(base_env.action_table), base_env.action_table)
 
     trainer = OnPolicyTrainer(
         env=env,

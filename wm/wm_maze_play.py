@@ -15,21 +15,10 @@ import numpy as np
 import torch
 from torch.distributions import Categorical
 
-from agent_utils_wm import MAZE_WM_MODEL_DEFAULTS, add_create_model_args, extract_create_model_args
+from agent_utils_wm import MAZE_WM_MODEL_DEFAULTS, add_create_model_args, create_world_model, extract_create_model_args
+from env_setup import MazeTrainerEnvAdapter
+from maze.rl_env import MazeVecEnv
 from policy_head import WMActionHeadPolicy
-from wm_joint_agent import create_maze_world_model
-
-
-THIS_DIR = Path(__file__).resolve().parent
-PARENT_DIR = THIS_DIR.parent
-MAZE_DIR = THIS_DIR / "maze"
-
-if str(PARENT_DIR) not in sys.path:
-    sys.path.insert(0, str(PARENT_DIR))
-if str(MAZE_DIR) not in sys.path:
-    sys.path.insert(0, str(MAZE_DIR))
-
-from rl_env import MazeVecEnv  # noqa: E402
 
 
 def _find_args_json(checkpoint: Path, explicit: Optional[str]) -> Optional[Path]:
@@ -255,9 +244,11 @@ def main() -> None:
     turn_bins = len({int(turn) for turn, _ in env.action_table})
     step_bins = len({int(step) for _, step in env.action_table})
     wm_model_args = extract_create_model_args(args, arg_prefix="wm", device=args.device)
-    wm_model = create_maze_world_model(
+    wm_model = create_world_model(
         model_args=wm_model_args,
         device=device,
+        observation_type="maze",
+        observation_space=MazeTrainerEnvAdapter(env).observation_space,
         maze_dim=maze_dim,
         turn_bins=turn_bins,
         step_bins=step_bins,

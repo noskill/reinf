@@ -24,6 +24,7 @@ from double import DoubleAgent
 from goal_agent import GoalAgent
 from goal_agent_low import LowLevelAgent
 from observation import (
+    add_maze_communication,
     create_agimaze_baseline_observation_codec,
     create_agimaze_discrete_observation_codec,
     create_maze_baseline_observation_codec,
@@ -369,19 +370,43 @@ def extract_create_model_args(
 
     return SimpleNamespace(**values)
 
+def shared_maze_spec(sensor_space):
+    if not isinstance(sensor_space, gym.spaces.Dict):
+            raise ValueError("Shared-maze sensor space must be Dict")
+    if set(sensor_space.spaces) != {"local", "message", "message_valid"}:
+        raise ValueError("Expected local, message and message_valid sensor fields")
+    local_space = sensor_space["local"]
+    message_space = sensor_space["message"]
+    message_valid_space = sensor_space["message_valid"]
+    if not isinstance(local_space, gym.spaces.Box) or local_space.shape != (2,):
+        raise ValueError("Shared-maze requires exactly two local sensors")
+    if not isinstance(message_space, gym.spaces.Box) or len(message_space.shape) != 2:
+        raise ValueError("Shared-maze message space must be Box with shape (peer_count, message_dim)")
+    peer_count, message_dim = message_space.shape
+    if (peer_count == 0) != (message_dim == 0):
+        raise ValueError("A disabled channel must have message shape (0, 0)")
+    if not isinstance(message_valid_space, gym.spaces.Box) or message_valid_space.shape != (peer_count,):
+        raise ValueError("message_valid space must be Box with shape (peer_count,)")
+    if message_valid_space.dtype != numpy.bool_:
+        raise ValueError("message_valid space must have Boolean dtype")
+    local_sensor_dim = local_space.shape[0]
+    return {"local_sensor_dim": local_sensor_dim, "peer_count": peer_count,
+                "message_dim": message_dim, "encoder_input_dim": local_sensor_dim + peer_count * message_dim + peer_count}
 
-def _observation_space_spec(observation_type, observation_space):
-    if observation_type not in {"maze", "agimaze"}:
+def _observation_space_spec(observation_type, observation_space) -> dict[str, int]:
+    if observation_type not in {"maze", "agimaze", "shared-maze"}:
         raise ValueError(f"Unsupported observation type: {observation_type}")
     if not isinstance(observation_space, gym.spaces.Dict) or "sensor" not in observation_space.spaces:
         raise ValueError("observation_space must be Dict containing 'sensor'")
     sensor_space = observation_space["sensor"]
+    if observation_type == "shared-maze":
+        return shared_maze_spec(sensor_space)
     if observation_type == "maze":
         if not isinstance(sensor_space, gym.spaces.Box):
             raise ValueError("Maze sensor space must be Box")
         if sensor_space.shape != (3,):
             raise ValueError(f"Expected maze sensor space shape (3,), got {sensor_space.shape}")
-        return 3, None
+        return {"encoder_input_dim": sensor_space.shape[0]}
     if not isinstance(sensor_space, gym.spaces.Dict):
         raise ValueError("AgiMaze sensor space must be Dict")
     if set(sensor_space.spaces) != {"movement_result", "inventory"}:
@@ -392,48 +417,48 @@ def _observation_space_spec(observation_type, observation_space):
         raise ValueError("movement_result space must be Discrete")
     if not isinstance(inventory_space, gym.spaces.MultiBinary) or len(inventory_space.shape) != 1:
         raise ValueError("inventory space must be one-dimensional MultiBinary")
-    return movement_result_space.n, inventory_space.shape[0]
+    return {"movement_result_classes": movement_result_space.n, "inventory_size": inventory_space.shape[0]}
 
 
 def create_baseline_observation_codec(observation_type, observation_space, args, *, sensor_bins=None):
-    first_dim, second_dim = _observation_space_spec(observation_type, observation_space)
-    if observation_type == "maze":
+    dimensions = _observation_space_spec(observation_type, observation_space)
+    if observation_type in {"maze", "shared-maze"}:
         if sensor_bins is None:
             raise ValueError("sensor_bins are required for maze observation decoder")
-        return create_maze_baseline_observation_codec(
-            sensor_dim=first_dim,
-            sensor_latent_dim=args.sensor_latent_dim,
-            feature_dim=args.hidden_size,
-            sensor_bins=sensor_bins,
-            hidden_dim=args.probe_hidden_dim,
-        )
+        codecs = create_maze_baseline_observation_codec(
+            sensor_dim=dimensions["encoder_input_dim"], sensor_latent_dim=args.sensor_latent_dim,
+            feature_dim=args.hidden_size, sensor_bins=sensor_bins, hidden_dim=args.probe_hidden_dim)
+        if observation_type == "shared-maze":
+            return add_maze_communication(codecs, local_sensor_dim=dimensions["local_sensor_dim"],
+                                          message_dim=dimensions["message_dim"], peer_count=dimensions["peer_count"])
+        return codecs
     return create_agimaze_baseline_observation_codec(
-        movement_result_classes=first_dim,
-        inventory_size=second_dim,
-        observation_latent_dim=args.sensor_latent_dim,
-        feature_dim=args.hidden_size,
-        hidden_dim=args.probe_hidden_dim,
-    )
+        movement_result_classes=dimensions["movement_result_classes"], inventory_size=dimensions["inventory_size"],
+        observation_latent_dim=args.sensor_latent_dim, feature_dim=args.hidden_size, hidden_dim=args.probe_hidden_dim)
 
 
 def create_discrete_observation_codec(observation_type, observation_space, args, *,
                                       feature_dim: int, stochastic_dim: int,
                                       hidden_size: int, sensor_bins=None):
-    first_dim, second_dim = _observation_space_spec(observation_type, observation_space)
-    if observation_type == "maze":
+    dimensions = _observation_space_spec(observation_type, observation_space)
+    if observation_type in {"maze", "shared-maze"}:
         if sensor_bins is None:
             raise ValueError("sensor_bins are required for maze observation decoder")
-        return create_maze_discrete_observation_codec(
-            sensor_dim=first_dim,
+        codecs = create_maze_discrete_observation_codec(
+            sensor_dim=dimensions["encoder_input_dim"],
             sensor_latent_dim=args.obs_latent_dim,
             feature_dim=feature_dim,
             stochastic_dim=stochastic_dim,
             hidden_size=hidden_size,
             sensor_bins=sensor_bins,
         )
+        if observation_type == "shared-maze":
+            return add_maze_communication(codecs, local_sensor_dim=dimensions["local_sensor_dim"],
+                                          message_dim=dimensions["message_dim"], peer_count=dimensions["peer_count"])
+        return codecs
     return create_agimaze_discrete_observation_codec(
-        movement_result_classes=first_dim,
-        inventory_size=second_dim,
+        movement_result_classes=dimensions["movement_result_classes"],
+        inventory_size=dimensions["inventory_size"],
         observation_latent_dim=args.obs_latent_dim,
         feature_dim=feature_dim,
         stochastic_dim=stochastic_dim,
@@ -944,13 +969,14 @@ def create_world_model(
         raise ValueError("maze_dim must be >= 2")
 
     _observation_space_spec(observation_type, observation_space)
-    if observation_type == "maze":
+    if observation_type in {"maze", "shared-maze"}:
         if sensor_max_bin < 1:
             raise ValueError("sensor_max_bin must be >= 1")
         sensor_bin_count = int(sensor_max_bin) + 1
-        sensor_bins = numpy.full(3, sensor_bin_count, dtype=numpy.int64)
-        sensor_tables = [make_soft_table(sensor_bin_count, sensor_sigma, device) for _ in range(3)]
-        sensor_min_idx = torch.zeros(3, dtype=torch.long, device=device)
+        sensor_count = 2 if observation_type == "shared-maze" else 3
+        sensor_bins = numpy.full(sensor_count, sensor_bin_count, dtype=numpy.int64)
+        sensor_tables = [make_soft_table(sensor_bin_count, sensor_sigma, device) for _ in range(sensor_count)]
+        sensor_min_idx = torch.zeros(sensor_count, dtype=torch.long, device=device)
     else:
         sensor_bins = None
         sensor_tables = None
@@ -999,22 +1025,3 @@ def create_world_model(
         loc_min=loc_min,
     )
     return model
-
-
-def create_maze_world_model(*, model_args, device: torch.device, maze_dim: int,
-                            turn_bins: int, step_bins: int, sensor_max_bin: int = 64,
-                            **kwargs):
-    observation_space = gym.spaces.Dict({
-        "sensor": gym.spaces.Box(low=0, high=sensor_max_bin, shape=(3,), dtype=numpy.float32),
-    })
-    return create_world_model(
-        model_args=model_args,
-        device=device,
-        observation_type="maze",
-        observation_space=observation_space,
-        maze_dim=maze_dim,
-        turn_bins=turn_bins,
-        step_bins=step_bins,
-        sensor_max_bin=sensor_max_bin,
-        **kwargs,
-    )

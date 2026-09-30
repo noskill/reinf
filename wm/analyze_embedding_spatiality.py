@@ -7,26 +7,18 @@ import argparse
 import ast
 import math
 import os
-import sys
 from collections import defaultdict
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
+import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-THIS_DIR = Path(__file__).resolve().parent
-PARENT_DIR = THIS_DIR.parent
-MAZE_DIR = THIS_DIR / "maze"
-for path in (PARENT_DIR, MAZE_DIR):
-    if str(path) not in sys.path:
-        sys.path.insert(0, str(path))
-
-from agent_utils_wm import MAZE_WM_MODEL_DEFAULTS, add_create_model_args, extract_create_model_args  # noqa: E402
-from rl_env import DEFAULT_ACTIONS, MazeVecEnv  # noqa: E402
-from wm_joint_agent import create_maze_world_model  # noqa: E402
+from agent_utils_wm import MAZE_WM_MODEL_DEFAULTS, add_create_model_args, create_world_model, extract_create_model_args
+from env_setup import MazeTrainerEnvAdapter
+from maze.rl_env import DEFAULT_ACTIONS, MazeVecEnv
 
 try:  # noqa: E402
     from image import DummyImage  # type: ignore
@@ -124,28 +116,23 @@ def load_checkpoint_config(args: argparse.Namespace) -> None:
 def build_model(
     args: argparse.Namespace,
     *,
-    env: Optional[MazeVecEnv] = None,
-    maze_dim: Optional[int] = None,
-    action_table: Optional[List[Tuple[int, int]]] = None,
+    observation_space: gym.spaces.Dict,
+    maze_dim: int,
+    action_table: List[Tuple[int, int]],
 ):
     load_checkpoint_config(args)
     model_args = extract_create_model_args(args, arg_prefix="wm", device=args.device)
     checkpoint_dim = max(int(getattr(args, "_checkpoint_loc_x_bins", 0)), int(getattr(args, "_checkpoint_loc_y_bins", 0)))
     if checkpoint_dim > 0:
         maze_dim = checkpoint_dim
-    elif maze_dim is None:
-        if env is not None:
-            maze_dim = int(env._mazes[0].dim)
-        else:
-            maze_dim = int(args.random_dim)
-    if action_table is None:
-        action_table = list(env.action_table if env is not None else DEFAULT_ACTIONS)
     turn_bins = len({int(turn) for turn, _ in action_table})
     step_bins = len({int(step) for _, step in action_table})
     args._model_maze_dim = int(maze_dim)
-    model = create_maze_world_model(
+    model = create_world_model(
         model_args=model_args,
         device=torch.device(args.device),
+        observation_type="maze",
+        observation_space=observation_space,
         maze_dim=maze_dim,
         turn_bins=turn_bins,
         step_bins=step_bins,
@@ -224,6 +211,7 @@ def collect_rollout(args: argparse.Namespace):
             obs = env._build_obs()
     action_table = list(env.action_table)
     maze_dim = int(env._mazes[0].dim)
+    observation_space = MazeTrainerEnvAdapter(env).observation_space
     env.close()
     return (
         obs_seq,
@@ -233,6 +221,7 @@ def collect_rollout(args: argparse.Namespace):
         torch.stack(action_seq, dim=1),
         action_table,
         maze_dim,
+        observation_space,
     )
 
 
@@ -312,7 +301,12 @@ def build_saved_episode_tensors(args: argparse.Namespace):
         "actions": actions.to(device),
         "key_padding_mask": key_padding_mask.to(device),
     }
-    return wm_obs, location, heading, sensors, key_padding_mask, max_coord + 1, list(DEFAULT_ACTIONS)
+    valid_sensors = sensors[~key_padding_mask]
+    observation_space = gym.spaces.Dict({
+        "sensor": gym.spaces.Box(low=valid_sensors.amin(dim=0).numpy(), high=valid_sensors.amax(dim=0).numpy(),
+                                 shape=(sensors.shape[-1],), dtype=np.float32)})
+    return (wm_obs, location, heading, sensors, key_padding_mask, max_coord + 1,
+            list(DEFAULT_ACTIONS), observation_space)
 
 
 def build_wm_obs(obs_seq, actions, action_table, device):
@@ -610,13 +604,12 @@ def main() -> None:
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     if args.data_path:
-        wm_obs, loc, heading, sensor, key_padding_mask, maze_dim, action_table = build_saved_episode_tensors(args)
-        model = build_model(args, maze_dim=maze_dim, action_table=action_table)
+        wm_obs, loc, heading, sensor, key_padding_mask, maze_dim, action_table, observation_space = build_saved_episode_tensors(args)
     else:
-        obs_seq, loc, heading, sensor, actions, action_table, maze_dim = collect_rollout(args)
-        model = build_model(args, maze_dim=maze_dim, action_table=action_table)
+        obs_seq, loc, heading, sensor, actions, action_table, maze_dim, observation_space = collect_rollout(args)
         wm_obs = build_wm_obs(obs_seq, actions, action_table, torch.device(args.device))
         key_padding_mask = wm_obs["key_padding_mask"].detach().cpu()
+    model = build_model(args, observation_space=observation_space, maze_dim=maze_dim, action_table=action_table)
     with torch.no_grad():
         out = model(wm_obs)
     emb = select_embedding(out, args.embedding)
