@@ -35,6 +35,9 @@ def run_epoch_joint(model, loader, optimizer, device, logger, metric_prefix=None
         "contrastive_entropy": 0.0,
         "contrastive_uncertainty_error_corr": 0.0}
     
+    if model.contrastive_dim == 0:
+        totals = {name: value for name, value in totals.items()
+                  if not name.startswith(("contrastive", "sensor_cpc")) and name != "sfa"}
     total_batches = 0
     cfg = model.config
 
@@ -75,10 +78,9 @@ def run_epoch_joint(model, loader, optimizer, device, logger, metric_prefix=None
         loss = obs_total + cfg.turn_weight * loss_dict["turn"] + cfg.step_weight * loss_dict["step"] + \
             loss_dict.get("aux_total", torch.tensor(0.0, device=device))
         
-        if cfg.contrastive_weight > 0:
-            loss = loss + cfg.contrastive_weight * loss_dict.get("contrastive", torch.tensor(0.0, device=device))
-
-        loss = loss + loss_dict["sfa"] + 0.1 * loss_dict["sensor_cpc"]
+        if model.contrastive_dim > 0:
+            loss = loss + cfg.contrastive_weight * loss_dict["contrastive"]
+            loss = loss + loss_dict["sfa"] + 0.1 * loss_dict["sensor_cpc"]
 
         if is_train:
             optimizer.zero_grad(set_to_none=True)

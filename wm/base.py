@@ -419,6 +419,8 @@ class PredictionLossMixin:
             key_padding_mask=targets["key_padding_mask"],
             aux_inputs=aux_inputs,
         )
+        if self.contrastive_dim == 0:
+            return losses
         contrastive_results = self.compute_contrastive_loss(
             aux_inputs=aux_inputs,
             key_padding_mask=targets["key_padding_mask"],
@@ -500,6 +502,8 @@ class PredictionLossMixin:
             loc_min=cfg.loc_min,
             aux_inputs=aux_inputs,
         )
+        if self.contrastive_dim == 0:
+            return metrics
         contrastive_stats = self.compute_contrastive_loss(
             aux_inputs=aux_inputs,
             key_padding_mask=targets["key_padding_mask"],
@@ -685,8 +689,8 @@ class DiscreteLatentPredictorBase(PredictionLossMixin, nn.Module):
             raise ValueError("probe_hidden_dim must be >= 0")
         if self.probe_layers < 1:
             raise ValueError("probe_layers must be >= 1")
-        if self.contrastive_dim <= 0:
-            raise ValueError("contrastive_dim must be > 0 for CPC and SFA")
+        if self.contrastive_dim < 0:
+            raise ValueError("contrastive_dim must be >= 0")
         if self.contrastive_steps < 1:
             raise ValueError("contrastive_steps must be >= 1")
         self.loc_x_bins = int(loc_x_bins)
@@ -696,10 +700,14 @@ class DiscreteLatentPredictorBase(PredictionLossMixin, nn.Module):
         self.observation_decoder = observation_decoder
         self.z_observation_decoder = z_observation_decoder
         self.h_observation_decoder = h_observation_decoder
-        self.cpc_sensor_probe_decoder = cpc_sensor_probe_decoder
-        self.cpc_sensor_latent_head = make_probe_head(
-            self.contrastive_dim, observation_encoder.latent_dim, self.probe_hidden_dim, 3)
-        self.cpc_sfa = RecurrentMLP(make_probe_head(self.contrastive_dim * 2, self.contrastive_dim, 256, 3))
+        self.cpc_sensor_probe_decoder = None
+        self.cpc_sensor_latent_head = None
+        self.cpc_sfa = None
+        if self.contrastive_dim > 0:
+            self.cpc_sensor_probe_decoder = cpc_sensor_probe_decoder
+            self.cpc_sensor_latent_head = make_probe_head(
+                self.contrastive_dim, observation_encoder.latent_dim, self.probe_hidden_dim, 3)
+            self.cpc_sfa = RecurrentMLP(make_probe_head(self.contrastive_dim * 2, self.contrastive_dim, 256, 3))
         self.sfa_cpc_grad_scale = 0.05
         self.prior_head = nn.Linear(self.hidden_size, self.stoch_flat)
         self.post_head = nn.Linear(self.hidden_size + observation_encoder.latent_dim, self.stoch_flat)
@@ -767,6 +775,8 @@ class DiscreteLatentPredictorBase(PredictionLossMixin, nn.Module):
         return tree_index(aux["prior_sensor_pred"], (slice(None), slice(1, None)))
 
     def compute_cpc_aux(self, prior_feat, z_post, actions, sensor_latent, reset_mask):
+        if self.contrastive_dim == 0:
+            return {}
         anchor = self._project_contrastive_target_z(z_post)
         pred_steps, scale_steps = self._project_contrastive_pred_steps(prior_feat, actions)
         return {
@@ -781,6 +791,8 @@ class DiscreteLatentPredictorBase(PredictionLossMixin, nn.Module):
 
     def compute_losses(self, *, preds, targets, aux_inputs=None):
         losses = super().compute_losses(preds=preds, targets=targets, aux_inputs=aux_inputs)
+        if self.contrastive_dim == 0:
+            return losses
         probe_loss = self.compute_cpc_probe_loss(aux_inputs, targets)
         losses["sensor_cpc_probe"] = probe_loss
         losses["aux_total"] = losses["aux_total"] + self.config.sensor_weight * probe_loss
@@ -789,6 +801,8 @@ class DiscreteLatentPredictorBase(PredictionLossMixin, nn.Module):
     @torch.no_grad()
     def compute_metrics(self, *, preds, targets, aux_inputs=None):
         metrics = super().compute_metrics(preds=preds, targets=targets, aux_inputs=aux_inputs)
+        if self.contrastive_dim == 0:
+            return metrics
         metrics.update(self.compute_cpc_probe_metrics(aux_inputs, targets))
         return metrics
 

@@ -1,0 +1,195 @@
+
+    
+ left + front                      front + right
+      |                                 |
+      v                                 v
+  [Agent 1] <------- messages ------> [Agent 2]
+      |                                 |
+ preference v1                     preference v2
+      |                                 |
+      +----------------+----------------+
+                       |
+                 (v1 + v2) / 2
+                       |
+              sample body action
+              
+              
+
+    
+ left + front            
+      |                             
+      v                              
+  [Agent 1] 
+      |                       
+ preference v1                   
+      |                             
+      +----------------+
+                       |
+                      v1 
+                       |
+              sample body action 
+
+              
+
+#########
+#
+# shared body model1
+#
+#########   
+h0 = 0, 
+z0 = qϕ(z | h0, O0) # posterior
+
+s0 = [h0, z0] -> (a0, m0^{i->j}) # policy sample 
+
+# environment samples body action b0 from a0^i and a0^j and transfer messages, new observation o1
+
+h1 = Fϕ(h0, z0, b0, a0, m0^{i→j}, m0^{j→i})
+
+p1 = p(z | h1) # prior
+
+p1 -> hat z1 -> hat o1
+
+q1 = q(z| h1, o1) # posterior
+
+
+
+#########
+#
+# shared body model2
+#
+#########   
+h0 = 0, 
+z0 = qϕ(z | h0, O0) # posterior
+
+s0 = [h0, z0] -> (a0, m0^{i->j}) # policy sample 
+
+# environment samples body action b0 from a0^i and a0^j and transfer messages, new observation o1
+
+h1 = Fϕ(h0, z0, b0, a0, m0^{i→j}, m0^{j→i})
+
+p1 = p(z | h1) # prior
+
+p1 -> hat z1 -> hat o1
+
+q1 = q(z| h1, o1) # posterior
+
+
+    
+#########
+#
+# shared body model3
+#
+#########
+
+b - body action
+m - message
+h_t - recurrent/sequential context
+
+st = [ht, zt] -> (at, mt) # policy sample 
+
+# environment process at from agents and sample bt
+
+h_t+1=Fϕ(ht, zt, bt, at, m^out_t, m^in_t-1) # recurrent step
+
+prior for hat z_t with and without incoming message
+p^+_{t+1} = p(z_{t+1} | ht, zt, bt, m^in_t)
+
+p^-_{t+1} = p(z_{t+1} | ht, zt, bt)
+
+posterior
+q_t = qϕ(z_t | h_t, o_t)
+
+sensor reconstruction
+hat o_t = D(h_t, z_t)
+
+Loss:
+L = L_reconstruction + KL(q || p^-) + KL(q || p^+) + stability_loss
+
+
+message usefullness:
+U_m= D_KL(q_{t+1} || p^-_{t+1}) - D_KL(q_{t+1} || p^+_{t+1})
+
+policy reward - local sensor learning progress + surprise + stability + message usefullness
+
+
+h0=0, o0=0, 
+z0 = qϕ(h0, o0) # posterior
+s0 = [ h0, z0] -> a0, m0 # policy call
+# environment step, sample body action b0 and transfer messages m^in_0, get observation O1
+h1=Fϕ(h0, z0, b0, m0, m^in_-1)
+
+prior hat z1 = dϕ(h1, m=0)
+prior hat z1 = dϕ(h1, m^in_0)
+
+posterior z1 = qϕ(h1, O1, m^in_0))
+s1 = [h1, z1] -> a1, m1
+..
+
+
+#########
+#
+# shared body model4
+#
+#########
+
+
+for agent i:
+
+h0 = 0
+z0 = p
+m_-1^{j->i} = 0
+
+
+[h0, z0] -> (a0^i, m0^{i->j})  # policy call
+
+
+# body aggregates agents' preferences and samples physical action
+b0 ~ body(a0^1, a0^2)
+
+
+# deterministic history context
+h1 = Fϕ(h0, z0, b0, a0^i,   m0^{i->j},  m_-1^{j->i} # message of other agent at previous timestep
+)
+
+
+# prediction before seeing current incoming message
+p1^- = dϕ(z1 | h1, MASK)
+
+
+# environment returns  observation O1  incoming message m0^{j->i}
+
+
+# prediction after hearing message, but BEFORE using O1
+p1^+ = dϕ(z1 | h1, m0^{j->i})
+
+
+# physical-state target / posterior
+z1 ~ qϕ(z1 | O1)       # message-blind target
+
+
+# usefulness of incoming message
+U_m =
+    KL(q1 || p1^-)
+    - KL(q1 || p1^+)
+
+
+# next policy gets actual inferred state + history
+(a1^i, m1^{i->j}) ~ policy(h1, z1)
+
+    h0,
+    z0,
+    b0,
+    own_preference0,
+    own_message0,
+    incoming_message_-1
+)
+
+# prediction before current message
+p1_minus = d(h1, MASK)
+
+# prediction after current message
+p1_plus = d(h1, incoming_message0)
+
+U_msg =
+    KL(q1 || p1_minus)
+    - KL(q1 || p1_plus)

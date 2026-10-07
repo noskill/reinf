@@ -112,7 +112,8 @@ class TSSMDiscretePredictor(DiscreteLatentPredictorBase):
     def clear_cache(self):
         self.backbone.clear_cache()
         self._z = None
-        self.cpc_sfa.clear_cache()
+        if self.cpc_sfa is not None:
+            self.cpc_sfa.clear_cache()
 
     def reset_cache(self, reset_mask):
         assert reset_mask.dtype == torch.bool and reset_mask.ndim == 1
@@ -120,14 +121,17 @@ class TSSMDiscretePredictor(DiscreteLatentPredictorBase):
             assert reset_mask.shape == self._z.shape[:1]
             self._z = self._z.masked_fill(reset_mask[:, None], 0)
         self.backbone.reset_cache(reset_mask)
-        self.cpc_sfa.reset_cache(reset_mask)
+        if self.cpc_sfa is not None:
+            self.cpc_sfa.reset_cache(reset_mask)
 
     def get_cache_state(self):
         if self._z is None:
             assert self.backbone.get_cache_state() is None
             return None
-        return {"z": self._z.detach().clone(), "backbone": self.backbone.get_cache_state(),
-                "sfa": self.cpc_sfa.get_cache_state()}
+        state = {"z": self._z.detach().clone(), "backbone": self.backbone.get_cache_state()}
+        if self.cpc_sfa is not None:
+            state["sfa"] = self.cpc_sfa.get_cache_state()
+        return state
 
     def set_cache_state(self, state):
         if state is None:
@@ -135,16 +139,19 @@ class TSSMDiscretePredictor(DiscreteLatentPredictorBase):
             return
         self._z = state["z"].detach().clone()
         self.backbone.set_cache_state(state["backbone"])
-        self.cpc_sfa.set_cache_state(state["sfa"])
+        if self.cpc_sfa is not None:
+            self.cpc_sfa.set_cache_state(state["sfa"])
 
     def index_cache_state(self, state, batch_indices):
         if state is None:
             return None
-        return {
+        indexed = {
             "z": state["z"][batch_indices].detach().clone(),
             "backbone": self.backbone.index_cache_state(state["backbone"], batch_indices),
-            "sfa": self.cpc_sfa.index_cache_state(state["sfa"], batch_indices),
         }
+        if self.cpc_sfa is not None:
+            indexed["sfa"] = self.cpc_sfa.index_cache_state(state["sfa"], batch_indices)
+        return indexed
 
     def _forward_core(
         self,

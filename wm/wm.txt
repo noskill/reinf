@@ -150,11 +150,11 @@ kl_post = max(
 free_nats = 1.0
 AC-CPC:
 for horizon k = 0..K-1:
-    x_tk = wk([ht, hat zt, at:t+k-1])
+    o_tk = wk([ht, hat zt, at:t+k-1])
     y_tk = uk(z't+k)
     z't+k = qϕ(z | augment(ot+k))
 
-    cpc_k = InfoNCE(x_tk, y_tk)
+    cpc_k = InfoNCE(o_tk, y_tk)
     
     
 hat olat_k = sensor_latent_head(e_k0) #  sensor embedding reconstruction, deterministic, computed from anchor cpc only
@@ -194,7 +194,7 @@ y_t = u(detach(z_t))
 CPC prediction:                                                                                                             
 mu_tk, sigma_tk = w_k([h_t, hat_z_t, a_t, ..., a_t+k-1])   
 
-cpc_loss = InfoNCE(x_tk, y_t+k)
+cpc_loss = InfoNCE(o_tk, y_t+k)
 NLL = -log Normal(detach(y_t+k); mu_tk, sigma_tk² I)
 
 observation_loss = CE(decoder([h_t, z_t]), o_t) # posterior reconstruction with decoder
@@ -221,3 +221,6 @@ WM loss =
     + SFA_loss
     + stability_loss
     + probes
+    
+
+

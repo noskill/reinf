@@ -76,7 +76,7 @@ def parse_args():
         "--target-entropy",
         type=float,
         default=None,
-        help="Policy entropy target. Default: 0.5 * log(action_dim).",
+        help="Categorical policy entropy target; not used by shared-body PPO. Default: 0.5 * log(action_dim).",
     )
     parser.set_defaults(policy_backprop_through_wm=True)
     parser.add_argument(
@@ -182,6 +182,10 @@ def parse_args():
     parser.add_argument("--body-agents", type=int, choices=[2, 3], default=2)
     parser.add_argument("--communication", choices=["learned", "none", "state"], default="learned")
     parser.add_argument("--message-symbols", type=int, default=8)
+    parser.add_argument("--vote-concentration", type=float, default=20.0,
+                        help="Fixed Dirichlet concentration kappa for shared-body votes.")
+    parser.add_argument("--wm-body-action", action=argparse.BooleanOptionalAction, default=True,
+                        help="Include executed body action in the shared-body WM transition.")
     parser.add_argument("--shared-weights", action="store_true")
     parser.add_argument("--env-type", type=str, default='maze', choices=['maze', 'agimaze'])
     return parser.parse_args()
@@ -220,8 +224,8 @@ def main():
     save_run_args(args, run_dir)
 
     logger = Logger(run_dir)
-    if args.wm_contrastive_dim <= 0:
-        raise ValueError("--wm-contrastive-dim must be > 0")
+    if args.wm_contrastive_dim < 0:
+        raise ValueError("--wm-contrastive-dim must be >= 0")
     if args.wm_contrastive_steps < 1:
         raise ValueError("--wm-contrastive-steps must be >= 1")
     if args.wm_contrastive_uncertainty_weight < 0:

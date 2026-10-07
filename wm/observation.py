@@ -181,11 +181,10 @@ class MazeObservationDecoder(ObservationDecoder):
 
 
 class CommunicatingMazeEncoder(MazeObservationEncoder):
-    """Encode local sensors and separately masked, detached peer messages."""
+    """Encode physical sensors only; messages condition the WM transition."""
 
     def __init__(self, encoder, *, local_sensor_dim, latent_dim, message_dim, peer_count):
-        input_dim = local_sensor_dim + peer_count * message_dim + peer_count
-        super().__init__(encoder, input_dim, latent_dim)
+        super().__init__(encoder, local_sensor_dim, latent_dim)
         self.local_sensor_dim = local_sensor_dim
         self.message_dim = message_dim
         self.peer_count = peer_count
@@ -203,11 +202,7 @@ class CommunicatingMazeEncoder(MazeObservationEncoder):
         assert message_valid.shape == (batch_size, sequence_length, self.peer_count), \
             "Expected message_valid [B,T,peer_count]"
         assert message_valid.dtype == torch.bool, "message_valid must be Boolean"
-        masked_messages = incoming_messages.detach().clone()
-        masked_messages[~message_valid] = 0
-        encoder_input = torch.cat([local_sensors.float(), masked_messages.flatten(start_dim=2),
-                                   message_valid.float()], dim=-1)
-        return super().encode(encoder_input)
+        return super().encode(local_sensors.float())
 
 
 class CommunicatingMazeDecoder(MazeObservationDecoder):
@@ -230,9 +225,9 @@ def add_maze_communication(codecs, *, local_sensor_dim, message_dim, peer_count)
     encoder = CommunicatingMazeEncoder(
         base_encoder.encoder, local_sensor_dim=local_sensor_dim, latent_dim=base_encoder.latent_dim,
         message_dim=message_dim, peer_count=peer_count)
-    assert encoder.sensor_dim == base_encoder.sensor_dim, "Communication dimensions must match the encoder input"
+    assert encoder.sensor_dim == base_encoder.sensor_dim, "Encoder input must contain only local sensors"
     decoders = tuple(CommunicatingMazeDecoder(sensor_bins=decoder.sensor_bins, decoder=decoder.decoder,
-                                              categorical_heads=decoder.categorical_heads)
+                                              categorical_heads=decoder.categorical_heads) if decoder is not None else None
                      for decoder in base_decoders)
     return (encoder, *decoders)
 
@@ -386,7 +381,7 @@ def create_maze_baseline_observation_codec(*, sensor_dim: int, sensor_latent_dim
 
 def create_maze_discrete_observation_codec(*, sensor_dim: int, sensor_latent_dim: int,
                                            feature_dim: int, stochastic_dim: int,
-                                           hidden_size: int, sensor_bins: Sequence[int]):
+                                           hidden_size: int, sensor_bins: Sequence[int], cpc_enabled: bool = True):
     sensor_encoder = nn.Sequential(
         nn.Linear(sensor_dim, sensor_latent_dim),
         nn.ReLU(),
@@ -407,8 +402,10 @@ def create_maze_discrete_observation_codec(*, sensor_dim: int, sensor_latent_dim
         sensor_bins=sensor_bins,
         decoder=nn.Linear(hidden_size, sensor_out_dim),
     )
-    probe_decoder = MazeObservationDecoder(
-        sensor_bins=sensor_bins, decoder=nn.Linear(sensor_latent_dim, sensor_out_dim))
+    probe_decoder = None
+    if cpc_enabled:
+        probe_decoder = MazeObservationDecoder(
+            sensor_bins=sensor_bins, decoder=nn.Linear(sensor_latent_dim, sensor_out_dim))
     return encoder, decoder, z_decoder, h_decoder, probe_decoder
 
 
@@ -441,7 +438,7 @@ def create_agimaze_baseline_observation_codec(*, movement_result_classes: int,
 def create_agimaze_discrete_observation_codec(*, movement_result_classes: int,
                                               inventory_size: int, observation_latent_dim: int,
                                               feature_dim: int, stochastic_dim: int,
-                                              hidden_size: int, hidden_dim: int):
+                                              hidden_size: int, hidden_dim: int, cpc_enabled: bool = True):
     observation_dim = movement_result_classes + inventory_size
 
     def create_decoder(input_dim: int):
@@ -463,5 +460,5 @@ def create_agimaze_discrete_observation_codec(*, movement_result_classes: int,
         create_decoder(feature_dim),
         create_decoder(stochastic_dim),
         create_decoder(hidden_size),
-        create_decoder(observation_latent_dim),
+        create_decoder(observation_latent_dim) if cpc_enabled else None,
     )

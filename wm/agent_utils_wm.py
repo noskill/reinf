@@ -391,7 +391,7 @@ def shared_maze_spec(sensor_space):
         raise ValueError("message_valid space must have Boolean dtype")
     local_sensor_dim = local_space.shape[0]
     return {"local_sensor_dim": local_sensor_dim, "peer_count": peer_count,
-                "message_dim": message_dim, "encoder_input_dim": local_sensor_dim + peer_count * message_dim + peer_count}
+                "message_dim": message_dim, "encoder_input_dim": local_sensor_dim}
 
 def _observation_space_spec(observation_type, observation_space) -> dict[str, int]:
     if observation_type not in {"maze", "agimaze", "shared-maze"}:
@@ -451,6 +451,7 @@ def create_discrete_observation_codec(observation_type, observation_space, args,
             stochastic_dim=stochastic_dim,
             hidden_size=hidden_size,
             sensor_bins=sensor_bins,
+            cpc_enabled=args.contrastive_dim > 0,
         )
         if observation_type == "shared-maze":
             return add_maze_communication(codecs, local_sensor_dim=dimensions["local_sensor_dim"],
@@ -464,6 +465,7 @@ def create_discrete_observation_codec(observation_type, observation_space, args,
         stochastic_dim=stochastic_dim,
         hidden_size=hidden_size,
         hidden_dim=args.probe_hidden_dim,
+        cpc_enabled=args.contrastive_dim > 0,
     )
 
 
@@ -786,6 +788,8 @@ def create_single_policy_agent(args, wm_model_args, wm_model, logger, maze_dim, 
 
 
 def create_double_policy_agent(args, wm_model_args, wm_model, logger, maze_dim, num_actions, action_table):
+    if wm_model.contrastive_dim == 0:
+        raise ValueError("DoubleAgent requires CPC/SFA for embedding goals")
     device = torch.device(args.device)
 
     h_t_dim = int(wm_model_args.hidden_size)
@@ -963,8 +967,8 @@ def create_world_model(
     sensor_max_bin: int = 64,
     logger=None,
 ):
-    if int(model_args.contrastive_dim) <= 0:
-        raise ValueError("contrastive_dim must be > 0 for AC-CPC intrinsic reward")
+    if model_args.contrastive_dim < 0:
+        raise ValueError("contrastive_dim must be >= 0")
     if maze_dim < 2:
         raise ValueError("maze_dim must be >= 2")
 

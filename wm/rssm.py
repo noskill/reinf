@@ -80,19 +80,24 @@ class RSSMDiscretePredictor(DiscreteLatentPredictorBase):
 
     def clear_cache(self):
         self._state = None
-        self.cpc_sfa.clear_cache()
+        if self.cpc_sfa is not None:
+            self.cpc_sfa.clear_cache()
 
     def reset_cache(self, reset_mask):
         assert reset_mask.dtype == torch.bool and reset_mask.ndim == 1
         if self._state is not None:
             assert reset_mask.shape == self._state.shape[:1]
             self._state = self._state.masked_fill(reset_mask[:, None], 0)
-        self.cpc_sfa.reset_cache(reset_mask)
+        if self.cpc_sfa is not None:
+            self.cpc_sfa.reset_cache(reset_mask)
 
     def get_cache_state(self):
         if self._state is None:
             return None
-        return {"state": self._state.detach().clone(), "sfa": self.cpc_sfa.get_cache_state()}
+        state = {"state": self._state.detach().clone()}
+        if self.cpc_sfa is not None:
+            state["sfa"] = self.cpc_sfa.get_cache_state()
+        return state
 
     def set_cache_state(self, state):
         if state is None:
@@ -100,13 +105,16 @@ class RSSMDiscretePredictor(DiscreteLatentPredictorBase):
             return
         assert state["state"].ndim == 2 and state["state"].shape[1] == self.feat_dim
         self._state = state["state"].detach().clone()
-        self.cpc_sfa.set_cache_state(state["sfa"])
+        if self.cpc_sfa is not None:
+            self.cpc_sfa.set_cache_state(state["sfa"])
 
     def index_cache_state(self, state, batch_indices):
         if state is None:
             return None
-        return {"state": state["state"][batch_indices].detach().clone(),
-                "sfa": self.cpc_sfa.index_cache_state(state["sfa"], batch_indices)}
+        indexed = {"state": state["state"][batch_indices].detach().clone()}
+        if self.cpc_sfa is not None:
+            indexed["sfa"] = self.cpc_sfa.index_cache_state(state["sfa"], batch_indices)
+        return indexed
 
     def _rssm_step(self, x_t: torch.Tensor, h_prev: torch.Tensor) -> torch.Tensor:
         return self.rnn(x_t, h_prev)
@@ -178,7 +186,7 @@ class RSSMDiscretePredictor(DiscreteLatentPredictorBase):
         z_only_pred = self._decode_sensor_from_z(z_post)
         h_only_pred = self._decode_sensor_from_h(h_post)
         prior_roll_sensor_pred = None
-        if self.prior_rollout_weight > 0:
+        if need_aux and self.prior_rollout_weight > 0:
             h_roll = h_init
             z_roll_flat = z_init_flat
             feat_roll_steps = []
