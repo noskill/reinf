@@ -174,8 +174,6 @@ def main():
         raise ValueError("--contrastive-horizon-discount must be > 0")
     if args.contrastive_uncertainty_weight < 0:
         raise ValueError("--contrastive-uncertainty-weight must be >= 0")
-    if args.contrastive_weight > 0 and args.contrastive_dim <= 0:
-        raise ValueError("--contrastive-dim must be > 0 when --contrastive-weight > 0")
     if args.contrastive_steps < 1:
         raise ValueError("--contrastive-steps must be >= 1")
     try:
