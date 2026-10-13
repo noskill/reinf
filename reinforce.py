@@ -13,22 +13,10 @@ from pool import EpisodesPoolMixin
 
 
 class ReinforceBase(Agent):
-    def __init__(
-        self,
-        policy,
-        sampler,
-        policy_lr=0.001,
-        num_envs=8,
-        discount=0.99,
-        device=torch.device("cpu"),
-        logger=None,
-        log_prefix=None,
-        entropy_coef=0.005,
-        target_entropy=2,
-        mu_coef=0.001,
-        exp_adv=False,
-        **kwargs
-    ):
+    def __init__(self, policy, sampler, policy_lr=0.001, num_envs=8,
+                 discount=0.99, device=torch.device("cpu"), logger=None,
+                 log_prefix=None, entropy_coef=0.005, target_entropy=2, mu_coef=0.001,
+                 exp_adv=False, **kwargs):
         self.num_envs = num_envs
         self.policy = policy
         self.sampler = sampler

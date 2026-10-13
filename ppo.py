@@ -22,7 +22,7 @@ class PPOBase(VPGBase):
       duplication and ease maintenance.
     """
     def __init__(self, policy, value, sampler, policy_lr=0.0001, value_lr=0.001, num_envs=8, discount=0.99, device=torch.device('cpu'), logger=None, log_prefix=None, num_learning_epochs=4, clip_param=None, **kwargs):
-        super().__init__(policy, value, sampler, policy_lr=policy_lr,
+        super().__init__(policy, value, sampler, policy_lr=policy_lr, value_lr=value_lr,
                     num_envs=num_envs, discount=discount,
                     device=device, logger=logger, log_prefix=log_prefix, num_learning_epochs=num_learning_epochs, **kwargs)
         self.policy_old = copy.deepcopy(self.policy)
