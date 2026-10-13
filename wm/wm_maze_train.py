@@ -76,7 +76,7 @@ def parse_args():
         "--target-entropy",
         type=float,
         default=None,
-        help="Categorical policy entropy target; not used by shared-body PPO. Default: 0.5 * log(action_dim).",
+        help="Categorical policy/vote entropy target; not used for Dirichlet votes. Default: 0.5 * log(action_dim).",
     )
     parser.set_defaults(policy_backprop_through_wm=True)
     parser.add_argument(
@@ -179,9 +179,10 @@ def parse_args():
     parser.add_argument("--wm-heading-smoothing", type=float, default=0.0)
     parser.add_argument("--agent-type", type=str, default="single-policy-ppo",
                         choices=["single-policy-ppo", "double-policy-ppo", "shared-body-ppo"])
-    parser.add_argument("--body-agents", type=int, choices=[2, 3], default=2)
+    parser.add_argument("--body-agents", type=int, choices=[1, 2], default=2)
     parser.add_argument("--communication", choices=["learned", "none", "state"], default="learned")
     parser.add_argument("--message-symbols", type=int, default=8)
+    parser.add_argument("--vote-distribution", choices=["dirichlet", "categorical"], default="dirichlet")
     parser.add_argument("--vote-concentration", type=float, default=20.0,
                         help="Fixed Dirichlet concentration kappa for shared-body votes.")
     parser.add_argument("--wm-body-action", action=argparse.BooleanOptionalAction, default=True,

@@ -2,7 +2,7 @@ import math
 
 import torch
 from torch import nn
-from torch.distributions import Categorical, Dirichlet
+from torch.distributions import Categorical, Dirichlet, OneHotCategorical
 
 from agent_group import AgentGroup
 from policy_head import WMActionHeadPolicy, WMValueHeadPolicy
@@ -14,9 +14,9 @@ from wm_joint_agent import JointWMPPO
 
 
 class SharedBodyPolicy(nn.Module):
-    """Local Dirichlet vote and optional categorical message policy."""
+    """Local vote and optional categorical message policy."""
 
-    def __init__(self, head, num_actions, message_symbols, concentration=20.0):
+    def __init__(self, head, num_actions, message_symbols, concentration=20.0, vote_distribution="dirichlet"):
         super().__init__()
         if not math.isfinite(concentration) or concentration <= 0:
             raise ValueError("Vote concentration must be finite and positive")
@@ -24,6 +24,9 @@ class SharedBodyPolicy(nn.Module):
         self.num_actions = num_actions
         self.message_symbols = message_symbols
         self.concentration = concentration
+        if vote_distribution not in ("dirichlet", "categorical"):
+            raise ValueError(f"Unknown vote distribution: {vote_distribution}")
+        self.vote_distribution = vote_distribution
 
     def local_logits(self, features):
         logits = self.head(features)
@@ -33,6 +36,8 @@ class SharedBodyPolicy(nn.Module):
 
     def forward(self, state, **kwargs):
         motor, message = self.local_logits(state["features"])
+        if self.vote_distribution == "categorical":
+            return {"vote_logits": motor, "message_logits": message}
         probabilities = motor.softmax(-1)
         # Keep alpha positive even when softmax underflows, preserving sum(alpha) = kappa.
         probabilities = (probabilities + 1e-6) / (1 + self.num_actions * 1e-6)
@@ -42,10 +47,10 @@ class SharedBodyPolicy(nn.Module):
 class VoteMessageDistribution:
     """PPO tensor action: vote coordinates, then one message index when enabled."""
 
-    def __init__(self, concentration, message_logits):
-        self.vote = Dirichlet(concentration)
+    def __init__(self, vote, message_logits):
+        self.vote = vote
         self.message = Categorical(logits=message_logits) if message_logits.shape[-1] else None
-        self.num_actions = concentration.shape[-1]
+        self.num_actions = vote.event_shape[0]
 
     def sample(self):
         vote = self.vote.sample()
@@ -72,16 +77,22 @@ class VoteMessageDistribution:
 
 class VoteMessageSampler(ActionSampler):
     def __call__(self, params, actions=None, return_distribution=False):
-        distribution = VoteMessageDistribution(params["concentration"], params["message_logits"])
+        vote = OneHotCategorical(logits=params["vote_logits"]) if "vote_logits" in params else Dirichlet(params["concentration"])
+        distribution = VoteMessageDistribution(vote, params["message_logits"])
         if actions is None:
             actions = distribution.sample()
         return actions, distribution.log_prob(actions), distribution
 
 
 class SharedBodyPPO(PPO):
-    def __init__(self, policy, *args, **kwargs):
-        symmetric = torch.full((policy.num_actions,), policy.concentration / policy.num_actions)
-        self.entropy_targets = [Dirichlet(symmetric).entropy().item()]
+    def __init__(self, policy, *args, target_entropy=None, **kwargs):
+        if policy.vote_distribution == "categorical":
+            if target_entropy is None:
+                raise ValueError("Categorical votes require target_entropy")
+            self.entropy_targets = [target_entropy]
+        else:
+            symmetric = torch.full((policy.num_actions,), policy.concentration / policy.num_actions)
+            self.entropy_targets = [Dirichlet(symmetric).entropy().item()]
         if policy.message_symbols:
             self.entropy_targets.append(0.5 * math.log(policy.message_symbols))
         super().__init__(policy, *args, target_entropy=self.entropy_targets[0], **kwargs)
@@ -95,6 +106,14 @@ class SharedBodyPPO(PPO):
         return log_prob, distribution.entropy_parts(), None
 
     def compute_entropy_loss(self, entropy, device, dtype, target_entropy=None, return_parts=False):
+        if self.policy.vote_distribution == "categorical":
+            assert len(self.entropy_targets) == 1, "Categorical control has only a vote head"
+            if entropy.ndim == 2:
+                assert entropy.shape[-1] == 1
+                entropy = entropy.squeeze(-1)
+            self.logger.log_scalar("entropy/vote", entropy.mean().item())
+            target_entropy = self.entropy_targets[0] if target_entropy is None else target_entropy
+            return super().compute_entropy_loss(entropy, device, dtype, target_entropy, return_parts)
         targets = self.entropy_targets if target_entropy is None else target_entropy
         targets = torch.as_tensor(targets, device=device, dtype=dtype)
         entropy = entropy.to(device=device, dtype=dtype)
@@ -302,7 +321,11 @@ class SharedBodyAgents(AgentGroup):
         return updated[0]
 
     def _log_body_sensor_metrics(self):
-        if self.shared_weights:
+        right_sensor = 2 if self.num_agents == 1 else 1
+        if self.num_agents == 1:
+            left = right = self.agents[0].sensor_predictions
+            left_config = right_config = self.agents[0].wm_model.config
+        elif self.shared_weights:
             predictions = self.agents[0].sensor_predictions
             # Completed episodes follow body/agent order, including asynchronous resets.
             left = tree_map(predictions, lambda value: value[0::self.num_agents])
@@ -313,9 +336,9 @@ class SharedBodyAgents(AgentGroup):
             left_config, right_config = (agent.wm_model.config for agent in self.agents[:2])
         assert torch.equal(left["mask"], right["mask"]), "Body predictions must align by episode and step"
         lr_rmse, lr_acc = masked_lr_metrics_logits(
-            pred_left=left["prediction"][0], pred_right=right["prediction"][1],
-            target_left=left["target"][..., 0], target_right=right["target"][..., 1], mask=left["mask"],
-            min_left=float(left_config.sensor_min_idx[0]), min_right=float(right_config.sensor_min_idx[1]))
+            pred_left=left["prediction"][0], pred_right=right["prediction"][right_sensor],
+            target_left=left["target"][..., 0], target_right=right["target"][..., right_sensor], mask=left["mask"],
+            min_left=float(left_config.sensor_min_idx[0]), min_right=float(right_config.sensor_min_idx[right_sensor]))
         self.logger.log_scalar("wm/metric/lr_acc", lr_acc.item())
         self.logger.log_scalar("wm/metric/lr_rmse", lr_rmse.item())
         for agent in self.agents:
@@ -324,7 +347,7 @@ class SharedBodyAgents(AgentGroup):
     def _configuration(self):
         return {"num_agents": self.num_agents, "shared_weights": self.shared_weights,
                 "channel": self.channel, "message_dim": self.message_dim, "num_actions": self.num_actions,
-                "action_distribution": "dirichlet", "vote_concentration": self.concentration,
+                "action_distribution": self.agents[0].agent.policy.vote_distribution, "vote_concentration": self.concentration,
                 "wm_transition": "own_vote_messages", "wm_body_action": self.wm_body_action}
 
     def get_state_dict(self):
@@ -377,12 +400,12 @@ def create_shared_body_agents(args, env, model_args, logger):
         if args.communication == "state" and feature_dim != env.message_dim:
             raise ValueError("State-channel width must equal the WM feature size")
         head = WMActionHeadPolicy(env.num_actions + message_symbols, env.device, feature_dim)
-        policy = SharedBodyPolicy(head, env.num_actions, message_symbols, args.vote_concentration)
+        policy = SharedBodyPolicy(head, env.num_actions, message_symbols, args.vote_concentration, args.vote_distribution)
         value = LocalValueHead(env.device, feature_dim)
         ppo = SharedBodyPPO(policy=policy, value=value, sampler=VoteMessageSampler(), joint=True,
                   policy_lr=args.policy_lr, num_envs=env.num_envs * (env.num_agents if args.shared_weights else 1),
                   discount=args.discount, logger=local_logger, device=env.device,
-                  entropy_coef=args.entropy_coef)
+                  entropy_coef=args.entropy_coef, target_entropy=args.target_entropy)
         agent = LocalBodyAgent(
             agent=ppo, logger=local_logger, wm_model=model, action_table=env.env.action_table,
             wm_body_action=args.wm_body_action,

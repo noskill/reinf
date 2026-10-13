@@ -206,17 +206,17 @@ class CommunicatingMazeEncoder(MazeObservationEncoder):
 
 
 class CommunicatingMazeDecoder(MazeObservationDecoder):
-    """Decode one agent's sensor pair, not the full shared body's observations."""
+    """Decode an agent's physical sensors, not its messages."""
 
     def __init__(self, *, sensor_bins, decoder=None, categorical_heads=None):
-        assert len(sensor_bins) == 2, "Shared maze decoder requires two local sensors"
+        assert len(sensor_bins) in (2, 3), "Shared maze decoder requires two or three local sensors"
         super().__init__(sensor_bins=sensor_bins, decoder=decoder, categorical_heads=categorical_heads)
 
     def physical_target(self, target):
         return target["local"]
 
     def compute_metrics(self, prediction, target, key_padding_mask, config, auxiliary_prediction=None):
-        # Body-level LR metrics need left from agent 1 and right from agent 2.
+        # The agent container combines physical left/right predictions for body metrics.
         return self._distance_metrics(prediction, target, key_padding_mask, config)
 
 

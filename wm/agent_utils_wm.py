@@ -378,8 +378,8 @@ def shared_maze_spec(sensor_space):
     local_space = sensor_space["local"]
     message_space = sensor_space["message"]
     message_valid_space = sensor_space["message_valid"]
-    if not isinstance(local_space, gym.spaces.Box) or local_space.shape != (2,):
-        raise ValueError("Shared-maze requires exactly two local sensors")
+    if not isinstance(local_space, gym.spaces.Box) or local_space.shape not in ((2,), (3,)):
+        raise ValueError("Shared-maze requires two or three local sensors")
     if not isinstance(message_space, gym.spaces.Box) or len(message_space.shape) != 2:
         raise ValueError("Shared-maze message space must be Box with shape (peer_count, message_dim)")
     peer_count, message_dim = message_space.shape
@@ -972,12 +972,12 @@ def create_world_model(
     if maze_dim < 2:
         raise ValueError("maze_dim must be >= 2")
 
-    _observation_space_spec(observation_type, observation_space)
+    dimensions = _observation_space_spec(observation_type, observation_space)
     if observation_type in {"maze", "shared-maze"}:
         if sensor_max_bin < 1:
             raise ValueError("sensor_max_bin must be >= 1")
         sensor_bin_count = int(sensor_max_bin) + 1
-        sensor_count = 2 if observation_type == "shared-maze" else 3
+        sensor_count = dimensions["encoder_input_dim"]
         sensor_bins = numpy.full(sensor_count, sensor_bin_count, dtype=numpy.int64)
         sensor_tables = [make_soft_table(sensor_bin_count, sensor_sigma, device) for _ in range(sensor_count)]
         sensor_min_idx = torch.zeros(sensor_count, dtype=torch.long, device=device)

@@ -8,16 +8,27 @@ from env_setup import MazeTrainerEnvAdapter
 class SharedBodyMazeEnv(MazeTrainerEnvAdapter):
     """One body, averaged probability votes and one-step detached messages."""
 
-    def __init__(self, env, num_agents, message_dim):
+    def __init__(self, env, num_agents, message_dim, sensor_indices=None):
         super().__init__(env)
-        if num_agents not in (2, 3):
-            raise ValueError("Shared-body maze requires two or three agents")
+        if num_agents not in (1, 2):
+            raise ValueError("Shared-body maze requires one or two agents")
         if message_dim < 0:
             raise ValueError("message_dim must be non-negative")
+        if num_agents == 1 and message_dim != 0:
+            raise ValueError("A single agent requires message_dim=0")
         self.num_agents = num_agents
         self.message_dim = message_dim
         self.num_actions = env.action_space_n
-        self.sensor_indices = torch.tensor([(0, 1), (1, 2), (0, 2)][:num_agents], device=self.device)
+        if sensor_indices is None:
+            sensor_indices = [(0, 1, 2)] if num_agents == 1 else [(0, 1), (1, 2)]
+        self.sensor_indices = torch.as_tensor(sensor_indices, device=self.device)
+        if self.sensor_indices.dtype != torch.long or self.sensor_indices.ndim != 2:
+            raise ValueError("sensor_indices must be a rectangular array of integer indices [agents, sensors]")
+        if self.sensor_indices.shape[0] != num_agents or not 1 <= self.sensor_indices.shape[1] <= 3:
+            raise ValueError("sensor_indices must specify one to three sensors for each agent")
+        if ((self.sensor_indices < 0) | (self.sensor_indices > 2)).any():
+            raise ValueError("Sensor indices must be 0 (left), 1 (front) or 2 (right)")
+        sensor_count = self.sensor_indices.shape[1]
         self.device = self.sensor_indices.device
         peer_indices = [[sender for sender in range(num_agents) if sender != receiver]
                         for receiver in range(num_agents)]
@@ -28,12 +39,12 @@ class SharedBodyMazeEnv(MazeTrainerEnvAdapter):
         message_shape = (self.peer_count, self.message_dim)
         self.local_observation_space = gym.spaces.Dict({
             "sensor": gym.spaces.Dict({
-                "local": gym.spaces.Box(0, np.inf, shape=(2,), dtype=np.float32),
+                "local": gym.spaces.Box(0, np.inf, shape=(sensor_count,), dtype=np.float32),
                 "message": gym.spaces.Box(-np.inf, np.inf, shape=message_shape, dtype=np.float32),
                 "message_valid": gym.spaces.Box(0, 1, shape=(self.peer_count,), dtype=np.bool_)})})
         self.observation_space = gym.spaces.Dict({
             "sensor": gym.spaces.Dict({
-                "local": gym.spaces.Box(0, np.inf, shape=(num_agents, 2), dtype=np.float32),
+                "local": gym.spaces.Box(0, np.inf, shape=(num_agents, sensor_count), dtype=np.float32),
                 "message": gym.spaces.Box(-np.inf, np.inf, shape=(num_agents, *message_shape), dtype=np.float32),
                 "message_valid": gym.spaces.Box(0, 1, shape=(num_agents, self.peer_count), dtype=np.bool_)}),
             "location": gym.spaces.Box(0, np.iinfo(np.int64).max, shape=(num_agents, 2), dtype=np.int64),
